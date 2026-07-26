@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 
 BOARD_SIZE: Final = 8
 PLANE_COUNT: Final = 21
+ENCODER_VERSION: Final = "v1"
 
 
 def _tensor_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:

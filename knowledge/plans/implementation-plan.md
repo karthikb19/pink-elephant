@@ -60,6 +60,29 @@ normal way to provide global state to a convolutional network. The encoder's
 exact shape and semantics must be versioned because saved examples and
 checkpoints depend on them.
 
+### Encoder test matrix
+
+The encoder is a serialization boundary, so use a compact set of deterministic
+positions that exercises its contracts rather than tests limited to piece
+counts in the starting position:
+
+- starting position: shape, type, all piece roles, empty squares, and all four
+  castling rights;
+- ordinary middlegame and sparse endgame: every square belongs to exactly one
+  of the twelve piece planes or the empty-square plane;
+- color-flip pairs: a board and `board.mirror()` encode identically, including
+  turn, piece ownership, castling, en-passant, and halfmove state;
+- asymmetric castling rights and a clock above 150: rights stay relative to the
+  current player and the clock clips without overflow;
+- legal en-passant opportunities for White and Black: exactly the canonical
+  target square is set;
+- repeated move cycles: zero, one, and two prior occurrences set the two
+  repetition thresholds correctly.
+
+Keep the positions as explicit FENs or short legal move sequences in unit
+tests. They are fast, offline regression fixtures and should expand whenever a
+new plane or canonicalization rule is introduced.
+
 Repetition is stored in two separate places with different jobs:
 
 - The authoritative `python-chess` board retains its complete move stack. It
