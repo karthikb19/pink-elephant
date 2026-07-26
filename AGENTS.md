@@ -19,6 +19,19 @@
   the user or developer impact, relevant historical context or root cause, and
   the validation performed. Update the description when the scope changes.
 
+### GitHub CLI and PR creation
+
+- GitHub CLI (`gh`) credentials are stored in the host macOS keychain and may
+  not be available from the filesystem sandbox. For GitHub API work, run `gh`
+  with host access (`require_escalated`); do not refresh or expose the token
+  through `GH_TOKEN`.
+- When asked to open a PR, inspect the working tree and stage only the intended
+  files. Commit intentionally, push the `kb/` branch with upstream tracking,
+  then open a draft PR unless the user explicitly asks for a ready-for-review
+  PR.
+- If host-side `gh` authentication fails, ask the user to run
+  `gh auth login -h github.com` rather than attempting to repair credentials.
+
 ## Project knowledge
 
 Keep durable project context, plans, and decisions in `knowledge/`.
