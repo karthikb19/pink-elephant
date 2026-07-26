@@ -10,6 +10,15 @@
 - Tests must be deterministic, fast, and offline; mock network, Modal, clocks, randomness, and expensive Torch work.
 - Run `uv run ruff format --check .`, `uv run ruff check .`, and `uv run pytest` before handing off.
 
+## Git workflow
+
+- Prefix every branch name with `kb/`.
+- Create draft pull requests when work is ready to share, and keep their status
+  and links visible in handoffs.
+- Write accurate, durable PR descriptions. State what changed, why it changed,
+  the user or developer impact, relevant historical context or root cause, and
+  the validation performed. Update the description when the scope changes.
+
 ## Project knowledge
 
 Keep durable project context, plans, and decisions in `knowledge/`.
