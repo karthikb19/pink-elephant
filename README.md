@@ -1,2 +1,12 @@
 # pink-elephant
-alpha go but chess
+
+AlphaGo-style chess experiments.
+
+## Development
+
+```sh
+uv sync
+uv run ruff format .
+uv run ruff check .
+uv run pytest
+```
