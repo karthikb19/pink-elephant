@@ -7,11 +7,21 @@ from pink_elephant.encoding import ENCODER_VERSION, encode_board
 
 def test_starting_position_has_expected_planes() -> None:
     encoded = encode_board(chess.Board())
+    back_rank_piece_files = ((1, 6), (2, 5), (0, 7), (3,), (4,))
 
     assert encoded.shape == (21, 8, 8)
     assert encoded.dtype == np.uint8
-    assert encoded[0, 1].sum() == 8  # Current-player pawns start on rank two.
-    assert encoded[6, 6].sum() == 8  # Opponent pawns start on rank seven.
+    assert np.array_equal(encoded[0, 1], np.ones(8, dtype=np.uint8))
+    assert encoded[0].sum() == 8
+    assert np.array_equal(encoded[6, 6], np.ones(8, dtype=np.uint8))
+    assert encoded[6].sum() == 8
+
+    for piece_plane, files in enumerate(back_rank_piece_files, start=1):
+        assert encoded[piece_plane, 0, list(files)].sum() == len(files)
+        assert encoded[piece_plane].sum() == len(files)
+        assert encoded[piece_plane + 6, 7, list(files)].sum() == len(files)
+        assert encoded[piece_plane + 6].sum() == len(files)
+
     assert encoded[12].sum() == 32  # The starting board has 32 empty squares.
     assert encoded[13:17].min() == 1
     assert encoded[17].sum() == 0
