@@ -3,6 +3,8 @@
 - Use `uv`: `uv sync`, `uv run pytest`, and `uv run ruff check .`.
 - Keep production code in `src/pink_elephant/` and tests in `tests/`.
 - Write small, typed functions with explicit inputs, outputs, and failures; avoid hidden state.
+- Keep inline code comments to one line and use them only to explain why code exists.
+- Do not use multi-line comments to explain a change; keep that context in documentation or commits.
 - Model structured data precisely. Avoid bare `dict`, `Any`, and opaque shapes such as
   `list[dict[str, Any]]`; prefer a typed model (`pydantic`, `TypedDict`, or a named tuple).
   Use `Any` only as a last resort when the schema cannot be expressed.
