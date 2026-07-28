@@ -13,7 +13,7 @@ PLANE_COUNT: Final = 21
 ENCODER_VERSION: Final = "v1"
 
 
-def _tensor_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
+def canonical_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
     """Return ``(row, column)`` for a square in the canonical orientation.
 
     Rows run from the current player's home rank toward the opponent's home
@@ -33,7 +33,7 @@ def _set_piece_planes(encoded: NDArray[np.uint8], board: chess.Board, turn: ches
         for piece_type in chess.PIECE_TYPES:
             plane = encoded[plane_offset + piece_type - 1]
             for square in board.pieces(piece_type, color):
-                row, column = _tensor_square(square, turn)
+                row, column = canonical_square(square, turn)
                 plane[row, column] = 1
 
 
@@ -74,7 +74,7 @@ def encode_board(board: chess.Board) -> NDArray[np.uint8]:
     _set_broadcast_plane(encoded, 16, int(board.has_queenside_castling_rights(not turn)))
 
     if board.ep_square is not None:
-        row, column = _tensor_square(board.ep_square, turn)
+        row, column = canonical_square(board.ep_square, turn)
         encoded[17, row, column] = 1
 
     _set_broadcast_plane(encoded, 18, min(board.halfmove_clock, 150))
