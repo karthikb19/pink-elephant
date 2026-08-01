@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -14,7 +14,7 @@ from typing import Final
 import modal
 import torch
 
-from pink_elephant.contracts import ValidationMetrics
+from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.dataset import ExpertBatchLoader
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.shards import MANIFEST_FILENAME, load_dataset_manifest
@@ -212,11 +212,57 @@ def train_l4(
     metrics_path = run_path / "metrics.json"
     final_validation: ValidationMetrics | None = None
     latest_checkpoint: str | None = None
+    _log_event(
+        "training_started",
+        batch_size=batch_size,
+        dataset_name=dataset_name,
+        epochs=epochs,
+        gpu=MODAL_GPU,
+        model={
+            "channels": channels,
+            "policy_channels": policy_channels,
+            "residual_blocks": residual_blocks,
+            "value_hidden_channels": value_hidden_channels,
+        },
+        optimizer={
+            "grad_clip_norm": grad_clip_norm,
+            "learning_rate": learning_rate,
+            "value_weight": MODAL_VALUE_WEIGHT,
+            "weight_decay": weight_decay,
+        },
+        resume_checkpoint=resume_checkpoint,
+        run_name=run_name,
+        start_epoch=trainer.epoch,
+        train_batches=_total_batches(train_loader.example_count, batch_size),
+        train_examples=train_loader.example_count,
+        validation_batches=_total_batches(validation_loader.example_count, batch_size),
+        validation_examples=validation_loader.example_count,
+    )
     while trainer.epoch < epochs:
         epoch_start = time.perf_counter()
         target_epoch = trainer.epoch + 1
-        training = trainer.train_epoch(train_loader.iter_batches(epoch=trainer.epoch))
-        validation = trainer.validate(validation_loader)
+        _log_event(
+            "epoch_started",
+            epoch=target_epoch,
+            step=trainer.step,
+            total_epochs=epochs,
+        )
+        training = trainer.train_epoch(
+            _log_batch_progress(
+                train_loader.iter_batches(epoch=trainer.epoch),
+                phase="train",
+                epoch=target_epoch,
+                total_batches=_total_batches(train_loader.example_count, batch_size),
+            )
+        )
+        validation = trainer.validate(
+            _log_batch_progress(
+                validation_loader,
+                phase="validation",
+                epoch=target_epoch,
+                total_batches=_total_batches(validation_loader.example_count, batch_size),
+            )
+        )
         checkpoint: str | None = None
         if target_epoch % checkpoint_interval == 0 or target_epoch == epochs:
             checkpoint_path = run_path / f"epoch-{target_epoch:06d}-step-{trainer.step:09d}.pt"
@@ -227,6 +273,12 @@ def train_l4(
                 git_revision=git_revision,
             )
             checkpoint = checkpoint_path.name
+            _log_event(
+                "checkpoint_saved",
+                checkpoint=checkpoint,
+                epoch=trainer.epoch,
+                step=trainer.step,
+            )
         latest_checkpoint = checkpoint or latest_checkpoint
         final_validation = validation
         metrics = ModalEpochMetrics(
@@ -243,13 +295,14 @@ def train_l4(
         )
         metrics_path.write_text(json.dumps(asdict(metrics), indent=2) + "\n", encoding="utf-8")
         training_volume.commit()
+        _log_event("epoch_completed", metrics=asdict(metrics), metrics_path=str(metrics_path))
 
     if final_validation is None:
         saved_metrics = _read_metrics(metrics_path)
         final_validation = saved_metrics.validation
         latest_checkpoint = saved_metrics.checkpoint
     assert final_validation is not None
-    return ModalTrainingResult(
+    result = ModalTrainingResult(
         run_name=run_name,
         gpu=MODAL_GPU,
         epochs_completed=trainer.epoch,
@@ -265,6 +318,8 @@ def train_l4(
         metrics_path=_volume_relative_path(RUN_VOLUME_ROOT, run_name) + "/metrics.json",
         latest_checkpoint=latest_checkpoint,
     )
+    _log_event("training_completed", result=asdict(result))
+    return result
 
 
 @app.local_entrypoint()
@@ -281,9 +336,21 @@ def main(
     """Upload data, launch L4 training, and download metrics."""
 
     selected_run_name = run_name or datetime.now(UTC).strftime("l4-%Y%m%d-%H%M%S")
+    _log_event(
+        "dataset_upload_started",
+        dataset_dir=str(Path(dataset_dir).expanduser().resolve()),
+        dataset_name=dataset_name,
+    )
     remote_dataset = upload_dataset(
         Path(dataset_dir),
         dataset_name=dataset_name,
+    )
+    _log_event("dataset_ready", remote_dataset=remote_dataset)
+    _log_event(
+        "training_call_started",
+        batch_size=batch_size,
+        epochs=epochs,
+        run_name=selected_run_name,
     )
     result = train_l4.remote(
         dataset_name,
@@ -294,6 +361,7 @@ def main(
         resume_checkpoint=resume_checkpoint,
         git_revision=_git_revision(),
     )
+    _log_event("training_call_returned", run_name=selected_run_name)
     local_run_dir = Path(output_dir) / selected_run_name
     metrics_path = download_run_metrics(
         local_run_dir,
@@ -302,6 +370,40 @@ def main(
     print(json.dumps(asdict(result), indent=2))
     print(f"uploaded dataset: {remote_dataset}")
     print(f"metrics: {metrics_path}")
+
+
+def _log_event(event: str, **fields: object) -> None:
+    payload: dict[str, object] = {"event": event, **fields}
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _log_batch_progress(
+    batches: Iterable[TrainingBatch],
+    *,
+    phase: str,
+    epoch: int,
+    total_batches: int,
+) -> Iterator[TrainingBatch]:
+    progress_interval = max(1, total_batches // 10)
+    examples_seen = 0
+    for batch_index, batch in enumerate(batches, start=1):
+        batch_examples = int(batch.positions.shape[0])
+        examples_seen += batch_examples
+        if batch_index == 1 or batch_index % progress_interval == 0 or batch_index == total_batches:
+            _log_event(
+                "batch_progress",
+                batch=batch_index,
+                batch_examples=batch_examples,
+                epoch=epoch,
+                examples_seen=examples_seen,
+                phase=phase,
+                total_batches=total_batches,
+            )
+        yield batch
+
+
+def _total_batches(example_count: int, batch_size: int) -> int:
+    return (example_count + batch_size - 1) // batch_size
 
 
 def _git_revision() -> str | None:
