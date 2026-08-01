@@ -147,3 +147,41 @@ PY
 The explicit epoch argument makes training shuffling deterministic across
 restarts. Validation remains in stable shard order. The loader keeps the final
 partial batch rather than silently dropping examples.
+
+## Run training with the live dashboard
+
+For a resumable local experiment, use the dashboard runner. It writes
+`metrics.json` and a self-contained `index.html` before training starts and
+after every epoch. The browser page contains inline SVG charts for validation
+policy loss, the uniform legal-move baseline, value error, and top-1/top-5
+policy accuracy.
+
+The initial pilot checkpoint can be used to continue from epoch 1:
+
+```sh
+uv run python scripts/run_training_dashboard.py \
+  --dataset-path data/processed/expert/v1-pilot \
+  --output-dir data/runs/initial-pilot \
+  --resume-checkpoint data/runs/initial-pilot/epoch-000001.pt \
+  --epochs 10 \
+  --checkpoint-interval 2 \
+  --batch-size 512
+```
+
+In another terminal, serve the run directory locally:
+
+```sh
+python -m http.server 8765 --directory data/runs/initial-pilot
+```
+
+Open <http://127.0.0.1:8765/>. The page reloads every ten seconds while the
+target epoch is still running, so it shows new metrics and checkpoints without
+an additional dashboard dependency. The training process also emits one JSON
+line per epoch and periodic batch progress lines, which makes it suitable for
+terminal logs or a later process supervisor.
+
+The runner is safe to restart with the same output directory: it restores the
+checkpoint, preserves the existing metric history, and continues from the
+checkpoint epoch. Checkpoints are written only at the configured interval;
+the example therefore produces `epoch-000002.pt`, `epoch-000004.pt`, through
+`epoch-000010.pt`.
