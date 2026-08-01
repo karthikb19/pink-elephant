@@ -7,11 +7,19 @@ from pink_elephant.action_mapping import move_to_policy_index
 from pink_elephant.pgn import ParserStats, PgnParserConfig, iter_expert_examples, split_game_id
 
 FIXTURE = Path(__file__).parent / "fixtures" / "expert_games.pgn"
+REAL_PILOT_FIXTURE = Path(__file__).parent / "fixtures" / "real_pilot_sample.pgn"
 
 
 def _parse_fixture(config: PgnParserConfig | None = None):
     stats = ParserStats()
     with FIXTURE.open(encoding="utf-8") as handle:
+        examples = list(iter_expert_examples(handle, config=config, stats=stats))
+    return examples, stats
+
+
+def _parse_file(path: Path, config: PgnParserConfig | None = None):
+    stats = ParserStats()
+    with path.open(encoding="utf-8") as handle:
         examples = list(iter_expert_examples(handle, config=config, stats=stats))
     return examples, stats
 
@@ -74,3 +82,37 @@ def test_parser_extracts_id_from_a_lichess_url() -> None:
     examples, _ = _parse_fixture()
 
     assert {example.game_id for example in examples} == {"white-win", "black-win", "draw"}
+
+
+def test_real_pilot_sample_has_expected_games_positions_and_targets() -> None:
+    examples, stats = _parse_file(REAL_PILOT_FIXTURE)
+    by_game = {}
+    for example in examples:
+        by_game.setdefault(example.game_id, []).append(example)
+
+    assert stats.games_seen == 3
+    assert stats.accepted_games == 3
+    assert stats.positions_emitted == 307
+    assert stats.train_positions == 307
+    assert stats.validation_positions == 0
+    assert {item.key: item.count for item in stats.event_counts} == {"Rated Blitz game": 3}
+    assert {item.key: item.count for item in stats.result_counts} == {"1-0": 3}
+    assert {game_id: len(items) for game_id, items in by_game.items()} == {
+        "ayeVRIAx": 85,
+        "XT6dUHT5": 131,
+        "Up6V4zNe": 91,
+    }
+    assert {game_id: items[0].played_action for game_id, items in by_game.items()} == {
+        "ayeVRIAx": 804,
+        "XT6dUHT5": 804,
+        "Up6V4zNe": 877,
+    }
+    assert {
+        game_id: (items[0].outcome, items[1].outcome, items[-1].outcome)
+        for game_id, items in by_game.items()
+    } == {
+        "ayeVRIAx": (1, -1, 1),
+        "XT6dUHT5": (1, -1, 1),
+        "Up6V4zNe": (1, -1, 1),
+    }
+    assert all(example.played_action in example.legal_actions for example in examples)
