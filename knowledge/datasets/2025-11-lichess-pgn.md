@@ -42,6 +42,9 @@ experiments. It is not a unit-test fixture.
 Tiny, checked-in PGNs for parser unit tests belong separately under `tests/`
 when ingestion is implemented.
 
+The checked-in real-data sample and reproducible parser/sharder setup are
+documented in `knowledge/datasets/pgn-sharder.md`.
+
 ## Source-file SHA-256
 
 ```text
