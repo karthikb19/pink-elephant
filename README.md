@@ -25,7 +25,7 @@ The function emits flushed JSON progress events. Follow them from another
 terminal while the run is active:
 
 ~~~sh
-uv run modal app logs pink-elephant-training -f --tail 100
+uv run modal app logs pink-elephant-training -f
 ~~~
 
 Look for `training_started`, `batch_progress`, `checkpoint_saved`, and
