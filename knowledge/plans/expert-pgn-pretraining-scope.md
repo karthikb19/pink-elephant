@@ -98,6 +98,12 @@ legal, incompatible schema versions, and malformed board shapes or dtypes.
 Use a deterministic single-process loader initially. Shard streaming is
 preferred to loading the complete pilot corpus into memory.
 
+The connector should expose a pure collator plus a manifest-aware
+`ExpertBatchLoader`. The collator converts a sequence of `ExpertExample` values
+into one `TrainingBatch`; the loader streams only the selected split and
+provides an explicit epoch to deterministic training shuffling. Validation
+should use stable shard order, and the final partial batch should be retained.
+
 ## Phase 3: Joint policy/value training
 
 The parser/action adapter owns chess legality. For each board, `python-chess`
