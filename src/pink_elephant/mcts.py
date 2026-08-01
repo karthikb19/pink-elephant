@@ -31,6 +31,8 @@ class MCTSConfig:
     exploration_constant: float = 1.25
 
     def __post_init__(self) -> None:
+        if not isinstance(self.num_simulations, int) or isinstance(self.num_simulations, bool):
+            raise ValueError(f"num_simulations must be an integer, got {self.num_simulations!r}")
         if self.num_simulations < 1:
             raise ValueError(f"num_simulations must be positive, got {self.num_simulations}")
         if not math.isfinite(self.exploration_constant) or self.exploration_constant <= 0:
