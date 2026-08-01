@@ -6,7 +6,7 @@ from typing import Final
 
 import chess
 
-from pink_elephant.encoding import BOARD_SIZE, canonical_square
+from pink_elephant.encoding import BOARD_SIZE
 
 ACTION_PLANES: Final = 73
 POLICY_SIZE: Final = BOARD_SIZE * BOARD_SIZE * ACTION_PLANES
@@ -95,12 +95,20 @@ def legal_policy_indices(board: chess.Board) -> tuple[int, ...]:
 def _move_to_policy_index(board: chess.Board, move: chess.Move) -> int:
     """Encode a move whose legality has already been established."""
 
-    origin_row, origin_column = canonical_square(move.from_square, board.turn)
-    target_row, target_column = canonical_square(move.to_square, board.turn)
+    origin_row, origin_column = _canonical_square(move.from_square, board.turn)
+    target_row, target_column = _canonical_square(move.to_square, board.turn)
     row_delta = target_row - origin_row
     column_delta = target_column - origin_column
     plane = _plane_for_move(row_delta, column_delta, move.promotion)
     return ((origin_row * BOARD_SIZE + origin_column) * ACTION_PLANES) + plane
+
+
+def _canonical_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
+    """Return a square's row and file in the side-to-move orientation."""
+
+    rank = chess.square_rank(square)
+    file = chess.square_file(square)
+    return (rank if turn == chess.WHITE else BOARD_SIZE - 1 - rank, file)
 
 
 def _plane_for_move(row_delta: int, column_delta: int, promotion: chess.PieceType | None) -> int:

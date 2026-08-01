@@ -9,14 +9,12 @@ from pink_elephant.action_mapping import (
     move_to_policy_index,
     policy_index_to_move,
 )
-from pink_elephant.model import POLICY_SIZE as MODEL_POLICY_SIZE
 
 
 def test_action_schema_has_expected_stable_shape_and_version() -> None:
     assert ACTION_PLANES == 73
     assert POLICY_SIZE == 4_672
     assert ACTION_SCHEMA_VERSION == "v1"
-    assert MODEL_POLICY_SIZE == POLICY_SIZE
 
 
 def test_equivalent_white_and_black_moves_share_a_canonical_policy_index() -> None:

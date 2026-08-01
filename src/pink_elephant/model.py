@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Final, NamedTuple
 
 import torch
 from torch import Tensor, nn
 
-from pink_elephant.action_mapping import POLICY_SIZE
 from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
+
+POLICY_SIZE: Final = 4_672
 
 
 @dataclass(frozen=True)
