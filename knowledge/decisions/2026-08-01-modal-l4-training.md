@@ -2,11 +2,10 @@
 
 ## Context
 
-The local training loop and dashboard are working, but training is limited by
-the developer machine and processed dataset shards are not yet available to a
-remote worker. The next experiment needs durable shard storage, a repeatable
-GPU entrypoint, and a browser-viewable result without moving chess or training
-logic into infrastructure-specific code.
+The local training loop is working, but training is limited by the developer
+machine and processed dataset shards are not yet available to a remote worker.
+The next experiment needs durable shard storage and a repeatable GPU entrypoint
+without moving chess or training logic into infrastructure-specific code.
 
 ## Decision
 
@@ -22,7 +21,7 @@ dataset before the call and downloads the metrics artifact afterward.
 
 - Keep training local and use Modal only for later self-play workers.
 - Copy shards as function arguments instead of storing them in a Volume.
-- Integrate the existing local dashboard before the first GPU run.
+- Add a visualization layer before the first GPU run.
 - Use a much larger network or multi-GPU job before measuring this baseline.
 
 ## Consequences
