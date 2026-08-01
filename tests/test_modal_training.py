@@ -37,14 +37,19 @@ class _FakeBatch:
 
 
 class _FakeVolume:
-    def __init__(self) -> None:
+    def __init__(self, remote_manifest: bytes | None = None) -> None:
         self.upload_call: _UploadCall | None = None
+        self.remote_manifest = remote_manifest
 
     def batch_upload(self, *, force: bool) -> _FakeBatch:
         self.upload_call = _UploadCall(force=force)
         return _FakeBatch(self.upload_call)
 
     def read_file(self, path: str) -> list[bytes]:
+        if path.endswith("/manifest.json"):
+            if self.remote_manifest is None:
+                raise FileNotFoundError(path)
+            return [self.remote_manifest]
         return [b'{"epoch": 1}']
 
 
@@ -96,6 +101,42 @@ def test_upload_dataset_validates_shards_and_uses_a_versioned_volume_path(
     assert volume.upload_call.force is True
     assert volume.upload_call.local_path == dataset_dir.resolve()
     assert volume.upload_call.remote_path == remote_path
+
+
+def test_upload_dataset_skips_a_matching_existing_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_dataset(dataset_dir)
+    volume = _FakeVolume((dataset_dir / "manifest.json").read_bytes())
+    monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
+
+    remote_path = modal_training.upload_dataset(
+        dataset_dir,
+        volume_name="test-volume",
+        dataset_name="expert/v1-pilot",
+    )
+
+    assert remote_path == "/datasets/expert/v1-pilot"
+    assert volume.upload_call is None
+
+
+def test_upload_dataset_rejects_a_different_existing_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_dataset(dataset_dir)
+    volume = _FakeVolume(b"different-manifest")
+    monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
+
+    with pytest.raises(FileExistsError, match="different manifest"):
+        modal_training.upload_dataset(
+            dataset_dir,
+            volume_name="test-volume",
+            dataset_name="expert/v1-pilot",
+        )
+
+    assert volume.upload_call is None
 
 
 def test_download_run_metrics_writes_metrics_json(

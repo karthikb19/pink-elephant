@@ -99,6 +99,8 @@ def upload_dataset(
     _validate_local_dataset(local_dir)
     remote_path = _volume_relative_path(DATASET_VOLUME_ROOT, dataset_name)
     volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+    if not overwrite and _dataset_manifest_matches(volume, remote_path, local_dir):
+        return remote_path
     with volume.batch_upload(force=overwrite) as batch:
         batch.put_directory(local_dir, remote_path)
     return remote_path
@@ -321,6 +323,21 @@ def _validate_local_dataset(dataset_dir: Path) -> None:
         shard_path = dataset_dir / shard.relative_path
         if not shard_path.is_file():
             raise FileNotFoundError(f"manifest shard does not exist: {shard_path}")
+
+
+def _dataset_manifest_matches(volume: modal.Volume, remote_path: str, local_dir: Path) -> bool:
+    remote_manifest_path = f"{remote_path}/{MANIFEST_FILENAME}"
+    try:
+        remote_manifest = b"".join(volume.read_file(remote_manifest_path))
+    except FileNotFoundError:
+        return False
+    local_manifest = (local_dir / MANIFEST_FILENAME).read_bytes()
+    if remote_manifest != local_manifest:
+        raise FileExistsError(
+            f"dataset already exists with a different manifest: {remote_path}; "
+            "choose a new dataset_name"
+        )
+    return True
 
 
 def _validate_training_arguments(
