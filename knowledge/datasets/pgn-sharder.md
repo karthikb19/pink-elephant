@@ -104,3 +104,44 @@ validation = sum(1 for _ in iter_processed_examples(dataset, split="validation")
 print({"manifest": manifest.as_dict(), "train": train, "validation": validation})
 PY
 ```
+
+## Load batches for training
+
+The processed dataset is the input to the training connector. The loader reads
+the manifest-listed shards, reconstructs the dense legal-action mask, converts
+boards to normalized floating-point tensors, and yields `TrainingBatch`
+values. It does not place tensors on a device; the trainer handles that.
+
+```sh
+uv run python - <<'PY'
+from pathlib import Path
+
+from pink_elephant.dataset import ExpertBatchLoader
+from pink_elephant.model import ChessResNet, ResNetConfig
+from pink_elephant.training import Trainer, TrainerConfig
+
+dataset_path = Path("data/processed/expert/v1-pilot")
+train_loader = ExpertBatchLoader(dataset_path, split="train", batch_size=256, seed=0)
+validation_loader = ExpertBatchLoader(
+    dataset_path,
+    split="validation",
+    batch_size=256,
+    shuffle=False,
+)
+trainer = Trainer(
+    ChessResNet(ResNetConfig()),
+    TrainerConfig(seed=0),
+)
+trainer.fit(
+    lambda: train_loader.iter_batches(epoch=trainer.epoch),
+    lambda: validation_loader,
+    epochs=1,
+    checkpoint_dir=Path("data/runs/initial-training"),
+    source_manifest=train_loader.source_identity,
+)
+PY
+```
+
+The explicit epoch argument makes training shuffling deterministic across
+restarts. Validation remains in stable shard order. The loader keeps the final
+partial batch rather than silently dropping examples.
