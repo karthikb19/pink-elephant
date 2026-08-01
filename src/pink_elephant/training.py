@@ -22,6 +22,7 @@ from pink_elephant.contracts import (
 from pink_elephant.model import ModelOutput
 
 CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
+EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.01
 
 
 class _ConfigPayload(TypedDict):
@@ -64,11 +65,15 @@ class _CheckpointPayload(TypedDict):
 
 @dataclass(frozen=True)
 class TrainerConfig:
-    """Configuration for the local AdamW policy/value trainer."""
+    """Configuration for the local AdamW policy/value trainer.
+
+    The default value weight follows AlphaGo Zero's supervised human-game
+    pretraining setup; self-play training can explicitly use ``1.0``.
+    """
 
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
-    value_weight: float = 1.0
+    value_weight: float = EXPERT_PRETRAINING_VALUE_WEIGHT
     device: str = "cpu"
     seed: int | None = None
     grad_clip_norm: float | None = None
@@ -144,7 +149,14 @@ class CheckpointMetadata:
 
 
 def mask_policy_logits(policy_logits: Tensor, legal_mask: Tensor) -> Tensor:
-    """Set illegal action logits to negative infinity for legal-only scoring."""
+    """Set illegal action logits to negative infinity for legal-only scoring.
+
+    This function does not inspect a board or determine chess legality. The
+    upstream chess/action adapter uses ``python-chess`` and
+    ``legal_policy_indices`` to create one dense boolean row per position. The
+    mask then makes illegal actions contribute zero probability to softmax,
+    cross-entropy, top-k metrics, and later MCTS priors.
+    """
 
     if policy_logits.ndim != 2 or tuple(policy_logits.shape[1:]) != (POLICY_SIZE,):
         raise ValueError(
@@ -173,9 +185,13 @@ def compute_joint_loss(
     output: ModelOutput,
     batch: TrainingBatch,
     *,
-    value_weight: float = 1.0,
+    value_weight: float = EXPERT_PRETRAINING_VALUE_WEIGHT,
 ) -> JointLoss:
-    """Compute legal-masked policy loss, scalar value loss, and their sum."""
+    """Compute legal-masked policy loss, scalar value loss, and their sum.
+
+    ``value_weight=0.01`` is the expert-PGN pretraining default. Passing
+    ``1.0`` selects the equal-weight AlphaZero-style self-play objective.
+    """
 
     _validate_value_weight(value_weight)
     masked_logits = mask_policy_logits(output.policy_logits, batch.legal_mask)

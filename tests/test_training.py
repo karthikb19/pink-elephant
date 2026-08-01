@@ -2,14 +2,17 @@ import math
 from collections.abc import Iterable
 from pathlib import Path
 
+import chess
 import pytest
 import torch
 from torch import Tensor, nn
 
-from pink_elephant.action_mapping import POLICY_SIZE
+from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, move_to_policy_index
 from pink_elephant.contracts import DatasetSchema, TrainingBatch, ValidationMetrics
-from pink_elephant.model import ModelOutput
+from pink_elephant.encoding import encode_board
+from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
 from pink_elephant.training import (
+    EXPERT_PRETRAINING_VALUE_WEIGHT,
     Trainer,
     TrainerConfig,
     aggregate_validation_metrics,
@@ -56,6 +59,42 @@ def _output(
     return ModelOutput(policy_logits=policy_logits, value=torch.tensor(values))
 
 
+def _legal_mask(board: chess.Board) -> Tensor:
+    legal_mask = torch.zeros((1, POLICY_SIZE), dtype=torch.bool)
+    legal_mask[0, list(legal_policy_indices(board))] = True
+    return legal_mask
+
+
+def _board_batch() -> TrainingBatch:
+    boards = [chess.Board(), chess.Board()]
+    boards[1].push_uci("e2e4")
+    positions = torch.stack(
+        [torch.from_numpy(encode_board(board)) for board in boards],
+    ).float()
+    positions[:, 18] /= 150.0
+    legal_mask = torch.zeros((len(boards), POLICY_SIZE), dtype=torch.bool)
+    for row, board in enumerate(boards):
+        legal_mask[row, list(legal_policy_indices(board))] = True
+    played_actions = torch.tensor(
+        (
+            move_to_policy_index(boards[0], chess.Move.from_uci("e2e4")),
+            move_to_policy_index(boards[1], chess.Move.from_uci("e7e5")),
+        ),
+        dtype=torch.int64,
+    )
+    return TrainingBatch(
+        positions=positions,
+        legal_mask=legal_mask,
+        played_actions=played_actions,
+        outcomes=torch.tensor((1.0, -1.0), dtype=torch.float32),
+    )
+
+
+def test_expert_pretraining_default_uses_a_low_value_weight() -> None:
+    assert pytest.approx(0.01) == EXPERT_PRETRAINING_VALUE_WEIGHT
+    assert TrainerConfig().value_weight == pytest.approx(0.01)
+
+
 def test_masking_removes_a_high_scoring_illegal_action() -> None:
     logits = torch.zeros((1, POLICY_SIZE), dtype=torch.float32)
     logits[0, 2] = 1000
@@ -76,6 +115,31 @@ def test_masking_rejects_an_empty_legal_action_set() -> None:
 
     with pytest.raises(ValueError, match="at least one legal action"):
         mask_policy_logits(logits, torch.zeros_like(logits, dtype=torch.bool))
+
+
+def test_masking_uses_python_chess_legal_actions() -> None:
+    board = chess.Board()
+    legal_indices = legal_policy_indices(board)
+    played_action = move_to_policy_index(board, chess.Move.from_uci("e2e4"))
+    illegal_action = next(index for index in range(POLICY_SIZE) if index not in legal_indices)
+    legal_mask = _legal_mask(board)
+    logits = torch.zeros((1, POLICY_SIZE), dtype=torch.float32)
+    logits[0, illegal_action] = 1_000
+    batch = TrainingBatch(
+        positions=torch.zeros((1, 21, 8, 8), dtype=torch.float32),
+        legal_mask=legal_mask,
+        played_actions=torch.tensor((played_action,), dtype=torch.int64),
+        outcomes=torch.tensor((1.0,), dtype=torch.float32),
+    )
+
+    losses = compute_joint_loss(
+        ModelOutput(policy_logits=logits, value=torch.zeros(1)),
+        batch,
+    )
+
+    assert legal_mask.sum().item() == len(tuple(board.legal_moves))
+    assert mask_policy_logits(logits, legal_mask)[0, illegal_action] == -torch.inf
+    assert losses.policy == pytest.approx(math.log(len(legal_indices)))
 
 
 def test_joint_loss_has_policy_value_and_weighted_terms() -> None:
@@ -215,3 +279,58 @@ def test_fit_writes_one_immutable_checkpoint_per_epoch(tmp_path: Path) -> None:
         "epoch-000001-step-000000001.pt",
         "epoch-000002-step-000000002.pt",
     ]
+
+
+def test_end_to_end_real_board_model_training_and_checkpointing(tmp_path: Path) -> None:
+    batch = _board_batch()
+    model_config = ResNetConfig(
+        channels=4,
+        residual_blocks=1,
+        policy_channels=1,
+        value_hidden_channels=4,
+    )
+    trainer_config = TrainerConfig(
+        learning_rate=0.01,
+        weight_decay=0.0,
+        seed=7,
+    )
+    trainer = Trainer(ChessResNet(model_config), trainer_config)
+    before = {
+        name: parameter.detach().clone() for name, parameter in trainer.model.named_parameters()
+    }
+
+    results = trainer.fit(
+        lambda: [batch],
+        lambda: [batch],
+        epochs=2,
+        checkpoint_dir=tmp_path,
+        source_manifest="fixture-manifest-sha256",
+        git_revision="test-revision",
+    )
+
+    assert len(results) == 2
+    assert trainer.epoch == 2
+    assert trainer.step == 2
+    assert any(
+        not torch.equal(before[name], parameter.detach())
+        for name, parameter in trainer.model.named_parameters()
+    )
+    for _, metrics in results:
+        assert metrics.example_count == 2
+        assert metrics.uniform_policy_loss == pytest.approx(math.log(20), rel=1e-5)
+        assert math.isfinite(metrics.policy_loss)
+        assert math.isfinite(metrics.value_mse)
+        assert math.isfinite(metrics.value_mae)
+
+    checkpoints = sorted(tmp_path.glob("*.pt"))
+    assert [path.name for path in checkpoints] == [
+        "epoch-000001-step-000000001.pt",
+        "epoch-000002-step-000000002.pt",
+    ]
+    restored = Trainer(ChessResNet(model_config), trainer_config)
+    metadata = restored.load_checkpoint(checkpoints[-1])
+    assert metadata.epoch == 2
+    assert metadata.step == 2
+    assert metadata.metrics == results[-1][1]
+    assert metadata.source_manifest == "fixture-manifest-sha256"
+    assert metadata.git_revision == "test-revision"

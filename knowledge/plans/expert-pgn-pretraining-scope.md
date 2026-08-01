@@ -100,6 +100,13 @@ preferred to loading the complete pilot corpus into memory.
 
 ## Phase 3: Joint policy/value training
 
+The parser/action adapter owns chess legality. For each board, `python-chess`
+provides the legal moves, `legal_policy_indices` maps those moves into the
+canonical `4,672`-action space, and the future collator scatters those indices
+into a dense boolean `legal_mask`. `mask_policy_logits` only applies that
+already-validated mask; it intentionally does not receive a board or call a
+chess rules engine.
+
 For each batch:
 
 ```text
@@ -108,6 +115,13 @@ policy_loss = cross_entropy(masked_policy_logits, played_action)
 value_loss = MSE(predicted_value, outcome)
 total_loss = policy_loss + value_weight * value_loss
 ```
+
+The trainer defaults to `value_weight = 0.01` for this expert-PGN
+pretraining stage. AlphaGo Zero's supervised human-game experiment used this
+same MSE factor to reduce value overfitting; its self-play objective, like the
+published AlphaZero objective, weights policy cross-entropy and value MSE
+equally. The configuration keeps the weight explicit so the later MCTS/self-
+play phase can select `1.0` without changing the loss implementation.
 
 The initial trainer should use AdamW and run locally on CPU or MPS. Modal,
 distributed training, and MCTS are outside this first implementation.
