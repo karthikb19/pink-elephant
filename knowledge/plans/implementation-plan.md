@@ -153,8 +153,7 @@ The joint loss can be expressed as:
 For expert-game pretraining, `search_policy` is initially the one-hot move made
 in the recorded game. For self-play, it becomes MCTS's normalized root visit
 distribution. Keeping the same example schema for both sources makes the
-transition much simpler. Expert pretraining starts with
-`value_weight = 0.25`; self-play can select `1.0`.
+transition much simpler.
 
 ## Data stages
 
@@ -292,10 +291,11 @@ directly for the next 10-game batch.
 
 ## Modal deployment boundary
 
-The local vertical slice is now the source of truth for training, while Modal
-provides the execution and artifact layer. The first Modal path runs processed
-expert shards on one L4 and stores checkpoints and metrics in a named Volume.
-Treat Modal as infrastructure, not as the owner of chess logic.
+Modal is not needed now. First finish and validate the entire local vertical
+slice: `position -> tensor -> model -> MCTS -> 10 self-play games -> saved
+examples -> train -> checkpoint`. Modal is useful only after that path is
+trustworthy. Treat it as an execution and artifact layer, not as the owner of
+chess logic.
 
 Suggested separation:
 

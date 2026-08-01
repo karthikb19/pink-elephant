@@ -122,14 +122,15 @@ value_loss = MSE(predicted_value, outcome)
 total_loss = policy_loss + value_weight * value_loss
 ```
 
-The trainer defaults to `value_weight = 0.25` for this expert-PGN
-pretraining stage. This is a deliberate experiment setting that gives the
-outcome target more influence; the configuration keeps the weight explicit so
-the later MCTS/self-play phase can select `1.0` without changing the
-loss implementation.
+The trainer defaults to `value_weight = 0.01` for this expert-PGN
+pretraining stage. AlphaGo Zero's supervised human-game experiment used this
+same MSE factor to reduce value overfitting; its self-play objective, like the
+published AlphaZero objective, weights policy cross-entropy and value MSE
+equally. The configuration keeps the weight explicit so the later MCTS/self-
+play phase can select `1.0` without changing the loss implementation.
 
-The initial trainer uses AdamW locally and on a single Modal L4. Distributed
-training remains outside this first implementation.
+The initial trainer should use AdamW and run locally on CPU or MPS. Modal,
+distributed training, and MCTS are outside this first implementation.
 
 Record these validation metrics:
 

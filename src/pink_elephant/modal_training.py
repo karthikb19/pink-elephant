@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Iterable
+import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -14,17 +15,10 @@ import modal
 import torch
 
 from pink_elephant.contracts import ValidationMetrics
-from pink_elephant.dashboard import (
-    TrainingRunRecord,
-    read_training_history,
-    write_training_dashboard,
-    write_training_history,
-)
 from pink_elephant.dataset import ExpertBatchLoader
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.shards import MANIFEST_FILENAME, load_dataset_manifest
 from pink_elephant.training import (
-    EXPERT_PRETRAINING_VALUE_WEIGHT,
     Trainer,
     TrainerConfig,
 )
@@ -38,9 +32,9 @@ MODAL_BATCH_SIZE: Final[int] = 1_024
 MODAL_LEARNING_RATE: Final[float] = 3e-4
 MODAL_WEIGHT_DECAY: Final[float] = 1e-4
 MODAL_GRAD_CLIP_NORM: Final[float] = 1.0
+MODAL_VALUE_WEIGHT: Final[float] = 0.25
 MODAL_EPOCHS: Final[int] = 10
 MODAL_CHECKPOINT_INTERVAL: Final[int] = 1
-MODAL_REFRESH_SECONDS: Final[int] = 10
 MODAL_CHANNELS: Final[int] = 128
 MODAL_RESIDUAL_BLOCKS: Final[int] = 8
 MODAL_POLICY_CHANNELS: Final[int] = 2
@@ -54,6 +48,22 @@ image = (
 )
 app = modal.App(name="pink-elephant-training", image=image)
 training_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
+
+
+@dataclass(frozen=True)
+class ModalEpochMetrics:
+    """Metrics persisted after each completed Modal training epoch."""
+
+    run_name: str
+    epoch: int
+    step: int
+    train_examples: int
+    train_total_loss: float
+    train_policy_loss: float
+    train_value_loss: float
+    validation: ValidationMetrics
+    checkpoint: str | None
+    elapsed_seconds: float
 
 
 @dataclass(frozen=True)
@@ -72,7 +82,6 @@ class ModalTrainingResult:
     channels: int
     residual_blocks: int
     final_validation: ValidationMetrics
-    dashboard_path: str
     metrics_path: str
     latest_checkpoint: str | None
 
@@ -95,26 +104,22 @@ def upload_dataset(
     return remote_path
 
 
-def download_run_artifacts(
+def download_run_metrics(
     output_dir: Path,
     *,
     volume_name: str = MODAL_VOLUME_NAME,
     run_name: str,
-) -> tuple[Path, Path]:
-    """Download the dashboard and metrics JSON for one completed run."""
+) -> Path:
+    """Download metrics JSON for one completed run."""
 
     run_path = _volume_relative_path(RUN_VOLUME_ROOT, run_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     volume = modal.Volume.from_name(volume_name)
-    downloaded: list[Path] = []
-    for filename in ("index.html", "metrics.json"):
-        remote_file = f"{run_path}/{filename}"
-        local_file = output_dir / filename
-        with local_file.open("wb") as destination:
-            for chunk in volume.read_file(remote_file):
-                destination.write(chunk)
-        downloaded.append(local_file)
-    return downloaded[0], downloaded[1]
+    local_file = output_dir / "metrics.json"
+    with local_file.open("wb") as destination:
+        for chunk in volume.read_file(f"{run_path}/metrics.json"):
+            destination.write(chunk)
+    return local_file
 
 
 @app.function(
@@ -130,7 +135,6 @@ def train_l4(
     epochs: int = MODAL_EPOCHS,
     batch_size: int = MODAL_BATCH_SIZE,
     checkpoint_interval: int = MODAL_CHECKPOINT_INTERVAL,
-    refresh_seconds: int = MODAL_REFRESH_SECONDS,
     learning_rate: float = MODAL_LEARNING_RATE,
     weight_decay: float = MODAL_WEIGHT_DECAY,
     grad_clip_norm: float | None = MODAL_GRAD_CLIP_NORM,
@@ -147,7 +151,6 @@ def train_l4(
         epochs=epochs,
         batch_size=batch_size,
         checkpoint_interval=checkpoint_interval,
-        refresh_seconds=refresh_seconds,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         grad_clip_norm=grad_clip_norm,
@@ -171,7 +174,7 @@ def train_l4(
     trainer_config = TrainerConfig(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        value_weight=EXPERT_PRETRAINING_VALUE_WEIGHT,
+        value_weight=MODAL_VALUE_WEIGHT,
         device="cuda",
         seed=0,
         grad_clip_norm=grad_clip_norm,
@@ -194,7 +197,7 @@ def train_l4(
         shuffle=False,
     )
     trainer = Trainer(ChessResNet(model_config), trainer_config)
-    history = _prepare_run(
+    _prepare_run(
         trainer,
         run_path,
         resume_checkpoint=resume_checkpoint,
@@ -204,12 +207,11 @@ def train_l4(
             f"checkpoint epoch {trainer.epoch} is after requested target epoch {epochs}"
         )
 
-    history_path = run_path / "metrics.json"
-    dashboard_path = run_path / "index.html"
+    metrics_path = run_path / "metrics.json"
+    final_validation: ValidationMetrics | None = None
+    latest_checkpoint: str | None = None
     while trainer.epoch < epochs:
-        epoch_start = torch.cuda.Event(enable_timing=True)
-        epoch_end = torch.cuda.Event(enable_timing=True)
-        epoch_start.record()
+        epoch_start = time.perf_counter()
         target_epoch = trainer.epoch + 1
         training = trainer.train_epoch(train_loader.iter_batches(epoch=trainer.epoch))
         validation = trainer.validate(validation_loader)
@@ -223,31 +225,28 @@ def train_l4(
                 git_revision=git_revision,
             )
             checkpoint = checkpoint_path.name
-        epoch_end.record()
-        torch.cuda.synchronize()
-        elapsed_seconds = epoch_start.elapsed_time(epoch_end) / 1_000.0
-        record = TrainingRunRecord(
+        latest_checkpoint = checkpoint or latest_checkpoint
+        final_validation = validation
+        metrics = ModalEpochMetrics(
+            run_name=run_name,
             epoch=trainer.epoch,
             step=trainer.step,
-            training=training,
+            train_examples=training.example_count,
+            train_total_loss=training.total_loss,
+            train_policy_loss=training.policy_loss,
+            train_value_loss=training.value_loss,
             validation=validation,
             checkpoint=checkpoint,
-            elapsed_seconds=elapsed_seconds,
+            elapsed_seconds=time.perf_counter() - epoch_start,
         )
-        history = (*history, record)
-        write_training_history(history_path, history)
-        write_training_dashboard(
-            dashboard_path,
-            history,
-            target_epoch=epochs,
-            refresh_seconds=refresh_seconds,
-            title=f"Pink Elephant · {run_name}",
-        )
+        metrics_path.write_text(json.dumps(asdict(metrics), indent=2) + "\n", encoding="utf-8")
         training_volume.commit()
 
-    if not history:
-        raise ValueError("training run did not produce a validation result")
-    final_record = history[-1]
+    if final_validation is None:
+        saved_metrics = _read_metrics(metrics_path)
+        final_validation = saved_metrics.validation
+        latest_checkpoint = saved_metrics.checkpoint
+    assert final_validation is not None
     return ModalTrainingResult(
         run_name=run_name,
         gpu=MODAL_GPU,
@@ -257,13 +256,12 @@ def train_l4(
         validation_examples=validation_loader.example_count,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        value_weight=EXPERT_PRETRAINING_VALUE_WEIGHT,
+        value_weight=MODAL_VALUE_WEIGHT,
         channels=channels,
         residual_blocks=residual_blocks,
-        final_validation=final_record.validation,
-        dashboard_path=_volume_relative_path(RUN_VOLUME_ROOT, run_name) + "/index.html",
+        final_validation=final_validation,
         metrics_path=_volume_relative_path(RUN_VOLUME_ROOT, run_name) + "/metrics.json",
-        latest_checkpoint=_latest_checkpoint(history),
+        latest_checkpoint=latest_checkpoint,
     )
 
 
@@ -276,10 +274,9 @@ def main(
     epochs: int = MODAL_EPOCHS,
     batch_size: int = MODAL_BATCH_SIZE,
     checkpoint_interval: int = MODAL_CHECKPOINT_INTERVAL,
-    refresh_seconds: int = MODAL_REFRESH_SECONDS,
     resume_checkpoint: str | None = None,
 ) -> None:
-    """Upload data, launch L4 training, and download viewable results."""
+    """Upload data, launch L4 training, and download metrics."""
 
     selected_run_name = run_name or datetime.now(UTC).strftime("l4-%Y%m%d-%H%M%S")
     remote_dataset = upload_dataset(
@@ -292,18 +289,16 @@ def main(
         epochs=epochs,
         batch_size=batch_size,
         checkpoint_interval=checkpoint_interval,
-        refresh_seconds=refresh_seconds,
         resume_checkpoint=resume_checkpoint,
         git_revision=_git_revision(),
     )
     local_run_dir = Path(output_dir) / selected_run_name
-    dashboard_path, metrics_path = download_run_artifacts(
+    metrics_path = download_run_metrics(
         local_run_dir,
         run_name=selected_run_name,
     )
     print(json.dumps(asdict(result), indent=2))
     print(f"uploaded dataset: {remote_dataset}")
-    print(f"dashboard: {dashboard_path}")
     print(f"metrics: {metrics_path}")
 
 
@@ -333,7 +328,6 @@ def _validate_training_arguments(
     epochs: int,
     batch_size: int,
     checkpoint_interval: int,
-    refresh_seconds: int,
     learning_rate: float,
     weight_decay: float,
     grad_clip_norm: float | None,
@@ -348,8 +342,6 @@ def _validate_training_arguments(
         raise ValueError("batch_size must be positive")
     if checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be positive")
-    if refresh_seconds < 0:
-        raise ValueError("refresh_seconds must be non-negative")
     if learning_rate <= 0:
         raise ValueError("learning_rate must be positive")
     if weight_decay < 0:
@@ -371,12 +363,12 @@ def _prepare_run(
     run_path: Path,
     *,
     resume_checkpoint: str | None,
-) -> tuple[TrainingRunRecord, ...]:
+) -> None:
     if resume_checkpoint is None:
         if run_path.exists():
             raise FileExistsError(f"training run already exists: {run_path}")
         run_path.mkdir(parents=True)
-        return ()
+        return
 
     if not run_path.is_dir():
         raise FileNotFoundError(f"run directory does not exist for resume: {run_path}")
@@ -384,28 +376,64 @@ def _prepare_run(
     checkpoint_path = run_path / Path(*checkpoint_name.parts)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint_path}")
-    metadata = trainer.load_checkpoint(checkpoint_path)
-    history_path = run_path / "metrics.json"
-    if history_path.exists():
-        return read_training_history(history_path)
-    if metadata.metrics is None:
-        raise ValueError("resume checkpoint must contain validation metrics")
-    return (
-        TrainingRunRecord(
-            epoch=metadata.epoch,
-            step=metadata.step,
-            training=None,
-            validation=metadata.metrics,
-            checkpoint=checkpoint_path.name,
+    trainer.load_checkpoint(checkpoint_path)
+
+
+def _read_metrics(path: Path) -> ModalEpochMetrics:
+    decoded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(decoded, Mapping):
+        raise ValueError("Modal metrics must be a JSON object")
+    validation = decoded.get("validation")
+    if not isinstance(validation, Mapping):
+        raise ValueError("Modal metrics validation must be a JSON object")
+    return ModalEpochMetrics(
+        run_name=_required_str(decoded, "run_name"),
+        epoch=_required_int(decoded, "epoch"),
+        step=_required_int(decoded, "step"),
+        train_examples=_required_int(decoded, "train_examples"),
+        train_total_loss=_required_float(decoded, "train_total_loss"),
+        train_policy_loss=_required_float(decoded, "train_policy_loss"),
+        train_value_loss=_required_float(decoded, "train_value_loss"),
+        validation=ValidationMetrics(
+            example_count=_required_int(validation, "example_count"),
+            policy_loss=_required_float(validation, "policy_loss"),
+            uniform_policy_loss=_required_float(validation, "uniform_policy_loss"),
+            policy_top1_accuracy=_required_float(validation, "policy_top1_accuracy"),
+            policy_top5_accuracy=_required_float(validation, "policy_top5_accuracy"),
+            value_mse=_required_float(validation, "value_mse"),
+            value_mae=_required_float(validation, "value_mae"),
         ),
+        checkpoint=_optional_str(decoded, "checkpoint"),
+        elapsed_seconds=_required_float(decoded, "elapsed_seconds"),
     )
 
 
-def _latest_checkpoint(history: Iterable[TrainingRunRecord]) -> str | None:
-    for record in reversed(tuple(history)):
-        if record.checkpoint is not None:
-            return record.checkpoint
-    return None
+def _required_str(payload: Mapping[str, object], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str):
+        raise ValueError(f"Modal metrics field {name!r} must be a string")
+    return value
+
+
+def _required_int(payload: Mapping[str, object], name: str) -> int:
+    value = payload.get(name)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Modal metrics field {name!r} must be an integer")
+    return value
+
+
+def _required_float(payload: Mapping[str, object], name: str) -> float:
+    value = payload.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"Modal metrics field {name!r} must be numeric")
+    return float(value)
+
+
+def _optional_str(payload: Mapping[str, object], name: str) -> str | None:
+    value = payload.get(name)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"Modal metrics field {name!r} must be a string or null")
+    return value
 
 
 def _volume_relative_path(root: str, child: str) -> str:

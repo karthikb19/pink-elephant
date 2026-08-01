@@ -185,24 +185,3 @@ checkpoint, preserves the existing metric history, and continues from the
 checkpoint epoch. Checkpoints are written only at the configured interval;
 the example therefore produces `epoch-000002.pt`, `epoch-000004.pt`, through
 `epoch-000010.pt`.
-
-## Run training on Modal
-
-pink_elephant.modal_training uses the same loader, trainer, and dashboard on
-one L4 GPU. It uploads the complete processed dataset to a named Modal Volume
-before starting the job, stores checkpoints and metrics under a unique run
-path, and downloads index.html plus metrics.json to the local output
-directory when the job finishes:
-
-~~~sh
-uv run modal run src/pink_elephant/modal_training.py \
-  --dataset-dir data/processed/expert/v1-pilot \
-  --dataset-name expert-v1-pilot \
-  --epochs 10
-~~~
-
-The default Modal configuration is a 128-channel, eight-block residual model,
-batch size 1,024, AdamW learning rate 3e-4, and value-loss weight 0.25.
-Open the downloaded index.html to inspect policy loss, value error, and
-policy accuracy. Keep each --run-name unique; Modal Volume uploads and run
-checkpoints are write-once by default.

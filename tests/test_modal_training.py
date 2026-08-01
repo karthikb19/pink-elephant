@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import pytest
 
 import pink_elephant.modal_training as modal_training
+from pink_elephant.contracts import ValidationMetrics
 from pink_elephant.pgn import PgnParserConfig
 from pink_elephant.shards import write_pgn_dataset
 
@@ -43,8 +45,6 @@ class _FakeVolume:
         return _FakeBatch(self.upload_call)
 
     def read_file(self, path: str) -> list[bytes]:
-        if path.endswith("/index.html"):
-            return [b"<html>", b"dashboard</html>"]
         return [b'{"epoch": 1}']
 
 
@@ -64,7 +64,7 @@ def test_modal_defaults_target_an_l4_with_a_larger_network() -> None:
     assert modal_training.MODAL_BATCH_SIZE == 1_024
     assert modal_training.MODAL_CHANNELS == 128
     assert modal_training.MODAL_RESIDUAL_BLOCKS == 8
-    assert pytest.approx(0.25) == modal_training.EXPERT_PRETRAINING_VALUE_WEIGHT
+    assert pytest.approx(0.25) == modal_training.MODAL_VALUE_WEIGHT
 
 
 def test_volume_paths_reject_absolute_and_parent_traversal() -> None:
@@ -98,20 +98,41 @@ def test_upload_dataset_validates_shards_and_uses_a_versioned_volume_path(
     assert volume.upload_call.remote_path == remote_path
 
 
-def test_download_run_artifacts_writes_dashboard_and_metrics(
+def test_download_run_metrics_writes_metrics_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     volume = _FakeVolume()
     monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
 
-    dashboard, metrics = modal_training.download_run_artifacts(
+    metrics = modal_training.download_run_metrics(
         tmp_path / "local-run",
         volume_name="test-volume",
         run_name="l4-trial",
     )
 
-    assert dashboard.read_text(encoding="utf-8") == "<html>dashboard</html>"
     assert metrics.read_text(encoding="utf-8") == '{"epoch": 1}'
+
+
+def test_modal_metrics_round_trip(tmp_path: Path) -> None:
+    metrics = modal_training.ModalEpochMetrics(
+        run_name="l4-trial",
+        epoch=2,
+        step=8,
+        train_examples=128,
+        train_total_loss=1.5,
+        train_policy_loss=1.2,
+        train_value_loss=0.3,
+        validation=ValidationMetrics(64, 1.1, 2.0, 0.2, 0.7, 0.8, 0.6),
+        checkpoint="epoch-000002-step-000000008.pt",
+        elapsed_seconds=3.5,
+    )
+    path = tmp_path / "metrics.json"
+    path.write_text(
+        json.dumps(asdict(metrics)),
+        encoding="utf-8",
+    )
+
+    assert modal_training._read_metrics(path) == metrics
 
 
 def test_local_dataset_validation_rejects_a_missing_manifest_shard(tmp_path: Path) -> None:

@@ -90,9 +90,9 @@ def _board_batch() -> TrainingBatch:
     )
 
 
-def test_expert_pretraining_default_uses_the_configured_value_weight() -> None:
-    assert pytest.approx(0.25) == EXPERT_PRETRAINING_VALUE_WEIGHT
-    assert TrainerConfig().value_weight == pytest.approx(0.25)
+def test_expert_pretraining_default_uses_a_low_value_weight() -> None:
+    assert pytest.approx(0.01) == EXPERT_PRETRAINING_VALUE_WEIGHT
+    assert TrainerConfig().value_weight == pytest.approx(0.01)
 
 
 def test_masking_removes_a_high_scoring_illegal_action() -> None:

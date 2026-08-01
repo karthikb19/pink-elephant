@@ -6,7 +6,7 @@ AlphaGo-style chess experiments.
 
 The Modal runner uploads a processed dataset into a named Volume, trains the
 larger 128-channel/8-block network on one L4 GPU, and downloads the completed
-metrics plus self-contained dashboard.
+metrics JSON plus checkpoints.
 
 ~~~sh
 uv run modal run src/pink_elephant/modal_training.py \
@@ -15,7 +15,7 @@ uv run modal run src/pink_elephant/modal_training.py \
   --epochs 10
 ~~~
 
-Open data/modal-runs/<run-name>/index.html after the command completes. The
+Open data/modal-runs/<run-name>/metrics.json after the command completes. The
 checkpoints remain in the Volume under runs/<run-name>/; retrieve one with
 uv run modal volume get pink-elephant-training runs/<run-name>/<checkpoint> ..
 Use a fresh --run-name for each experiment because dataset and run paths are
