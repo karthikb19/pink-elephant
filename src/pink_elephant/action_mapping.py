@@ -48,9 +48,10 @@ _UNDERPROMOTION_OFFSET = _RAY_PLANES + _KNIGHT_PLANES
 def move_to_policy_index(board: chess.Board, move: chess.Move) -> int:
     """Return the policy index for a legal move in ``board``.
 
-    The index uses the same side-to-move orientation as
-    :func:`pink_elephant.encoding.encode_board`. Queen promotions use the ray
-    plane for their movement; underpromotions use their dedicated nine planes.
+    The index uses a 180-degree side-to-move orientation: Black positions are
+    rotated so the active player's home rank and files occupy the same tensor
+    coordinates as White's. Queen promotions use the ray plane for their
+    movement; underpromotions use their dedicated nine planes.
     """
 
     if move not in board.legal_moves:
@@ -104,11 +105,14 @@ def _move_to_policy_index(board: chess.Board, move: chess.Move) -> int:
 
 
 def _canonical_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
-    """Return a square's row and file in the side-to-move orientation."""
+    """Return a square's row and file after rotating Black's board 180 degrees."""
 
     rank = chess.square_rank(square)
     file = chess.square_file(square)
-    return (rank if turn == chess.WHITE else BOARD_SIZE - 1 - rank, file)
+    if turn == chess.BLACK:
+        rank = BOARD_SIZE - 1 - rank
+        file = BOARD_SIZE - 1 - file
+    return rank, file
 
 
 def _plane_for_move(row_delta: int, column_delta: int, promotion: chess.PieceType | None) -> int:
@@ -192,8 +196,10 @@ def _ray_promotion(
 def _board_square(row: int, column: int, turn: chess.Color) -> chess.Square:
     """Convert a canonical coordinate back to a board square."""
 
-    rank = row if turn == chess.WHITE else BOARD_SIZE - 1 - row
-    return chess.square(column, rank)
+    if turn == chess.BLACK:
+        row = BOARD_SIZE - 1 - row
+        column = BOARD_SIZE - 1 - column
+    return chess.square(column, row)
 
 
 def _is_on_board(row: int, column: int) -> bool:
