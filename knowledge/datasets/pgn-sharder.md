@@ -129,7 +129,9 @@ validation_loader = ExpertBatchLoader(
     shuffle=False,
 )
 trainer = Trainer(
-    ChessResNet(ResNetConfig()),
+    ChessResNet(
+        ResNetConfig(channels=4, residual_blocks=1, policy_channels=1, value_hidden_channels=4)
+    ),
     TrainerConfig(seed=0),
 )
 trainer.fit(
