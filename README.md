@@ -21,6 +21,17 @@ uv run modal volume get pink-elephant-training runs/<run-name>/<checkpoint> ..
 Use a fresh --run-name for each experiment because dataset and run paths are
 immutable by default.
 
+The function emits flushed JSON progress events. Follow them from another
+terminal while the run is active:
+
+~~~sh
+uv run modal app logs pink-elephant-training -f --tail 100
+~~~
+
+Look for `training_started`, `batch_progress`, `checkpoint_saved`, and
+`epoch_completed`. The latter is also committed to the Volume after every
+epoch, so `metrics.json` remains a durable progress artifact if the job stops.
+
 ## Development
 
 ```sh

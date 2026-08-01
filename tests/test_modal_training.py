@@ -5,9 +5,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import pytest
+import torch
 
 import pink_elephant.modal_training as modal_training
-from pink_elephant.contracts import ValidationMetrics
+from pink_elephant.action_mapping import POLICY_SIZE
+from pink_elephant.contracts import TrainingBatch, ValidationMetrics
+from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 from pink_elephant.pgn import PgnParserConfig
 from pink_elephant.shards import write_pgn_dataset
 
@@ -174,6 +177,30 @@ def test_modal_metrics_round_trip(tmp_path: Path) -> None:
     )
 
     assert modal_training._read_metrics(path) == metrics
+
+
+def test_batch_progress_logs_periodic_json_events(capsys: pytest.CaptureFixture[str]) -> None:
+    batch = TrainingBatch(
+        positions=torch.zeros((2, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE)),
+        legal_mask=torch.ones((2, POLICY_SIZE), dtype=torch.bool),
+        played_actions=torch.zeros(2, dtype=torch.int64),
+        outcomes=torch.zeros(2),
+    )
+
+    assert list(
+        modal_training._log_batch_progress(
+            [batch, batch, batch],
+            phase="train",
+            epoch=2,
+            total_batches=3,
+        )
+    ) == [batch, batch, batch]
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [record["batch"] for record in records] == [1, 2, 3]
+    assert all(record["event"] == "batch_progress" for record in records)
+    assert all(record["phase"] == "train" for record in records)
+    assert records[-1]["examples_seen"] == 6
 
 
 def test_local_dataset_validation_rejects_a_missing_manifest_shard(tmp_path: Path) -> None:
