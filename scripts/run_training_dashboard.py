@@ -20,7 +20,12 @@ from pink_elephant.dashboard import (
 )
 from pink_elephant.dataset import ExpertBatchLoader
 from pink_elephant.model import ChessResNet, ResNetConfig
-from pink_elephant.training import CheckpointMetadata, Trainer, TrainerConfig
+from pink_elephant.training import (
+    EXPERT_PRETRAINING_VALUE_WEIGHT,
+    CheckpointMetadata,
+    Trainer,
+    TrainerConfig,
+)
 
 
 def main() -> None:
@@ -51,7 +56,7 @@ def main() -> None:
         TrainerConfig(
             learning_rate=1e-3,
             weight_decay=1e-4,
-            value_weight=0.01,
+            value_weight=EXPERT_PRETRAINING_VALUE_WEIGHT,
             device=device,
             seed=0,
         ),

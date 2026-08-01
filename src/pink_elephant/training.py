@@ -22,7 +22,7 @@ from pink_elephant.contracts import (
 from pink_elephant.model import ModelOutput
 
 CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
-EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.01
+EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.25
 
 
 class _ConfigPayload(TypedDict):
@@ -67,8 +67,9 @@ class _CheckpointPayload(TypedDict):
 class TrainerConfig:
     """Configuration for the local AdamW policy/value trainer.
 
-    The default value weight follows AlphaGo Zero's supervised human-game
-    pretraining setup; self-play training can explicitly use ``1.0``.
+    The default value weight gives the signed outcome target enough influence
+    to matter during expert-game pretraining; self-play can explicitly use a
+    different objective.
     """
 
     learning_rate: float = 1e-3
@@ -189,7 +190,7 @@ def compute_joint_loss(
 ) -> JointLoss:
     """Compute legal-masked policy loss, scalar value loss, and their sum.
 
-    ``value_weight=0.01`` is the expert-PGN pretraining default. Passing
+    ``value_weight=0.25`` is the expert-PGN pretraining default. Passing
     ``1.0`` selects the equal-weight AlphaZero-style self-play objective.
     """
 
