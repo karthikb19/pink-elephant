@@ -1,0 +1,54 @@
+[Event "Fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/white-win"]
+[Result "1-0"]
+[Variant "Standard"]
+
+1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# 1-0
+
+[Event "Fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/black-win"]
+[Result "0-1"]
+[Variant "Standard"]
+
+1. f3 e5 2. g4 Qh4# 0-1
+
+[Event "Fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/draw"]
+[Result "1/2-1/2"]
+[Variant "Standard"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1/2-1/2
+
+[Event "Fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/invalid-result"]
+[Result "*"]
+[Variant "Standard"]
+
+1. e4 *
+
+[Event "Fixture"]
+[Site "local"]
+[Result "1-0"]
+[Variant "Standard"]
+
+1. e4 1-0
+
+[Event "Fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/unsupported"]
+[Result "1-0"]
+[Variant "Chess960"]
+
+1. e4 1-0
+
+[Event "Fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/parse-error"]
+[Result "1-0"]
+[Variant "Standard"]
+
+1. e4 e5 2. e4 1-0
