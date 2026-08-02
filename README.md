@@ -63,6 +63,22 @@ uv run python scripts/play_chess.py \
 The loader reconstructs the model shape from the checkpoint weights, so it can
 open the current Modal L4 checkpoints without duplicating the training image.
 
+For a browser UI, run the local server and open the printed URL:
+
+~~~sh
+uv run python scripts/play_chess_web.py \
+  --checkpoint checkpoints/epoch-000010-step-000021900.pt \
+  --human-color white \
+  --simulations 16
+~~~
+
+The board supports click-to-move as well as SAN/UCI text input. The server
+stays local; stop it with `Ctrl-C`.
+
+`--simulations` controls the number of MCTS search rollouts used to choose each
+model move. More rollouts generally produce better-informed moves but take
+longer. Start with 16 or 32, then increase it if move latency is acceptable.
+
 ## Development
 
 ```sh

@@ -11,15 +11,17 @@ to compare two checkpoints directly.
 
 ## Decision
 
-Add a dependency-light terminal interface in `scripts/`. Download checkpoints
-with the existing Modal CLI, restore the saved network locally, and use the
-existing MCTS implementation for human-vs-checkpoint and checkpoint-vs-checkpoint play.
+Add dependency-light local interfaces in `scripts/`. Download checkpoints with
+the existing Modal CLI, restore the saved network locally, and use the existing
+MCTS implementation for terminal or browser-based human-vs-checkpoint play and
+checkpoint-vs-checkpoint matches.
 
 ## Alternatives
 
-A new Modal inference image or a web UI would add deployment and dependency
-work before the model can be evaluated interactively. A local terminal loop
-keeps the first interface offline after download and reuses current code.
+A new Modal inference image or a deployed web UI would add deployment and
+dependency work before the model can be evaluated interactively. A local HTTP
+server keeps the browser experience offline after download and reuses current
+code without adding a frontend dependency.
 
 ## Consequences
 
@@ -31,5 +33,5 @@ swapping can be used to reduce first-move bias.
 ## Surface Areas
 
 The new files are `scripts/download_checkpoint.py`, `scripts/play_chess.py`,
-their focused tests, and the README usage section. Modal training artifacts and
-the checkpoint format remain unchanged.
+`scripts/play_chess_web.py`, their focused tests, and the README usage section.
+Modal training artifacts and the checkpoint format remain unchanged.
