@@ -1,0 +1,38 @@
+# Local checkpoint play interface
+
+**Date:** 2026-08-02
+**Status:** Accepted
+
+## Context
+
+The training runner produces immutable checkpoints in a Modal Volume, but the
+repository has no way to inspect a checkpoint by playing chess against it or
+to compare two checkpoints directly.
+
+## Decision
+
+Add local interfaces in `scripts/` and a small React/Vite frontend in
+`frontend/`. Download checkpoints with the existing Modal CLI, restore the
+saved network locally, and use the existing MCTS implementation for terminal
+or browser-based human-vs-checkpoint play and checkpoint-vs-checkpoint matches.
+
+## Alternatives
+
+A new Modal inference image or a deployed web UI would add deployment work
+before the model can be evaluated interactively. A local React build served by
+the existing HTTP server gives the browser a richer interaction model while
+keeping inference offline after download.
+
+## Consequences
+
+The checkpoint architecture is inferred from the saved state because the
+current checkpoint format does not store `ResNetConfig`. Model-vs-model games
+are deterministic for a fixed checkpoint, device, and simulation count; color
+swapping can be used to reduce first-move bias.
+
+## Surface Areas
+
+The new files are `scripts/download_checkpoint.py`, `scripts/play_chess.py`,
+`scripts/play_chess_web.py`, `frontend/`, their focused tests, and the README
+usage section. The browser adds a one-time Node/npm build step. Modal training
+artifacts and the checkpoint format remain unchanged.
