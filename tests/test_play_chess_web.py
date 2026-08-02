@@ -43,7 +43,7 @@ def test_game_session_applies_human_move_and_model_response() -> None:
     assert "g1f3" in after_move["legal_moves"]
 
 
-def test_web_server_serves_page_and_move_api() -> None:
+def test_web_server_serves_frontend_page_and_move_api(tmp_path: Path) -> None:
     play_chess = _load_script(SCRIPT_PATH, "play_chess_http")
     play_chess_web = _load_script(WEB_SCRIPT_PATH, "play_chess_web_http_test")
     session = play_chess_web.GameSession(
@@ -51,14 +51,26 @@ def test_web_server_serves_page_and_move_api() -> None:
         human_color=chess.WHITE,
         simulations=16,
     )
-    server = play_chess_web.create_server(session, host="127.0.0.1", port=0)
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / "index.html").write_text("<html>React app</html>", encoding="utf-8")
+    (frontend_dir / "assets.js").write_text("console.log('app')", encoding="utf-8")
+    server = play_chess_web.create_server(
+        session,
+        host="127.0.0.1",
+        port=0,
+        frontend_dir=frontend_dir,
+    )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         with urllib.request.urlopen(f"{base_url}/") as response:
             page = response.read().decode("utf-8")
-        assert "Pink Elephant Chess" in page
+        assert "React app" in page
+
+        with urllib.request.urlopen(f"{base_url}/assets.js") as response:
+            assert response.read().decode("utf-8") == "console.log('app')"
 
         request = urllib.request.Request(
             f"{base_url}/api/move",

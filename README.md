@@ -66,14 +66,18 @@ open the current Modal L4 checkpoints without duplicating the training image.
 For a browser UI, run the local server and open the printed URL:
 
 ~~~sh
+npm --prefix frontend install
+npm --prefix frontend run build
+
 uv run python scripts/play_chess_web.py \
   --checkpoint checkpoints/epoch-000010-step-000021900.pt \
   --human-color white \
   --simulations 16
 ~~~
 
-The board supports click-to-move as well as SAN/UCI text input. The server
-stays local; stop it with `Ctrl-C`.
+The React board supports click-to-move as well as SAN/UCI text input. The
+Python server hosts the built app and inference API locally; stop it with
+`Ctrl-C`.
 
 `--simulations` controls the number of MCTS search rollouts used to choose each
 model move. More rollouts generally produce better-informed moves but take

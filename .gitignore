@@ -205,6 +205,11 @@ tempCodeRunnerFile.py
 
 # Local chess datasets, processed examples, and training artifacts
 data/
+checkpoints/
+
+# Local React dependencies and build output
+frontend/node_modules/
+frontend/dist/
 
 # Ruff stuff:
 .ruff_cache/

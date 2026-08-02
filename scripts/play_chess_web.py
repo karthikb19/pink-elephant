@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import threading
 from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
+from urllib.parse import urlsplit
 
 import chess
 from play_chess import (
@@ -151,10 +153,16 @@ class GameSession:
         return f"{self._model_player.label} is thinking"
 
 
-def create_server(session: GameSession, *, host: str, port: int) -> ThreadingHTTPServer:
+def create_server(
+    session: GameSession,
+    *,
+    host: str,
+    port: int,
+    frontend_dir: Path = Path("frontend/dist"),
+) -> ThreadingHTTPServer:
     """Create the local HTTP server for one game session."""
 
-    handler = _request_handler(session)
+    handler = _request_handler(session, frontend_dir.expanduser().resolve())
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server
@@ -165,6 +173,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     args = _parse_args(argv)
     device = infer_device(args.device)
+    frontend_dir = args.frontend_dir.expanduser().resolve()
+    if not (frontend_dir / "index.html").is_file():
+        raise FileNotFoundError(
+            f"React frontend is not built at {frontend_dir}; "
+            "run `npm --prefix frontend install && npm --prefix frontend run build` first"
+        )
     checkpoint = load_checkpoint_model(args.checkpoint.expanduser().resolve(), device)
     model_player = CheckpointPlayer(
         evaluator=CheckpointEvaluator(checkpoint),
@@ -177,7 +191,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         human_color=human_color,
         simulations=args.simulations,
     )
-    server = create_server(session, host=args.host, port=args.port)
+    server = create_server(
+        session,
+        host=args.host,
+        port=args.port,
+        frontend_dir=frontend_dir,
+    )
     address = server.server_address
     print(f"Open http://{address[0]}:{address[1]} in your browser")
     print(f"Loaded {checkpoint.path} on {device}")
@@ -189,21 +208,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         server.server_close()
 
 
-def _request_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
+def _request_handler(session: GameSession, frontend_dir: Path) -> type[BaseHTTPRequestHandler]:
     """Build a request handler bound to one in-memory game session."""
 
     class RequestHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = self.path.split("?", 1)[0]
-            if path == "/":
-                self._send_bytes(HTTPStatus.OK, "text/html", HTML_PAGE.encode("utf-8"))
-            elif path == "/api/state":
+            path = urlsplit(self.path).path
+            if path == "/api/state":
                 self._send_json(HTTPStatus.OK, session.state())
-            else:
+            elif path.startswith("/api/"):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            else:
+                self._serve_frontend(path)
 
         def do_POST(self) -> None:
-            path = self.path.split("?", 1)[0]
+            path = urlsplit(self.path).path
             try:
                 payload = self._read_json()
                 if path == "/api/move":
@@ -247,6 +266,25 @@ def _request_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _serve_frontend(self, path: str) -> None:
+            """Serve a built frontend file without allowing path traversal."""
+
+            relative_path = path.lstrip("/") or "index.html"
+            candidate = (frontend_dir / relative_path).resolve()
+            try:
+                candidate.relative_to(frontend_dir)
+            except ValueError:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            if not candidate.is_file():
+                if relative_path == "index.html":
+                    self._send_bytes(HTTPStatus.OK, "text/html", HTML_PAGE.encode("utf-8"))
+                else:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+            self._send_bytes(HTTPStatus.OK, content_type, candidate.read_bytes())
+
         def log_message(self, format: str, *args: object) -> None:
             return
 
@@ -261,6 +299,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--frontend-dir",
+        type=Path,
+        default=Path("frontend/dist"),
+        help="built React app directory",
+    )
     args = parser.parse_args(argv)
     if args.simulations < 1:
         parser.error("--simulations must be positive")
