@@ -25,12 +25,37 @@ The function emits flushed JSON progress events. Follow them from another
 terminal while the run is active:
 
 ~~~sh
-uv run modal app logs pink-elephant-training -f --tail 100
+uv run modal app logs pink-elephant-training -f
 ~~~
 
 Look for `training_started`, `batch_progress`, `checkpoint_saved`, and
 `epoch_completed`. The latter is also committed to the Volume after every
 epoch, so `metrics.json` remains a durable progress artifact if the job stops.
+
+## Checkpoint arena
+
+Play a local checkpoint against Stockfish with an Elo-limited opponent. The
+first run downloads the latest official Stockfish release for the host and
+caches it under `~/.cache/pink-elephant/stockfish`:
+
+```sh
+uv run play-stockfish \
+  --checkpoint ../../pink-elephant/checkpoints/epoch-000010-step-000021900.pt \
+  --stockfish-elo 1400 \
+  --model-color white
+```
+
+The current local checkpoint is not tracked by Git, so the example points from
+this worktree at the checkpoint in the main checkout. Use `--model-color
+alternate --games 2` for a two-game color-swapped match. The checkpoint model
+architecture is inferred from its saved tensors; `--model-simulations` controls
+the search used for checkpoint moves. To download Stockfish without playing:
+
+```sh
+uv run play-stockfish --download-only
+```
+
+An existing executable can be supplied with `--stockfish-binary`.
 
 ## Development
 
