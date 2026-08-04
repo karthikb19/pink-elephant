@@ -78,9 +78,10 @@ Validation should also be broken down by:
 - decisive versus drawn games;
 - player rating, if the processed schema retains or can recover it.
 
-Keep an append-only metric history for every training run. The current Modal
-runner overwrites `metrics.json` after each epoch, although the individual
-checkpoints retain their validation metrics.
+Keep an append-only metric history for every training run. Modal retains the
+latest snapshot in `metrics.json` and appends each epoch to
+`metrics-history.jsonl`; individual checkpoints also retain their validation
+metrics.
 
 ## Scale data by unique examples rather than epoch count
 
@@ -94,11 +95,13 @@ That is approximately one pass through the complete 10x corpus. One full-data
 epoch should be more valuable than ten pilot epochs because it contains about
 ten times as many unique games and positions.
 
-The first controlled data experiment should therefore be:
+The next full-data experiment should therefore be:
 
-1. Keep the 128-channel, 8-block model unchanged.
-2. Train for one complete pass over the full dataset.
-3. Compare it against the pilot epoch-10 checkpoint in the arena.
+1. Train the 192-channel, 12-block model for one complete pass over the full
+   dataset with value weight `1.0`.
+2. Compare every checkpoint against the pilot epoch-10 checkpoint in the arena.
+3. Retain the 128-channel, 8-block configuration as an explicit control by
+   passing `--channels 128 --residual-blocks 8`.
 4. Continue training only while held-out metrics and playing strength improve.
 
 Do not automatically run ten full-data epochs. Repeated exposure to correlated
@@ -173,7 +176,7 @@ waiting:
 - batch validation uses GPU `.any()`, `.all()`, `.isfinite()`, and Python
   `bool()` operations, which create CPU/GPU synchronization points;
 - legal policy masking repeats finite and legality checks on CUDA;
-- training reads three loss values with `.item()` on every batch;
+- training previously read three loss values with `.item()` on every batch;
 - Parquet rows are converted to individual Python example objects;
 - dense legal masks are constructed one row at a time;
 - data reading, collation, transfer, and GPU execution are synchronous.
@@ -183,7 +186,9 @@ Optimize in this order:
 1. Profile 100 to 200 representative steps with both CPU and CUDA activities.
 2. Validate source batches once on CPU and use a trusted internal batch type on
    the CUDA hot path.
-3. Vectorize Parquet-to-batch conversion and dense legal-mask construction.
+3. Accumulate detached training losses on the device and transfer the three
+   epoch totals once; then vectorize Parquet-to-batch conversion and dense
+   legal-mask construction.
 4. Randomize shards and row groups before applying bounded example shuffling.
 5. Add worker prefetch, pinned host memory, and non-blocking CUDA transfers.
 6. Enable automatic mixed precision for convolutions and linear layers.
@@ -233,8 +238,8 @@ as permanent.
 ```text
 playing arena and tactical benchmark
 -> trainer profiling and throughput fixes
--> one full-data epoch with the 128 x 8 baseline
--> controlled 192 x 12 comparison
+-> one full-data epoch with the 192 x 12 baseline
+-> 128 x 8 control comparison when attribution is needed
 -> engine-assisted value and policy targets
 -> batched, parallel MCTS self-play
 -> gated iterative improvement

@@ -33,17 +33,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stockfish-elo",
         type=int,
-        default=1400,
+        default=1500,
         metavar="ELO",
-        help=f"Stockfish Elo ({MIN_UCI_ELO}-{MAX_UCI_ELO}, default: 1400)",
+        help=f"Stockfish Elo ({MIN_UCI_ELO}-{MAX_UCI_ELO}, default: 1500)",
     )
     parser.add_argument(
         "--model-color",
         choices=("white", "black", "alternate"),
-        default="white",
+        default="alternate",
         help="side for the checkpoint; alternate switches side each game",
     )
-    parser.add_argument("--games", type=int, default=1, help="number of games (default: 1)")
+    parser.add_argument("--games", type=int, default=10, help="number of games (default: 10)")
     parser.add_argument(
         "--model-simulations",
         type=int,
@@ -131,6 +131,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _play_games(
     args: argparse.Namespace, model_player: ModelPlayer, stockfish_player: StockfishPlayer
 ) -> None:
+    model_wins = 0
+    draws = 0
+    model_losses = 0
+    unfinished = 0
     for game_index in range(args.games):
         model_color = _model_color(args.model_color, game_index)
         print(f"\nGame {game_index + 1}/{args.games}: checkpoint={_color_name(model_color)}")
@@ -143,6 +147,24 @@ def _play_games(
         )
         print(f"\nResult: {result.result} ({result.termination}, {result.plies} plies)")
         print(result.pgn)
+        if result.result == "*":
+            unfinished += 1
+        elif result.result == "1/2-1/2":
+            draws += 1
+        elif (model_color and result.result == "1-0") or (
+            not model_color and result.result == "0-1"
+        ):
+            model_wins += 1
+        else:
+            model_losses += 1
+
+    completed = model_wins + draws + model_losses
+    score = (model_wins + 0.5 * draws) / completed if completed else 0.0
+    print(
+        "\nArena summary: "
+        f"wins={model_wins}, draws={draws}, losses={model_losses}, "
+        f"unfinished={unfinished}, score={score:.3f}"
+    )
 
 
 def _model_color(setting: str, game_index: int) -> chess.Color:

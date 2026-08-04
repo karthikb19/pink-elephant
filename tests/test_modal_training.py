@@ -67,12 +67,12 @@ def _write_dataset(output_dir: Path) -> None:
         )
 
 
-def test_modal_defaults_target_an_l4_with_a_larger_network() -> None:
+def test_modal_defaults_target_an_l4_with_equal_policy_and_value_weight() -> None:
     assert modal_training.MODAL_GPU == "L4"
     assert modal_training.MODAL_BATCH_SIZE == 1_024
-    assert modal_training.MODAL_CHANNELS == 128
-    assert modal_training.MODAL_RESIDUAL_BLOCKS == 8
-    assert pytest.approx(0.25) == modal_training.MODAL_VALUE_WEIGHT
+    assert modal_training.MODAL_CHANNELS == 192
+    assert modal_training.MODAL_RESIDUAL_BLOCKS == 12
+    assert pytest.approx(1.0) == modal_training.MODAL_VALUE_WEIGHT
 
 
 def test_volume_paths_reject_absolute_and_parent_traversal() -> None:
@@ -157,6 +157,21 @@ def test_download_run_metrics_writes_metrics_json(
     assert metrics.read_text(encoding="utf-8") == '{"epoch": 1}'
 
 
+def test_download_run_metrics_history_writes_jsonl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    volume = _FakeVolume()
+    monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
+
+    metrics = modal_training.download_run_metrics_history(
+        tmp_path / "local-run",
+        volume_name="test-volume",
+        run_name="l4-trial",
+    )
+
+    assert metrics.read_text(encoding="utf-8") == '{"epoch": 1}'
+
+
 def test_modal_metrics_round_trip(tmp_path: Path) -> None:
     metrics = modal_training.ModalEpochMetrics(
         run_name="l4-trial",
@@ -169,6 +184,7 @@ def test_modal_metrics_round_trip(tmp_path: Path) -> None:
         validation=ValidationMetrics(64, 1.1, 2.0, 0.2, 0.7, 0.8, 0.6),
         checkpoint="epoch-000002-step-000000008.pt",
         elapsed_seconds=3.5,
+        recorded_at="2026-08-03T12:34:56+00:00",
     )
     path = tmp_path / "metrics.json"
     path.write_text(
@@ -199,6 +215,7 @@ def test_batch_progress_logs_periodic_json_events(capsys: pytest.CaptureFixture[
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [record["batch"] for record in records] == [1, 2, 3]
     assert all(record["event"] == "batch_progress" for record in records)
+    assert all(record["timestamp"].endswith("+00:00") for record in records)
     assert all(record["phase"] == "train" for record in records)
     assert records[-1]["examples_seen"] == 6
 

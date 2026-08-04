@@ -135,6 +135,33 @@ class TrainingSummary:
     value_loss: float
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationMetricTensors:
+    """Per-batch validation metrics kept on the model device."""
+
+    example_count: int
+    policy_loss: Tensor
+    uniform_policy_loss: Tensor
+    policy_top1_accuracy: Tensor
+    policy_top5_accuracy: Tensor
+    value_mse: Tensor
+    value_mae: Tensor
+
+    def as_tensor(self) -> Tensor:
+        """Return scalar metrics in the public validation-field order."""
+
+        return torch.stack(
+            (
+                self.policy_loss,
+                self.uniform_policy_loss,
+                self.policy_top1_accuracy,
+                self.policy_top5_accuracy,
+                self.value_mse,
+                self.value_mae,
+            )
+        )
+
+
 @dataclass(frozen=True)
 class CheckpointMetadata:
     """Training state and provenance restored from a checkpoint."""
@@ -209,6 +236,24 @@ def compute_joint_loss(
 def compute_validation_metrics(output: ModelOutput, batch: TrainingBatch) -> ValidationMetrics:
     """Compute legal-policy and signed-value metrics for one validation batch."""
 
+    metrics = _compute_validation_metric_tensors(output, batch)
+    values = tuple(float(value) for value in metrics.as_tensor().detach().cpu())
+    return ValidationMetrics(
+        example_count=metrics.example_count,
+        policy_loss=values[0],
+        uniform_policy_loss=values[1],
+        policy_top1_accuracy=values[2],
+        policy_top5_accuracy=values[3],
+        value_mse=values[4],
+        value_mae=values[5],
+    )
+
+
+def _compute_validation_metric_tensors(
+    output: ModelOutput, batch: TrainingBatch
+) -> _ValidationMetricTensors:
+    """Compute validation metrics without moving scalar results to the CPU."""
+
     masked_logits = mask_policy_logits(output.policy_logits, batch.legal_mask)
     value_predictions = _value_predictions(output.value, batch.positions.shape[0])
     if value_predictions.device != batch.outcomes.device:
@@ -226,14 +271,38 @@ def compute_validation_metrics(output: ModelOutput, batch: TrainingBatch) -> Val
     value_mse = value_errors.square().mean()
     value_mae = value_errors.abs().mean()
 
-    return ValidationMetrics(
+    return _ValidationMetricTensors(
         example_count=batch.positions.shape[0],
-        policy_loss=policy_loss.item(),
-        uniform_policy_loss=uniform_policy_loss.item(),
-        policy_top1_accuracy=top1.item(),
-        policy_top5_accuracy=top5.item(),
-        value_mse=value_mse.item(),
-        value_mae=value_mae.item(),
+        policy_loss=policy_loss,
+        uniform_policy_loss=uniform_policy_loss,
+        policy_top1_accuracy=top1,
+        policy_top5_accuracy=top5,
+        value_mse=value_mse,
+        value_mae=value_mae,
+    )
+
+
+def _aggregate_validation_metric_tensors(
+    metrics: Iterable[_ValidationMetricTensors],
+) -> ValidationMetrics:
+    """Aggregate detached validation tensors and transfer only final scalars."""
+
+    collected = tuple(metrics)
+    if not collected:
+        raise ValueError("at least one validation batch is required")
+    example_count = sum(item.example_count for item in collected)
+    totals = torch.zeros_like(collected[0].as_tensor())
+    for item in collected:
+        totals.add_(item.as_tensor().detach(), alpha=item.example_count)
+    values = tuple(float(value) for value in (totals / example_count).detach().cpu())
+    return ValidationMetrics(
+        example_count=example_count,
+        policy_loss=values[0],
+        uniform_policy_loss=values[1],
+        policy_top1_accuracy=values[2],
+        policy_top5_accuracy=values[3],
+        value_mse=values[4],
+        value_mae=values[5],
     )
 
 
@@ -291,9 +360,7 @@ class Trainer:
 
         self.model.train()
         total_examples = 0
-        total_loss = 0.0
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
+        loss_totals: Tensor | None = None
         batch_count = 0
 
         for source_batch in batches:
@@ -308,20 +375,24 @@ class Trainer:
             self.optimizer.step()
             batch_size = batch.positions.shape[0]
             total_examples += batch_size
-            total_loss += batch_size * losses.total.detach().item()
-            total_policy_loss += batch_size * losses.policy.detach().item()
-            total_value_loss += batch_size * losses.value.detach().item()
+            if loss_totals is None:
+                loss_totals = torch.zeros(3, device=losses.total.device, dtype=losses.total.dtype)
+            loss_totals.add_(
+                torch.stack((losses.total.detach(), losses.policy.detach(), losses.value.detach())),
+                alpha=batch_size,
+            )
             batch_count += 1
             self.step += 1
 
-        if batch_count == 0:
+        if batch_count == 0 or loss_totals is None:
             raise ValueError("at least one training batch is required")
         self.epoch += 1
+        total_loss, total_policy_loss, total_value_loss = loss_totals.detach().cpu()
         return TrainingSummary(
             example_count=total_examples,
-            total_loss=total_loss / total_examples,
-            policy_loss=total_policy_loss / total_examples,
-            value_loss=total_value_loss / total_examples,
+            total_loss=float(total_loss) / total_examples,
+            policy_loss=float(total_policy_loss) / total_examples,
+            value_loss=float(total_value_loss) / total_examples,
         )
 
     def validate(self, batches: Iterable[TrainingBatch]) -> ValidationMetrics:
@@ -329,17 +400,17 @@ class Trainer:
 
         was_training = self.model.training
         self.model.eval()
-        batch_metrics: list[ValidationMetrics] = []
+        batch_metrics: list[_ValidationMetricTensors] = []
         try:
             with torch.no_grad():
                 for source_batch in batches:
                     batch = self._on_device(source_batch)
                     batch_metrics.append(
-                        compute_validation_metrics(self._model_output(batch), batch)
+                        _compute_validation_metric_tensors(self._model_output(batch), batch)
                     )
         finally:
             self.model.train(was_training)
-        metrics = aggregate_validation_metrics(batch_metrics)
+        metrics = _aggregate_validation_metric_tensors(batch_metrics)
         self.last_validation_metrics = metrics
         return metrics
 

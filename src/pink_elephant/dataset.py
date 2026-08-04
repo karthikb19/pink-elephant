@@ -134,7 +134,7 @@ class ExpertBatchLoader:
 
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
-        examples: Iterable[ExpertExample] = self._iter_examples()
+        examples: Iterable[ExpertExample] = self._iter_examples(epoch=epoch)
         if self.shuffle:
             examples = _buffer_shuffle(
                 examples,
@@ -143,10 +143,13 @@ class ExpertBatchLoader:
             )
         yield from _batch_examples(examples, batch_size=self.batch_size)
 
-    def _iter_examples(self) -> Iterator[ExpertExample]:
+    def _iter_examples(self, *, epoch: int) -> Iterator[ExpertExample]:
         """Yield validated examples from the manifest-listed split shards."""
 
-        for shard in self._shards:
+        shards = list(self._shards)
+        if self.shuffle:
+            random.Random(self.seed + epoch).shuffle(shards)
+        for shard in shards:
             yield from iter_processed_shard(
                 self._shard_path(shard.relative_path),
                 expected_schema=self.schema,

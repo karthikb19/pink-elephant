@@ -28,15 +28,17 @@ MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 DATASET_VOLUME_ROOT: Final[str] = "datasets"
 RUN_VOLUME_ROOT: Final[str] = "runs"
+METRICS_FILENAME: Final[str] = "metrics.json"
+METRICS_HISTORY_FILENAME: Final[str] = "metrics-history.jsonl"
 MODAL_BATCH_SIZE: Final[int] = 1_024
 MODAL_LEARNING_RATE: Final[float] = 3e-4
 MODAL_WEIGHT_DECAY: Final[float] = 1e-4
 MODAL_GRAD_CLIP_NORM: Final[float] = 1.0
-MODAL_VALUE_WEIGHT: Final[float] = 0.25
+MODAL_VALUE_WEIGHT: Final[float] = 1.0
 MODAL_EPOCHS: Final[int] = 10
 MODAL_CHECKPOINT_INTERVAL: Final[int] = 1
-MODAL_CHANNELS: Final[int] = 128
-MODAL_RESIDUAL_BLOCKS: Final[int] = 8
+MODAL_CHANNELS: Final[int] = 192
+MODAL_RESIDUAL_BLOCKS: Final[int] = 12
 MODAL_POLICY_CHANNELS: Final[int] = 2
 MODAL_VALUE_HIDDEN_CHANNELS: Final[int] = 256
 MODAL_FUNCTION_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
@@ -64,6 +66,7 @@ class ModalEpochMetrics:
     validation: ValidationMetrics
     checkpoint: str | None
     elapsed_seconds: float
+    recorded_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class ModalTrainingResult:
     residual_blocks: int
     final_validation: ValidationMetrics
     metrics_path: str
+    metrics_history_path: str
     latest_checkpoint: str | None
 
 
@@ -114,14 +118,28 @@ def download_run_metrics(
 ) -> Path:
     """Download metrics JSON for one completed run."""
 
-    run_path = _volume_relative_path(RUN_VOLUME_ROOT, run_name)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    volume = modal.Volume.from_name(volume_name)
-    local_file = output_dir / "metrics.json"
-    with local_file.open("wb") as destination:
-        for chunk in volume.read_file(f"{run_path}/metrics.json"):
-            destination.write(chunk)
-    return local_file
+    return _download_run_file(
+        output_dir,
+        volume_name=volume_name,
+        run_name=run_name,
+        filename=METRICS_FILENAME,
+    )
+
+
+def download_run_metrics_history(
+    output_dir: Path,
+    *,
+    volume_name: str = MODAL_VOLUME_NAME,
+    run_name: str,
+) -> Path:
+    """Download the append-only per-epoch metrics history for one run."""
+
+    return _download_run_file(
+        output_dir,
+        volume_name=volume_name,
+        run_name=run_name,
+        filename=METRICS_HISTORY_FILENAME,
+    )
 
 
 @app.function(
@@ -209,7 +227,8 @@ def train_l4(
             f"checkpoint epoch {trainer.epoch} is after requested target epoch {epochs}"
         )
 
-    metrics_path = run_path / "metrics.json"
+    metrics_path = run_path / METRICS_FILENAME
+    metrics_history_path = run_path / METRICS_HISTORY_FILENAME
     final_validation: ValidationMetrics | None = None
     latest_checkpoint: str | None = None
     _log_event(
@@ -292,8 +311,11 @@ def train_l4(
             validation=validation,
             checkpoint=checkpoint,
             elapsed_seconds=time.perf_counter() - epoch_start,
+            recorded_at=datetime.now(UTC).isoformat(),
         )
         metrics_path.write_text(json.dumps(asdict(metrics), indent=2) + "\n", encoding="utf-8")
+        with metrics_history_path.open("a", encoding="utf-8") as history:
+            history.write(json.dumps(asdict(metrics)) + "\n")
         training_volume.commit()
         _log_event("epoch_completed", metrics=asdict(metrics), metrics_path=str(metrics_path))
 
@@ -316,6 +338,9 @@ def train_l4(
         residual_blocks=residual_blocks,
         final_validation=final_validation,
         metrics_path=_volume_relative_path(RUN_VOLUME_ROOT, run_name) + "/metrics.json",
+        metrics_history_path=(
+            _volume_relative_path(RUN_VOLUME_ROOT, run_name) + f"/{METRICS_HISTORY_FILENAME}"
+        ),
         latest_checkpoint=latest_checkpoint,
     )
     _log_event("training_completed", result=asdict(result))
@@ -331,6 +356,8 @@ def main(
     epochs: int = MODAL_EPOCHS,
     batch_size: int = MODAL_BATCH_SIZE,
     checkpoint_interval: int = MODAL_CHECKPOINT_INTERVAL,
+    channels: int = MODAL_CHANNELS,
+    residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     resume_checkpoint: str | None = None,
 ) -> None:
     """Upload data, launch L4 training, and download metrics."""
@@ -351,29 +378,42 @@ def main(
         batch_size=batch_size,
         epochs=epochs,
         run_name=selected_run_name,
+        channels=channels,
+        residual_blocks=residual_blocks,
     )
-    result = train_l4.remote(
+    result = train_l4.spawn(
         dataset_name,
         selected_run_name,
         epochs=epochs,
         batch_size=batch_size,
         checkpoint_interval=checkpoint_interval,
+        channels=channels,
+        residual_blocks=residual_blocks,
         resume_checkpoint=resume_checkpoint,
         git_revision=_git_revision(),
-    )
+    ).get()
     _log_event("training_call_returned", run_name=selected_run_name)
     local_run_dir = Path(output_dir) / selected_run_name
     metrics_path = download_run_metrics(
         local_run_dir,
         run_name=selected_run_name,
     )
+    metrics_history_path = download_run_metrics_history(
+        local_run_dir,
+        run_name=selected_run_name,
+    )
     print(json.dumps(asdict(result), indent=2))
     print(f"uploaded dataset: {remote_dataset}")
     print(f"metrics: {metrics_path}")
+    print(f"metrics history: {metrics_history_path}")
 
 
 def _log_event(event: str, **fields: object) -> None:
-    payload: dict[str, object] = {"event": event, **fields}
+    payload: dict[str, object] = {
+        "event": event,
+        "timestamp": datetime.now(UTC).isoformat(),
+        **fields,
+    }
     print(json.dumps(payload, sort_keys=True), flush=True)
 
 
@@ -404,6 +444,23 @@ def _log_batch_progress(
 
 def _total_batches(example_count: int, batch_size: int) -> int:
     return (example_count + batch_size - 1) // batch_size
+
+
+def _download_run_file(
+    output_dir: Path,
+    *,
+    volume_name: str,
+    run_name: str,
+    filename: str,
+) -> Path:
+    run_path = _volume_relative_path(RUN_VOLUME_ROOT, run_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    volume = modal.Volume.from_name(volume_name)
+    local_file = output_dir / filename
+    with local_file.open("wb") as destination:
+        for chunk in volume.read_file(f"{run_path}/{filename}"):
+            destination.write(chunk)
+    return local_file
 
 
 def _git_revision() -> str | None:
@@ -524,6 +581,7 @@ def _read_metrics(path: Path) -> ModalEpochMetrics:
         ),
         checkpoint=_optional_str(decoded, "checkpoint"),
         elapsed_seconds=_required_float(decoded, "elapsed_seconds"),
+        recorded_at=_optional_str(decoded, "recorded_at") or "",
     )
 
 
