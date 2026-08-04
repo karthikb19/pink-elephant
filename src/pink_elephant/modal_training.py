@@ -66,6 +66,7 @@ class ModalEpochMetrics:
     validation: ValidationMetrics
     checkpoint: str | None
     elapsed_seconds: float
+    recorded_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -310,6 +311,7 @@ def train_l4(
             validation=validation,
             checkpoint=checkpoint,
             elapsed_seconds=time.perf_counter() - epoch_start,
+            recorded_at=datetime.now(UTC).isoformat(),
         )
         metrics_path.write_text(json.dumps(asdict(metrics), indent=2) + "\n", encoding="utf-8")
         with metrics_history_path.open("a", encoding="utf-8") as history:
@@ -379,7 +381,7 @@ def main(
         channels=channels,
         residual_blocks=residual_blocks,
     )
-    result = train_l4.remote(
+    result = train_l4.spawn(
         dataset_name,
         selected_run_name,
         epochs=epochs,
@@ -389,7 +391,7 @@ def main(
         residual_blocks=residual_blocks,
         resume_checkpoint=resume_checkpoint,
         git_revision=_git_revision(),
-    )
+    ).get()
     _log_event("training_call_returned", run_name=selected_run_name)
     local_run_dir = Path(output_dir) / selected_run_name
     metrics_path = download_run_metrics(
@@ -407,7 +409,11 @@ def main(
 
 
 def _log_event(event: str, **fields: object) -> None:
-    payload: dict[str, object] = {"event": event, **fields}
+    payload: dict[str, object] = {
+        "event": event,
+        "timestamp": datetime.now(UTC).isoformat(),
+        **fields,
+    }
     print(json.dumps(payload, sort_keys=True), flush=True)
 
 
@@ -575,6 +581,7 @@ def _read_metrics(path: Path) -> ModalEpochMetrics:
         ),
         checkpoint=_optional_str(decoded, "checkpoint"),
         elapsed_seconds=_required_float(decoded, "elapsed_seconds"),
+        recorded_at=_optional_str(decoded, "recorded_at") or "",
     )
 
 

@@ -184,6 +184,7 @@ def test_modal_metrics_round_trip(tmp_path: Path) -> None:
         validation=ValidationMetrics(64, 1.1, 2.0, 0.2, 0.7, 0.8, 0.6),
         checkpoint="epoch-000002-step-000000008.pt",
         elapsed_seconds=3.5,
+        recorded_at="2026-08-03T12:34:56+00:00",
     )
     path = tmp_path / "metrics.json"
     path.write_text(
@@ -214,6 +215,7 @@ def test_batch_progress_logs_periodic_json_events(capsys: pytest.CaptureFixture[
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [record["batch"] for record in records] == [1, 2, 3]
     assert all(record["event"] == "batch_progress" for record in records)
+    assert all(record["timestamp"].endswith("+00:00") for record in records)
     assert all(record["phase"] == "train" for record in records)
     assert records[-1]["examples_seen"] == 6
 

@@ -9,7 +9,7 @@ The Modal runner uploads a processed dataset into a named Volume, trains the
 JSON, append-only metrics history, and checkpoints.
 
 ~~~sh
-uv run modal run src/pink_elephant/modal_training.py \
+uv run modal run --detach --timestamps src/pink_elephant/modal_training.py \
   --dataset-dir data/processed/expert/v1-pilot \
   --dataset-name expert-v1-pilot \
   --epochs 10 \
@@ -49,6 +49,11 @@ uv run modal app logs pink-elephant-training -f
 Look for `training_started`, `batch_progress`, `checkpoint_saved`, and
 `epoch_completed`. The latter is also committed to the Volume after every
 epoch, so `metrics.json` remains a durable progress artifact if the job stops.
+Every event and epoch metrics record includes a UTC timestamp. The local
+entrypoint submits the job with `spawn(...).get()`, so `--detach` allows the
+remote training job to continue if this computer or terminal disconnects.
+Afterward, retrieve metrics or checkpoints from the Modal Volume with
+`modal volume get` or inspect the run in the Modal dashboard.
 
 ## Checkpoint arena
 
