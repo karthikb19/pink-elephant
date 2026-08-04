@@ -6,6 +6,7 @@ import chess
 import torch
 
 from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game
+from pink_elephant.arena_cli import build_parser
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.training import CHECKPOINT_FORMAT_VERSION
 
@@ -64,6 +65,14 @@ def test_play_game_stops_at_move_limit_and_emits_pgn() -> None:
     assert result.termination == "move_limit"
     assert result.plies == 4
     assert "1." in result.pgn
+
+
+def test_arena_defaults_to_ten_games_against_1500_stockfish() -> None:
+    args = build_parser().parse_args(["--checkpoint", "checkpoint.pt"])
+
+    assert args.games == 10
+    assert args.stockfish_elo == 1500
+    assert args.model_color == "alternate"
 
 
 def _write_and_return(path: Path) -> Path:

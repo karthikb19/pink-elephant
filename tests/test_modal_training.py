@@ -67,12 +67,12 @@ def _write_dataset(output_dir: Path) -> None:
         )
 
 
-def test_modal_defaults_target_an_l4_with_a_larger_network() -> None:
+def test_modal_defaults_target_an_l4_with_equal_policy_and_value_weight() -> None:
     assert modal_training.MODAL_GPU == "L4"
     assert modal_training.MODAL_BATCH_SIZE == 1_024
-    assert modal_training.MODAL_CHANNELS == 128
-    assert modal_training.MODAL_RESIDUAL_BLOCKS == 8
-    assert pytest.approx(0.25) == modal_training.MODAL_VALUE_WEIGHT
+    assert modal_training.MODAL_CHANNELS == 192
+    assert modal_training.MODAL_RESIDUAL_BLOCKS == 12
+    assert pytest.approx(1.0) == modal_training.MODAL_VALUE_WEIGHT
 
 
 def test_volume_paths_reject_absolute_and_parent_traversal() -> None:
@@ -149,6 +149,21 @@ def test_download_run_metrics_writes_metrics_json(
     monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
 
     metrics = modal_training.download_run_metrics(
+        tmp_path / "local-run",
+        volume_name="test-volume",
+        run_name="l4-trial",
+    )
+
+    assert metrics.read_text(encoding="utf-8") == '{"epoch": 1}'
+
+
+def test_download_run_metrics_history_writes_jsonl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    volume = _FakeVolume()
+    monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
+
+    metrics = modal_training.download_run_metrics_history(
         tmp_path / "local-run",
         volume_name="test-volume",
         run_name="l4-trial",
