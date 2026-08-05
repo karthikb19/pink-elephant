@@ -206,12 +206,12 @@ def iter_engine_value_examples(
     config: EngineValueConfig | None = None,
     stats: EngineValueStats | None = None,
 ) -> Iterator[EngineValueExample]:
-    """Stream valid engine-value examples from a JSONL evaluation export."""
+    """Stream valid engine-value examples, skipping unusable source records."""
 
     selected_config = config or EngineValueConfig()
     counters = stats or EngineValueStats()
     with source_path.open("r", encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
+        for line in source:
             if not line.strip():
                 continue
             counters.records_seen += 1
@@ -226,9 +226,9 @@ def iter_engine_value_examples(
                 move = chess.Move.from_uci(first_move)
                 legal_actions = legal_policy_indices(board)
                 played_action = move_to_policy_index(board, move)
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError, json.JSONDecodeError):
                 counters.records_skipped += 1
-                raise ValueError(f"invalid engine evaluation at line {line_number}") from error
+                continue
             counters.records_emitted += 1
             if score_kind == "cp":
                 counters.cp_records += 1

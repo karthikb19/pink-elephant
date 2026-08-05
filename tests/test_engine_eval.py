@@ -10,6 +10,7 @@ from pink_elephant.action_mapping import POLICY_SIZE, move_to_policy_index
 from pink_elephant.engine_eval import (
     EngineValueConfig,
     EngineValueLoader,
+    EngineValueStats,
     cp_to_value,
     iter_engine_value_examples,
     mate_to_value,
@@ -93,9 +94,37 @@ def test_loader_batches_policy_and_value_targets_with_a_bounded_slice(tmp_path: 
     assert batches[0].outcomes[0] == pytest.approx(cp_to_value(100))
 
 
-def test_parser_rejects_a_pv_move_that_is_not_legal(tmp_path: Path) -> None:
+def test_parser_skips_records_below_the_minimum_depth(tmp_path: Path) -> None:
+    path = tmp_path / "low-depth.jsonl"
+    _write_records(
+        path,
+        [
+            _record(chess.Board().fen(), depth=19),
+            _record(chess.Board().fen(), depth=20, cp=300),
+        ],
+    )
+    stats = EngineValueStats()
+
+    examples = list(
+        iter_engine_value_examples(
+            path,
+            config=EngineValueConfig(min_depth=20),
+            stats=stats,
+        )
+    )
+
+    assert len(examples) == 1
+    assert examples[0].target == pytest.approx(cp_to_value(300))
+    assert stats.records_seen == 2
+    assert stats.records_skipped == 1
+    assert stats.records_emitted == 1
+
+
+def test_parser_skips_a_pv_move_that_is_not_legal(tmp_path: Path) -> None:
     path = tmp_path / "invalid.jsonl"
     _write_records(path, [_record(chess.Board().fen(), move="a1a8")])
+    stats = EngineValueStats()
 
-    with pytest.raises(ValueError, match="invalid engine evaluation at line 1"):
-        next(iter_engine_value_examples(path))
+    assert list(iter_engine_value_examples(path, stats=stats)) == []
+    assert stats.records_seen == 1
+    assert stats.records_skipped == 1

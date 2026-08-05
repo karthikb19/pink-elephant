@@ -19,6 +19,7 @@ from pink_elephant.engine_eval import (
     DEFAULT_CP_SCALE,
     EngineValueConfig,
     EngineValueLoader,
+    EngineValueStats,
 )
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.training import Trainer, TrainerConfig
@@ -299,27 +300,39 @@ def fine_tune_engine_a100(
         target_epoch = trainer.epoch + 1
         epoch_start = time.perf_counter()
         _log_event("epoch_started", epoch=target_epoch, step=trainer.step, total_epochs=epochs)
+        train_stats = EngineValueStats()
         training = trainer.train_epoch(
             _log_batch_progress(
                 train_loader.iter_batches(
                     epoch=trainer.epoch,
                     positions_per_epoch=positions_per_epoch,
+                    stats=train_stats,
                 ),
                 phase="train",
                 epoch=target_epoch,
                 total_batches=_total_batches(positions_per_epoch, batch_size),
             )
         )
+        validation_stats = EngineValueStats()
         validation = trainer.validate(
             _log_batch_progress(
                 validation_loader.iter_batches(
                     start_position=0,
                     positions_per_epoch=validation_positions,
+                    stats=validation_stats,
                 ),
                 phase="validation",
                 epoch=target_epoch,
                 total_batches=_total_batches(validation_positions, batch_size),
             )
+        )
+        _log_event(
+            "engine_evaluation_filtering",
+            epoch=target_epoch,
+            train_records_seen=train_stats.records_seen,
+            train_records_skipped=train_stats.records_skipped,
+            validation_records_seen=validation_stats.records_seen,
+            validation_records_skipped=validation_stats.records_skipped,
         )
         checkpoint: str | None = None
         if target_epoch % checkpoint_interval == 0 or target_epoch == epochs:
