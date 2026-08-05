@@ -414,6 +414,28 @@ class Trainer:
         self.last_validation_metrics = metrics
         return metrics
 
+    def load_model_weights(self, path: Path) -> CheckpointMetadata:
+        """Load model weights without restoring the checkpoint optimizer or epoch."""
+
+        payload = _load_checkpoint_payload(path, map_location=self.device)
+        checkpoint_schema = _schema_from_payload(payload["schema"])
+        if checkpoint_schema.encoder_version != self.schema.encoder_version:
+            raise ValueError("checkpoint encoder schema does not match this trainer")
+        if checkpoint_schema.action_schema_version != self.schema.action_schema_version:
+            raise ValueError("checkpoint action schema does not match this trainer")
+        self.model.load_state_dict(payload["model_state"])
+        metrics = _metrics_from_payload(payload["metrics"])
+        self.last_validation_metrics = metrics
+        return CheckpointMetadata(
+            config=TrainerConfig.from_payload(payload["config"]),
+            schema=checkpoint_schema,
+            epoch=payload["epoch"],
+            step=payload["step"],
+            metrics=metrics,
+            source_manifest=payload["source_manifest"],
+            git_revision=payload["git_revision"],
+        )
+
     def fit(
         self,
         train_batches: Callable[[], Iterable[TrainingBatch]],

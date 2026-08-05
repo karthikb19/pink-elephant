@@ -55,6 +55,34 @@ remote training job to continue if this computer or terminal disconnects.
 Afterward, retrieve metrics or checkpoints from the Modal Volume with
 `modal volume get` or inspect the run in the Modal dashboard.
 
+## Lichess engine policy/value fine-tuning
+
+Fine-tune checkpoint 10 on the 10M-position JSONL export. The job uses the
+deepest PV’s first move for the policy target, calibrated `[-1, 1]` engine
+values for the value target, a deterministic 10% validation split, and a
+900,000-position training window per epoch. It writes a checkpoint and
+append-only metrics record after every epoch:
+
+~~~sh
+uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.py \
+  --engine-eval-path lichess-eval-10m.jsonl \
+  --initial-checkpoint epoch-000010-step-000021900.pt \
+  --dataset-name lichess-eval-10m \
+  --run-name engine-192x12-10m \
+  --epochs 10 \
+  --batch-size 1024 \
+  --positions-per-epoch 900000 \
+  --validation-positions 100000 \
+  --channels 192 \
+  --residual-blocks 12 \
+  --min-depth 20 \
+  --cp-scale 400
+~~~
+
+Metrics download to `data/modal-engine-runs/<run-name>/`. The fine-tuned
+checkpoints remain in the Volume under `runs/<run-name>/` and can be retrieved
+with `uv run modal volume get`.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The
