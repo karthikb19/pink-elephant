@@ -64,11 +64,22 @@ values for the value target, a deterministic 10% validation split, and a
 900,000-position training window. Start with this one-epoch smoke test; it
 writes a checkpoint and append-only metrics record:
 
+First upload the dataset once:
+
+~~~sh
+uv run modal volume put pink-elephant-training \
+  lichess-eval-10m.jsonl \
+  engine-evals/lichess-eval-10m/data.jsonl
+~~~
+
+Then launch training while reusing that Volume file:
+
 ~~~sh
 uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.py \
   --engine-eval-path lichess-eval-10m.jsonl \
   --initial-checkpoint epoch-000010-step-000021900.pt \
   --dataset-name lichess-eval-10m \
+  --reuse-uploaded-dataset \
   --run-name engine-a100-192x12-1ep \
   --epochs 1 \
   --batch-size 1024 \

@@ -109,12 +109,20 @@ def upload_engine_evaluations(
     local_path = source_path.expanduser().resolve()
     if not local_path.is_file():
         raise FileNotFoundError(f"engine evaluation file does not exist: {local_path}")
-    remote_path = _volume_relative_path(ENGINE_EVAL_VOLUME_ROOT, dataset_name)
-    remote_file = str(PurePosixPath(remote_path) / ENGINE_EVAL_FILENAME)
+    remote_file = engine_evaluation_remote_path(dataset_name)
     volume = modal.Volume.from_name(volume_name, create_if_missing=True)
     with volume.batch_upload(force=overwrite) as batch:
         batch.put_file(local_path, remote_file)
     return remote_file
+
+
+def engine_evaluation_remote_path(dataset_name: str) -> str:
+    """Return the stable Volume path used by a named engine-evaluation dataset."""
+
+    return str(
+        PurePosixPath(_volume_relative_path(ENGINE_EVAL_VOLUME_ROOT, dataset_name))
+        / ENGINE_EVAL_FILENAME
+    )
 
 
 def upload_initial_checkpoint(
@@ -384,6 +392,7 @@ def main(
     dataset_name: str = "lichess-eval-10m",
     run_name: str = "",
     output_dir: str = "data/modal-engine-runs",
+    reuse_uploaded_dataset: bool = False,
     epochs: int = ENGINE_EPOCHS,
     batch_size: int = ENGINE_BATCH_SIZE,
     positions_per_epoch: int = ENGINE_POSITIONS_PER_EPOCH,
@@ -401,11 +410,15 @@ def main(
     selected_run_name = run_name or datetime.now(UTC).strftime("engine-%Y%m%d-%H%M%S")
     local_engine_path = Path(engine_eval_path)
     local_checkpoint_path = Path(initial_checkpoint)
-    _log_event("engine_evaluation_upload_started", path=str(local_engine_path.resolve()))
-    remote_engine_path = upload_engine_evaluations(
-        local_engine_path,
-        dataset_name=dataset_name,
-    )
+    remote_engine_path = engine_evaluation_remote_path(dataset_name)
+    if reuse_uploaded_dataset:
+        _log_event("engine_evaluation_upload_skipped", remote_path=remote_engine_path)
+    else:
+        _log_event("engine_evaluation_upload_started", path=str(local_engine_path.resolve()))
+        remote_engine_path = upload_engine_evaluations(
+            local_engine_path,
+            dataset_name=dataset_name,
+        )
     remote_checkpoint_path = upload_initial_checkpoint(
         local_checkpoint_path,
         run_name=selected_run_name,

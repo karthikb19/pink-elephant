@@ -72,6 +72,9 @@ def test_upload_helpers_store_source_and_checkpoint_under_separate_volume_paths(
 
 
 def test_remote_path_helpers_reject_unsafe_paths() -> None:
+    assert engine_modal.engine_evaluation_remote_path("lichess-eval-10m") == (
+        "/engine-evals/lichess-eval-10m/data.jsonl"
+    )
     assert engine_modal._mounted_remote_path("/engine-evals/data.jsonl") == Path(
         "/data/engine-evals/data.jsonl"
     )
