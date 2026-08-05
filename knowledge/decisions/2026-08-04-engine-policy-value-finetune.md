@@ -58,7 +58,7 @@ so a prepared indexed format may be a future throughput optimization.
 - `src/pink_elephant/engine_eval.py` parses Lichess JSONL and emits joint
   `TrainingBatch` objects.
 - `src/pink_elephant/modal_engine_finetune.py` uploads the raw file and
-  checkpoint, runs the L4 job, and persists metrics/checkpoints in the training
+  checkpoint, runs the A100-40GB job, and persists metrics/checkpoints in the training
   Volume.
 - `tests/test_engine_eval.py` and `tests/test_training.py` cover target
   conversion, legal PV moves, bounded batching, and fresh fine-tune loading.

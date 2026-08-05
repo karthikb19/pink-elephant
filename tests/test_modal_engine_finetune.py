@@ -32,7 +32,7 @@ class _FakeVolume:
 
 
 def test_engine_finetune_defaults_are_bounded_and_joint() -> None:
-    assert engine_modal.MODAL_GPU == "L4"
+    assert engine_modal.ENGINE_GPU == "A100-40GB"
     assert engine_modal.ENGINE_CHANNELS == 192
     assert engine_modal.ENGINE_RESIDUAL_BLOCKS == 12
     assert engine_modal.ENGINE_POSITIONS_PER_EPOCH == 900_000

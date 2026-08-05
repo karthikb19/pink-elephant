@@ -23,7 +23,7 @@ from pink_elephant.engine_eval import (
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.training import Trainer, TrainerConfig
 
-MODAL_GPU: Final[str] = "L4"
+ENGINE_GPU: Final[str] = "A100-40GB"
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 ENGINE_EVAL_VOLUME_ROOT: Final[str] = "engine-evals"
@@ -157,12 +157,12 @@ def download_run_metrics(
 
 
 @app.function(
-    gpu=MODAL_GPU,
+    gpu=ENGINE_GPU,
     volumes={MODAL_VOLUME_MOUNT: training_volume},
     timeout=MODAL_FUNCTION_TIMEOUT_SECONDS,
     retries=0,
 )
-def fine_tune_engine_l4(
+def fine_tune_engine_a100(
     engine_eval_remote_path: str,
     initial_checkpoint_remote_path: str,
     run_name: str,
@@ -215,7 +215,7 @@ def fine_tune_engine_l4(
     run_path.mkdir(parents=True, exist_ok=True)
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Modal L4 fine-tuning requires CUDA, but CUDA is unavailable")
+        raise RuntimeError("Modal A100-40GB fine-tuning requires CUDA, but CUDA is unavailable")
     torch.set_float32_matmul_precision("high")
 
     model_config = ResNetConfig(
@@ -264,7 +264,7 @@ def fine_tune_engine_l4(
         batch_size=batch_size,
         dataset=engine_eval_remote_path,
         epochs=epochs,
-        gpu=MODAL_GPU,
+        gpu=ENGINE_GPU,
         initial_checkpoint=initial_checkpoint_remote_path,
         initial_checkpoint_epoch=initial_metadata.epoch,
         initial_checkpoint_step=initial_metadata.step,
@@ -353,7 +353,7 @@ def fine_tune_engine_l4(
     assert final_validation is not None
     result = EngineFineTuneResult(
         run_name=run_name,
-        gpu=MODAL_GPU,
+        gpu=ENGINE_GPU,
         epochs_completed=trainer.epoch,
         optimizer_steps=trainer.step,
         train_examples=total_train_examples,
@@ -416,7 +416,7 @@ def main(
         initial_checkpoint=remote_checkpoint_path,
         run_name=selected_run_name,
     )
-    result = fine_tune_engine_l4.spawn(
+    result = fine_tune_engine_a100.spawn(
         remote_engine_path,
         remote_checkpoint_path,
         selected_run_name,

@@ -57,19 +57,20 @@ Afterward, retrieve metrics or checkpoints from the Modal Volume with
 
 ## Lichess engine policy/value fine-tuning
 
-Fine-tune checkpoint 10 on the 10M-position JSONL export. The job uses the
+Fine-tune checkpoint 10 on the 10M-position JSONL export using one Modal
+A100-40GB GPU. The job uses the
 deepest PV’s first move for the policy target, calibrated `[-1, 1]` engine
 values for the value target, a deterministic 10% validation split, and a
-900,000-position training window per epoch. It writes a checkpoint and
-append-only metrics record after every epoch:
+900,000-position training window. Start with this one-epoch smoke test; it
+writes a checkpoint and append-only metrics record:
 
 ~~~sh
 uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.py \
   --engine-eval-path lichess-eval-10m.jsonl \
   --initial-checkpoint epoch-000010-step-000021900.pt \
   --dataset-name lichess-eval-10m \
-  --run-name engine-192x12-10m \
-  --epochs 10 \
+  --run-name engine-a100-192x12-1ep \
+  --epochs 1 \
   --batch-size 1024 \
   --positions-per-epoch 900000 \
   --validation-positions 100000 \
@@ -78,6 +79,12 @@ uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.p
   --min-depth 20 \
   --cp-scale 400
 ~~~
+
+`--initial-checkpoint` can point to any compatible local checkpoint, including
+the newest checkpoint from another run. The launcher uploads it to the
+Modal Volume at `runs/<run-name>/initial-checkpoint.pt`; it is not baked into
+the container image. The A100 function mounts that Volume at `/data` and loads
+the checkpoint from there before creating a fresh optimizer.
 
 Metrics download to `data/modal-engine-runs/<run-name>/`. The fine-tuned
 checkpoints remain in the Volume under `runs/<run-name>/` and can be retrieved
