@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,10 +10,13 @@ import torch
 
 import pink_elephant.modal_training as modal_training
 from pink_elephant.action_mapping import POLICY_SIZE
+from pink_elephant.artifacts import RunIdentity, RunStore
 from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
+from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.pgn import PgnParserConfig
 from pink_elephant.shards import write_pgn_dataset
+from pink_elephant.training import Trainer, TrainerConfig
 
 FIXTURE = Path(__file__).parent / "fixtures" / "real_pilot_sample.pgn"
 
@@ -228,3 +232,63 @@ def test_local_dataset_validation_rejects_a_missing_manifest_shard(tmp_path: Pat
 
     with pytest.raises(FileNotFoundError, match="manifest shard"):
         modal_training._validate_local_dataset(dataset_dir)
+
+
+def test_prepare_run_uses_manifest_and_checkpoint_store_for_resume(tmp_path: Path) -> None:
+    config = ResNetConfig(channels=2, residual_blocks=1, policy_channels=1, value_hidden_channels=2)
+    trainer_config = TrainerConfig(weight_decay=0.0)
+    trainer = Trainer(ChessResNet(config), trainer_config)
+    assert trainer.model_spec is not None
+    identity = RunIdentity.create(
+        "modal trial", created_at=datetime(2026, 8, 6, 1, 2, 3, tzinfo=UTC)
+    )
+    run_store = RunStore(tmp_path / "runs")
+
+    layout = modal_training._prepare_run(
+        trainer,
+        run_store,
+        run_name=identity.run_id,
+        model_spec=trainer.model_spec,
+        run_parameters=(),
+        resume_checkpoint=None,
+    )
+    checkpoint = layout.checkpoints.path_for(0, 0)
+    trainer.save_checkpoint(checkpoint)
+    resumed = Trainer(ChessResNet(config), trainer_config)
+    assert resumed.model_spec is not None
+
+    resumed_layout = modal_training._prepare_run(
+        resumed,
+        run_store,
+        run_name=identity.run_id,
+        model_spec=resumed.model_spec,
+        run_parameters=(),
+        resume_checkpoint=checkpoint.name,
+    )
+
+    assert resumed_layout == layout
+    assert resumed.epoch == 0
+    assert resumed.step == 0
+
+
+def test_prepare_run_preserves_legacy_modal_resume_paths(tmp_path: Path) -> None:
+    config = ResNetConfig(channels=2, residual_blocks=1, policy_channels=1, value_hidden_channels=2)
+    trainer_config = TrainerConfig(weight_decay=0.0)
+    original = Trainer(ChessResNet(config), trainer_config)
+    legacy_directory = tmp_path / "runs" / "old-modal-label"
+    checkpoint = legacy_directory / "epoch-000001-step-000000003.pt"
+    original.save_checkpoint(checkpoint)
+    resumed = Trainer(ChessResNet(config), trainer_config)
+    assert resumed.model_spec is not None
+
+    layout = modal_training._prepare_run(
+        resumed,
+        RunStore(tmp_path / "runs"),
+        run_name="old-modal-label",
+        model_spec=resumed.model_spec,
+        run_parameters=(),
+        resume_checkpoint=checkpoint.name,
+    )
+
+    assert layout.directory == legacy_directory
+    assert layout.checkpoints.path_for(2, 4) == legacy_directory / "epoch-000002-step-000000004.pt"

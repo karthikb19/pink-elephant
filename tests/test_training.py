@@ -8,9 +8,11 @@ import torch
 from torch import Tensor, nn
 
 from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, move_to_policy_index
+from pink_elephant.artifacts import RunStore
 from pink_elephant.contracts import DatasetSchema, TrainingBatch, ValidationMetrics
 from pink_elephant.encoding import encode_board
 from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
+from pink_elephant.model_adapter import ModelSpec
 from pink_elephant.training import (
     EXPERT_PRETRAINING_VALUE_WEIGHT,
     Trainer,
@@ -34,6 +36,9 @@ class TinyPolicyValueModel(nn.Module):
             policy_logits=self.policy_bias.unsqueeze(0).expand(batch_size, -1),
             value=self.value_bias.expand(batch_size),
         )
+
+
+TINY_MODEL_SPEC = ModelSpec.from_parameters("test-tiny/v1", {})
 
 
 def _batch(
@@ -234,7 +239,7 @@ def test_trainer_validation_aggregates_multiple_batches() -> None:
 def test_checkpoint_round_trip_restores_model_optimizer_and_metadata(tmp_path: Path) -> None:
     config = TrainerConfig(learning_rate=0.1, weight_decay=0.0, value_weight=0.5)
     schema = DatasetSchema()
-    trainer = Trainer(TinyPolicyValueModel(), config, schema=schema)
+    trainer = Trainer(TinyPolicyValueModel(), config, schema=schema, model_spec=TINY_MODEL_SPEC)
     trainer.train_epoch([_batch()])
     metrics = trainer.validate([_batch()])
     checkpoint = tmp_path / "checkpoints" / "epoch-000001.pt"
@@ -245,7 +250,7 @@ def test_checkpoint_round_trip_restores_model_optimizer_and_metadata(tmp_path: P
         source_manifest="manifest-sha256",
         git_revision="abc123",
     )
-    restored = Trainer(TinyPolicyValueModel(), config, schema=schema)
+    restored = Trainer(TinyPolicyValueModel(), config, schema=schema, model_spec=TINY_MODEL_SPEC)
     loaded = restored.load_checkpoint(checkpoint)
 
     assert saved == loaded
@@ -264,7 +269,11 @@ def test_checkpoint_round_trip_restores_model_optimizer_and_metadata(tmp_path: P
 
 
 def test_fit_writes_one_immutable_checkpoint_per_epoch(tmp_path: Path) -> None:
-    trainer = Trainer(TinyPolicyValueModel(), TrainerConfig(weight_decay=0.0))
+    trainer = Trainer(
+        TinyPolicyValueModel(),
+        TrainerConfig(weight_decay=0.0),
+        model_spec=TINY_MODEL_SPEC,
+    )
     batches: Iterable[TrainingBatch] = [_batch()]
 
     results = trainer.fit(
@@ -278,6 +287,24 @@ def test_fit_writes_one_immutable_checkpoint_per_epoch(tmp_path: Path) -> None:
     assert sorted(path.name for path in tmp_path.glob("*.pt")) == [
         "epoch-000001-step-000000001.pt",
         "epoch-000002-step-000000002.pt",
+    ]
+
+
+def test_fit_writes_timestamped_checkpoints_to_a_run_store(tmp_path: Path) -> None:
+    model = ChessResNet(ResNetConfig(channels=4, residual_blocks=1))
+    trainer = Trainer(model, TrainerConfig(weight_decay=0.0))
+    layout = RunStore(tmp_path).create("local trial", trainer.model_spec)
+    batches: Iterable[TrainingBatch] = [_batch()]
+
+    trainer.fit(
+        lambda: batches,
+        lambda: batches,
+        epochs=1,
+        checkpoint_store=layout.checkpoints,
+    )
+
+    assert [path.name for path in layout.checkpoints.list()] == [
+        f"{layout.manifest.identity.run_id}-epoch-000001-step-000000001.pt"
     ]
 
 

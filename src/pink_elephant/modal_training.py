@@ -14,9 +14,11 @@ from typing import Final
 import modal
 import torch
 
+from pink_elephant.artifacts import RunIdentity, RunLayout, RunParameter, RunStore
 from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.dataset import ExpertBatchLoader
 from pink_elephant.model import ChessResNet, ResNetConfig
+from pink_elephant.model_adapter import ModelSpec
 from pink_elephant.shards import MANIFEST_FILENAME, load_dataset_manifest
 from pink_elephant.training import (
     Trainer,
@@ -90,6 +92,27 @@ class ModalTrainingResult:
     latest_checkpoint: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyCheckpointStore:
+    """Original Modal checkpoint paths retained only for existing resumes."""
+
+    directory: Path
+
+    def path_for(self, epoch: int, step: int) -> Path:
+        return self.directory / f"epoch-{epoch:06d}-step-{step:09d}.pt"
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyRunLayout:
+    """Path-compatible view of a pre-run.json Modal run."""
+
+    directory: Path
+
+    @property
+    def checkpoints(self) -> _LegacyCheckpointStore:
+        return _LegacyCheckpointStore(self.directory)
+
+
 def upload_dataset(
     dataset_dir: Path,
     *,
@@ -142,6 +165,53 @@ def download_run_metrics_history(
     )
 
 
+def launch_modal_training(
+    *,
+    dataset_dir: Path | None,
+    dataset_name: str | None,
+    run_name: str,
+    epochs: int,
+    batch_size: int = MODAL_BATCH_SIZE,
+    checkpoint_interval: int = MODAL_CHECKPOINT_INTERVAL,
+    learning_rate: float = MODAL_LEARNING_RATE,
+    weight_decay: float = MODAL_WEIGHT_DECAY,
+    grad_clip_norm: float | None = MODAL_GRAD_CLIP_NORM,
+    channels: int = MODAL_CHANNELS,
+    residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
+    policy_channels: int = MODAL_POLICY_CHANNELS,
+    value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
+    resume: bool = False,
+) -> ModalTrainingResult:
+    """Upload when needed and dispatch the same run/resume request to Modal."""
+
+    if resume:
+        selected_run_name = run_name
+        remote_dataset = ""
+        resume_checkpoint = "latest"
+    else:
+        if dataset_dir is None or dataset_name is None:
+            raise ValueError("new Modal training requires a dataset directory and name")
+        selected_run_name = RunIdentity.create(run_name).run_id
+        remote_dataset = upload_dataset(dataset_dir, dataset_name=dataset_name)
+        resume_checkpoint = None
+    return train_l4.spawn(
+        remote_dataset.removeprefix(f"/{DATASET_VOLUME_ROOT}/"),
+        selected_run_name,
+        epochs=epochs,
+        batch_size=batch_size,
+        checkpoint_interval=checkpoint_interval,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        grad_clip_norm=grad_clip_norm,
+        channels=channels,
+        residual_blocks=residual_blocks,
+        policy_channels=policy_channels,
+        value_hidden_channels=value_hidden_channels,
+        resume_checkpoint=resume_checkpoint,
+        git_revision=_git_revision(),
+    ).get()
+
+
 @app.function(
     gpu=MODAL_GPU,
     volumes={MODAL_VOLUME_MOUNT: training_volume},
@@ -167,6 +237,23 @@ def train_l4(
 ) -> ModalTrainingResult:
     """Train one versioned dataset on a single Modal L4 GPU."""
 
+    existing_layout = _standardized_resume_layout(run_name, resume_checkpoint)
+    if existing_layout is not None:
+        parameters = {
+            parameter.name: parameter.value for parameter in existing_layout.manifest.parameters
+        }
+        model_parameters = existing_layout.manifest.model.parameter_values()
+        dataset_name = _manifest_string(parameters, "dataset_name")
+        batch_size = _manifest_int(parameters, "batch_size")
+        checkpoint_interval = _manifest_int(parameters, "checkpoint_interval")
+        learning_rate = _manifest_float(parameters, "learning_rate")
+        weight_decay = _manifest_float(parameters, "weight_decay")
+        grad_clip_norm = _manifest_optional_float(parameters, "grad_clip_norm")
+        channels = _manifest_int(model_parameters, "channels")
+        residual_blocks = _manifest_int(model_parameters, "residual_blocks")
+        policy_channels = _manifest_int(model_parameters, "policy_channels")
+        value_hidden_channels = _manifest_int(model_parameters, "value_hidden_channels")
+
     _validate_training_arguments(
         epochs=epochs,
         batch_size=batch_size,
@@ -180,7 +267,6 @@ def train_l4(
         value_hidden_channels=value_hidden_channels,
     )
     dataset_path = _mounted_volume_path(DATASET_VOLUME_ROOT, dataset_name)
-    run_path = _mounted_volume_path(RUN_VOLUME_ROOT, run_name)
     manifest_path = dataset_path / MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise FileNotFoundError(f"dataset manifest does not exist: {manifest_path}")
@@ -217,11 +303,30 @@ def train_l4(
         shuffle=False,
     )
     trainer = Trainer(ChessResNet(model_config), trainer_config)
-    _prepare_run(
+    if trainer.model_spec is None:
+        raise RuntimeError("built-in training model is missing its registered adapter")
+    run_layout = _prepare_run(
         trainer,
-        run_path,
+        RunStore(MODAL_VOLUME_MOUNT / RUN_VOLUME_ROOT),
+        run_name=run_name,
+        model_spec=trainer.model_spec,
+        run_parameters=(
+            RunParameter("batch_size", batch_size),
+            RunParameter("checkpoint_interval", checkpoint_interval),
+            RunParameter("dataset_name", dataset_name),
+            RunParameter("device", "cuda"),
+            RunParameter("epochs", epochs),
+            RunParameter("git_revision", git_revision),
+            RunParameter("gpu", MODAL_GPU),
+            RunParameter("grad_clip_norm", grad_clip_norm),
+            RunParameter("learning_rate", learning_rate),
+            RunParameter("value_weight", MODAL_VALUE_WEIGHT),
+            RunParameter("weight_decay", weight_decay),
+        ),
         resume_checkpoint=resume_checkpoint,
     )
+    run_path = run_layout.directory
+    checkpoint_store = run_layout.checkpoints
     if trainer.epoch > epochs:
         raise ValueError(
             f"checkpoint epoch {trainer.epoch} is after requested target epoch {epochs}"
@@ -284,7 +389,7 @@ def train_l4(
         )
         checkpoint: str | None = None
         if target_epoch % checkpoint_interval == 0 or target_epoch == epochs:
-            checkpoint_path = run_path / f"epoch-{target_epoch:06d}-step-{trainer.step:09d}.pt"
+            checkpoint_path = checkpoint_store.path_for(target_epoch, trainer.step)
             trainer.save_checkpoint(
                 checkpoint_path,
                 metrics=validation,
@@ -362,7 +467,12 @@ def main(
 ) -> None:
     """Upload data, launch L4 training, and download metrics."""
 
-    selected_run_name = run_name or datetime.now(UTC).strftime("l4-%Y%m%d-%H%M%S")
+    if resume_checkpoint is not None:
+        if not run_name:
+            raise ValueError("run_name is required when resuming a checkpoint")
+        selected_run_name = run_name
+    else:
+        selected_run_name = RunIdentity.create(run_name or "l4-training").run_id
     _log_event(
         "dataset_upload_started",
         dataset_dir=str(Path(dataset_dir).expanduser().resolve()),
@@ -536,23 +646,76 @@ def _validate_training_arguments(
 
 def _prepare_run(
     trainer: Trainer,
-    run_path: Path,
+    run_store: RunStore,
     *,
+    run_name: str,
+    model_spec: ModelSpec,
+    run_parameters: tuple[RunParameter, ...],
     resume_checkpoint: str | None,
-) -> None:
+) -> RunLayout | _LegacyRunLayout:
     if resume_checkpoint is None:
-        if run_path.exists():
-            raise FileExistsError(f"training run already exists: {run_path}")
-        run_path.mkdir(parents=True)
-        return
+        identity = RunIdentity.parse(run_name)
+        return run_store.initialize(identity, model_spec, parameters=run_parameters)
 
-    if not run_path.is_dir():
-        raise FileNotFoundError(f"run directory does not exist for resume: {run_path}")
-    checkpoint_name = _safe_relative_path(resume_checkpoint, label="resume checkpoint")
-    checkpoint_path = run_path / Path(*checkpoint_name.parts)
+    manifest_path = run_store.root / run_name / "run.json"
+    if manifest_path.is_file():
+        run_layout = run_store.open(run_name)
+    else:
+        legacy_path = run_store.root / Path(*_safe_relative_path(run_name, label="run name").parts)
+        checkpoint_name = _safe_relative_path(resume_checkpoint, label="resume checkpoint")
+        checkpoint_path = legacy_path / Path(*checkpoint_name.parts)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"resume checkpoint does not exist: {checkpoint_path}"
+            ) from None
+        trainer.load_checkpoint(checkpoint_path)
+        return _LegacyRunLayout(legacy_path)
+    if run_layout.manifest.model != model_spec:
+        raise ValueError("resume run model specification does not match requested model")
+    checkpoint_path = run_layout.checkpoints.resolve(resume_checkpoint)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint_path}")
     trainer.load_checkpoint(checkpoint_path)
+    return run_layout
+
+
+def _standardized_resume_layout(run_name: str, resume_checkpoint: str | None) -> RunLayout | None:
+    if resume_checkpoint is None:
+        return None
+    store = RunStore(MODAL_VOLUME_MOUNT / RUN_VOLUME_ROOT)
+    if not (store.root / run_name / "run.json").is_file():
+        return None
+    return store.open(run_name)
+
+
+def _manifest_string(parameters: Mapping[str, object], name: str) -> str:
+    value = parameters.get(name)
+    if not isinstance(value, str):
+        raise ValueError(f"run manifest parameter {name!r} must be a string")
+    return value
+
+
+def _manifest_int(parameters: Mapping[str, object], name: str) -> int:
+    value = parameters.get(name)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"run manifest parameter {name!r} must be an integer")
+    return value
+
+
+def _manifest_float(parameters: Mapping[str, object], name: str) -> float:
+    value = parameters.get(name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"run manifest parameter {name!r} must be numeric")
+    return float(value)
+
+
+def _manifest_optional_float(parameters: Mapping[str, object], name: str) -> float | None:
+    value = parameters.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"run manifest parameter {name!r} must be numeric or null")
+    return float(value)
 
 
 def _read_metrics(path: Path) -> ModalEpochMetrics:

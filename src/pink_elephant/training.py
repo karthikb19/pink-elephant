@@ -6,13 +6,14 @@ import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypedDict, cast
+from typing import Final, NotRequired, TypedDict, cast
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
 from pink_elephant.action_mapping import POLICY_SIZE
+from pink_elephant.artifacts import CheckpointStore
 from pink_elephant.contracts import (
     DatasetSchema,
     JointLoss,
@@ -20,8 +21,15 @@ from pink_elephant.contracts import (
     ValidationMetrics,
 )
 from pink_elephant.model import ModelOutput
+from pink_elephant.model_adapter import (
+    ModelSpec,
+    ModelSpecPayload,
+    infer_legacy_model_spec,
+    model_spec_for,
+)
 
-CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
+CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v2"
+LEGACY_CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
 EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.01
 
 
@@ -61,6 +69,7 @@ class _CheckpointPayload(TypedDict):
     step: int
     source_manifest: str | None
     git_revision: str | None
+    model: NotRequired[ModelSpecPayload | None]
 
 
 @dataclass(frozen=True)
@@ -173,6 +182,7 @@ class CheckpointMetadata:
     metrics: ValidationMetrics | None
     source_manifest: str | None
     git_revision: str | None
+    model_spec: ModelSpec | None
 
 
 def mask_policy_logits(policy_logits: Tensor, legal_mask: Tensor) -> Tensor:
@@ -339,6 +349,7 @@ class Trainer:
         config: TrainerConfig | None = None,
         *,
         schema: DatasetSchema | None = None,
+        model_spec: ModelSpec | None = None,
     ) -> None:
         self.config = config or TrainerConfig()
         self.schema = schema or DatasetSchema()
@@ -346,6 +357,10 @@ class Trainer:
         if self.config.seed is not None:
             torch.manual_seed(self.config.seed)
         self.model = model.to(self.device)
+        described_model = model_spec_for(self.model)
+        if model_spec is not None and described_model is not None and model_spec != described_model:
+            raise ValueError("explicit model specification does not match the model adapter")
+        self.model_spec = model_spec or described_model
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.learning_rate,
@@ -421,6 +436,7 @@ class Trainer:
         *,
         epochs: int,
         checkpoint_dir: Path | None = None,
+        checkpoint_store: CheckpointStore | None = None,
         source_manifest: str | None = None,
         git_revision: str | None = None,
     ) -> tuple[tuple[TrainingSummary, ValidationMetrics], ...]:
@@ -428,16 +444,24 @@ class Trainer:
 
         if epochs < 1:
             raise ValueError("epochs must be positive")
+        if checkpoint_dir is not None and checkpoint_store is not None:
+            raise ValueError("checkpoint_dir and checkpoint_store are mutually exclusive")
         if checkpoint_dir is not None:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if checkpoint_store is not None:
+            checkpoint_store.directory.mkdir(parents=True, exist_ok=True)
 
         results: list[tuple[TrainingSummary, ValidationMetrics]] = []
         for _ in range(epochs):
             training = self.train_epoch(train_batches())
             validation = self.validate(validation_batches())
             results.append((training, validation))
-            if checkpoint_dir is not None:
+            checkpoint_path: Path | None = None
+            if checkpoint_store is not None:
+                checkpoint_path = checkpoint_store.path_for(self.epoch, self.step)
+            elif checkpoint_dir is not None:
                 checkpoint_path = checkpoint_dir / f"epoch-{self.epoch:06d}-step-{self.step:09d}.pt"
+            if checkpoint_path is not None:
                 self.save_checkpoint(
                     checkpoint_path,
                     metrics=validation,
@@ -460,6 +484,8 @@ class Trainer:
             raise FileExistsError(f"refusing to overwrite checkpoint: {path}")
         if self.epoch < 0 or self.step < 0:
             raise ValueError("training epoch and step must be non-negative")
+        if self.model_spec is None:
+            raise ValueError("saving a checkpoint requires a registered model adapter")
         path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_metrics = metrics if metrics is not None else self.last_validation_metrics
         payload: _CheckpointPayload = {
@@ -473,6 +499,7 @@ class Trainer:
             "step": self.step,
             "source_manifest": source_manifest,
             "git_revision": git_revision,
+            "model": self.model_spec.to_payload(),
         }
         torch.save(payload, path)
         return CheckpointMetadata(
@@ -483,6 +510,7 @@ class Trainer:
             metrics=checkpoint_metrics,
             source_manifest=source_manifest,
             git_revision=git_revision,
+            model_spec=self.model_spec,
         )
 
     def load_checkpoint(self, path: Path) -> CheckpointMetadata:
@@ -495,6 +523,13 @@ class Trainer:
         checkpoint_schema = _schema_from_payload(payload["schema"])
         if checkpoint_schema != self.schema:
             raise ValueError("checkpoint dataset schema does not match this trainer")
+        checkpoint_model_spec = self._checkpoint_model_spec(payload)
+        if (
+            checkpoint_model_spec is not None
+            and self.model_spec is not None
+            and checkpoint_model_spec != self.model_spec
+        ):
+            raise ValueError("checkpoint model specification does not match this trainer")
         self.model.load_state_dict(payload["model_state"])
         self.optimizer.load_state_dict(payload["optimizer_state"])
         self._move_optimizer_state_to_device()
@@ -510,7 +545,43 @@ class Trainer:
             metrics=metrics,
             source_manifest=payload["source_manifest"],
             git_revision=payload["git_revision"],
+            model_spec=checkpoint_model_spec,
         )
+
+    def load_model_weights(self, path: Path) -> CheckpointMetadata:
+        """Load model weights for a new run without restoring optimizer progress."""
+
+        payload = _load_checkpoint_payload(path, map_location=self.device)
+        checkpoint_schema = _schema_from_payload(payload["schema"])
+        if checkpoint_schema != self.schema:
+            raise ValueError("checkpoint dataset schema does not match this trainer")
+        checkpoint_model_spec = self._checkpoint_model_spec(payload)
+        if (
+            checkpoint_model_spec is not None
+            and self.model_spec is not None
+            and checkpoint_model_spec != self.model_spec
+        ):
+            raise ValueError("checkpoint model specification does not match this trainer")
+        self.model.load_state_dict(payload["model_state"])
+        return CheckpointMetadata(
+            config=TrainerConfig.from_payload(payload["config"]),
+            schema=checkpoint_schema,
+            epoch=_non_negative_int(payload["epoch"], "epoch"),
+            step=_non_negative_int(payload["step"], "step"),
+            metrics=_metrics_from_payload(payload["metrics"]),
+            source_manifest=payload["source_manifest"],
+            git_revision=payload["git_revision"],
+            model_spec=checkpoint_model_spec,
+        )
+
+    def _checkpoint_model_spec(self, payload: _CheckpointPayload) -> ModelSpec | None:
+        raw_spec = payload.get("model")
+        if raw_spec is not None:
+            return ModelSpec.from_payload(raw_spec)
+        try:
+            return infer_legacy_model_spec(payload["model_state"])
+        except ValueError:
+            return None
 
     def _model_output(self, batch: TrainingBatch) -> ModelOutput:
         output = self.model(batch.positions)
@@ -606,6 +677,9 @@ def _load_checkpoint_payload(path: Path, *, map_location: torch.device) -> _Chec
     if not isinstance(loaded, Mapping):
         raise ValueError("checkpoint payload must be a mapping")
     payload = cast(_CheckpointPayload, loaded)
-    if payload.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+    if payload.get("format_version") not in (
+        CHECKPOINT_FORMAT_VERSION,
+        LEGACY_CHECKPOINT_FORMAT_VERSION,
+    ):
         raise ValueError("unsupported training checkpoint format")
     return payload

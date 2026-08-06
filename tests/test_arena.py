@@ -6,8 +6,10 @@ import chess
 import torch
 
 from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game
-from pink_elephant.arena_cli import build_parser
+from pink_elephant.arena_cli import ArenaGame, ArenaSummary, _persist_evaluation, build_parser
+from pink_elephant.artifacts import RunStore
 from pink_elephant.model import ChessResNet, ResNetConfig
+from pink_elephant.model_adapter import chess_resnet_spec
 from pink_elephant.training import CHECKPOINT_FORMAT_VERSION
 
 
@@ -32,8 +34,8 @@ def test_load_checkpoint_infers_saved_model_dimensions(tmp_path: Path) -> None:
 
     loaded = load_checkpoint_model(checkpoint)
 
-    assert loaded.config == ResNetConfig(
-        channels=2, residual_blocks=1, policy_channels=1, value_hidden_channels=2
+    assert loaded.model_spec == chess_resnet_spec(
+        ResNetConfig(channels=2, residual_blocks=1, policy_channels=1, value_hidden_channels=2)
     )
     assert (loaded.epoch, loaded.step) == (4, 9)
 
@@ -73,6 +75,34 @@ def test_arena_defaults_to_ten_games_against_1500_stockfish() -> None:
     assert args.games == 10
     assert args.stockfish_elo == 1500
     assert args.model_color == "alternate"
+
+
+def test_arena_accepts_a_standardized_run_reference() -> None:
+    args = build_parser().parse_args(["--run-id", "20260806T010203Z-trial"])
+
+    assert args.run_id == "20260806T010203Z-trial"
+    assert args.checkpoint_name == "latest"
+
+
+def test_run_arena_results_are_persisted_below_the_run(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    layout = store.create("trial", chess_resnet_spec())
+    args = build_parser().parse_args(
+        ["--run-id", layout.manifest.identity.run_id, "--runs-root", str(store.root)]
+    )
+    summary = ArenaSummary(
+        games=(ArenaGame("white", "1-0", "checkmate", 9, "pgn"),),
+        wins=1,
+        draws=0,
+        losses=0,
+        unfinished=0,
+        score=1.0,
+    )
+
+    path = _persist_evaluation(args, Path("checkpoint.pt"), summary)
+
+    assert path.parent == layout.evaluations_directory
+    assert '"run_id":' in path.read_text(encoding="utf-8")
 
 
 def _write_and_return(path: Path) -> Path:
