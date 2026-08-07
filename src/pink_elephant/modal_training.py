@@ -194,22 +194,23 @@ def launch_modal_training(
         selected_run_name = RunIdentity.create(run_name).run_id
         remote_dataset = upload_dataset(dataset_dir, dataset_name=dataset_name)
         resume_checkpoint = None
-    return train_l4.spawn(
-        remote_dataset.removeprefix(f"/{DATASET_VOLUME_ROOT}/"),
-        selected_run_name,
-        epochs=epochs,
-        batch_size=batch_size,
-        checkpoint_interval=checkpoint_interval,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        grad_clip_norm=grad_clip_norm,
-        channels=channels,
-        residual_blocks=residual_blocks,
-        policy_channels=policy_channels,
-        value_hidden_channels=value_hidden_channels,
-        resume_checkpoint=resume_checkpoint,
-        git_revision=_git_revision(),
-    ).get()
+    with app.run():
+        return train_l4.spawn(
+            remote_dataset.removeprefix(f"/{DATASET_VOLUME_ROOT}/"),
+            selected_run_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            checkpoint_interval=checkpoint_interval,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            grad_clip_norm=grad_clip_norm,
+            channels=channels,
+            residual_blocks=residual_blocks,
+            policy_channels=policy_channels,
+            value_hidden_channels=value_hidden_channels,
+            resume_checkpoint=resume_checkpoint,
+            git_revision=_git_revision(),
+        ).get()
 
 
 @app.function(

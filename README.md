@@ -7,6 +7,10 @@ AlphaGo-style chess experiments.
 `./pe` is the short entrypoint for the experiment lifecycle. A new local run is
 just a model configuration, processed dataset, and target epoch:
 
+See [the experiment command guide](knowledge/experiment-commands.md) for full
+copy/paste commands, every common option, Modal operation, Stockfish evaluation,
+and legacy checkpoint migration. The examples below are the short path.
+
 ```sh
 ./pe train \
   --name expert-baseline \

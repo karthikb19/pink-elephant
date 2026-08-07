@@ -24,6 +24,16 @@ until a second model family demonstrates the need for a registry. Existing
 Modal commands and legacy run/checkpoint paths remain valid; standardized Modal
 resume recovers parameters from its remote manifest.
 
+The intended operator flow stays small; the complete flag and operational guide
+is in [the experiment command guide](../experiment-commands.md):
+
+```sh
+./pe train --name baseline --dataset data/processed/expert/v1-pilot --to-epochs 5
+./pe train --resume <run-id> --to-epochs 10
+./pe train --from <run-id>@latest --name lower-lr --to-epochs 5 --learning-rate 0.0001
+./pe play --run-id <run-id> --checkpoint-name latest --stockfish-elo 1500
+```
+
 ## Alternatives
 
 - A generic model/data/backend adapter registry was rejected because most of its
