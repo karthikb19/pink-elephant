@@ -131,6 +131,49 @@ A weights-only fork must keep the source model dimensions. Start a completely
 new run when comparing a different channel count, block count, or head width.
 The fork's `run.json` records its exact parent checkpoint.
 
+## Shard Lichess engine evaluations
+
+The Lichess evaluation export is converted once into the same processed
+Parquet directory used by the expert dataset. The parser reads JSONL
+incrementally while writing bounded `train/` and `validation/` shards, so
+training never reparses the multi-gigabyte source. Each record contributes the
+deepest usable principal variation's first move as the policy label and a
+`tanh(cp / 400)` or signed mate value label. The resulting files use the
+existing board/action schema, manifest, `ExpertBatchLoader`, and
+`TrainingData` adapter.
+
+Create an immutable output directory:
+
+```sh
+uv run python scripts/shard_engine_eval.py \
+  data/lichess-eval-10m.jsonl \
+  data/processed/expert/v1-lichess-eval-10m \
+  --min-depth 20 \
+  --max-examples-per-shard 50000
+```
+
+Then launch the normal processed-data training workflow:
+
+```sh
+./pe train \
+  --backend modal \
+  --gpu A100-40GB \
+  --name lichess-eval-10m-finetune \
+  --dataset data/processed/expert/v1-lichess-eval-10m \
+  --from-checkpoint checkpoints/epoch-000010-step-000021900.pt \
+  --to-epochs 10 \
+  --batch-size 1024 \
+  --learning-rate 0.0001 \
+  --value-weight 1.0 \
+  --channels 192 \
+  --residual-blocks 12
+```
+
+Use `--from-checkpoint` for a fresh optimizer and `--resume <run-id>` to
+continue an existing run with its saved configuration. Choose a new output
+directory when changing parser settings; the sharder will not overwrite an
+existing manifest.
+
 For example, launch three independent architectures against the same dataset:
 
 ```sh
@@ -269,9 +312,9 @@ parameters:
 ```
 
 The target is again the total desired epoch. The remote `run.json` supplies the
-saved configuration and `latest` supplies full optimizer progress. Modal
-weights-only forks are not currently supported; start a new Modal run for a new
-architecture or download a checkpoint and fork it locally.
+saved configuration and `latest` supplies full optimizer progress. Use
+`--from-checkpoint` when a new Modal run should start from compatible weights
+with a fresh optimizer.
 
 For a detached submission that should survive terminal disconnection, retain
 the original Modal entrypoint:

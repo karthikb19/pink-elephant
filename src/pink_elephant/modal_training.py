@@ -29,6 +29,7 @@ MODAL_GPU: Final[str] = "L4"
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 DATASET_VOLUME_ROOT: Final[str] = "datasets"
+INPUT_VOLUME_ROOT: Final[str] = "initial-checkpoints"
 RUN_VOLUME_ROOT: Final[str] = "runs"
 METRICS_FILENAME: Final[str] = "metrics.json"
 METRICS_HISTORY_FILENAME: Final[str] = "metrics-history.jsonl"
@@ -133,6 +134,26 @@ def upload_dataset(
     return remote_path
 
 
+def upload_initial_checkpoint(
+    checkpoint_path: Path,
+    *,
+    run_name: str,
+    volume_name: str = MODAL_VOLUME_NAME,
+) -> str:
+    """Upload fresh-start weights outside the run directory before initialization."""
+
+    local_path = checkpoint_path.expanduser().resolve()
+    if not local_path.is_file():
+        raise FileNotFoundError(f"initial checkpoint does not exist: {local_path}")
+    remote_path = str(
+        PurePosixPath(_volume_relative_path(INPUT_VOLUME_ROOT, run_name)) / "initial-checkpoint.pt"
+    )
+    volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+    with volume.batch_upload(force=False) as batch:
+        batch.put_file(local_path, remote_path)
+    return remote_path
+
+
 def download_run_metrics(
     output_dir: Path,
     *,
@@ -180,23 +201,38 @@ def launch_modal_training(
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     policy_channels: int = MODAL_POLICY_CHANNELS,
     value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
+    initial_checkpoint: Path | None = None,
+    gpu: str = MODAL_GPU,
     resume: bool = False,
 ) -> ModalTrainingResult:
     """Upload when needed and dispatch the same run/resume request to Modal."""
 
     if resume:
         selected_run_name = run_name
-        remote_dataset = ""
+        selected_dataset_name = ""
         resume_checkpoint = "latest"
+        initial_checkpoint_remote = None
     else:
         if dataset_dir is None or dataset_name is None:
             raise ValueError("new Modal training requires a dataset directory and name")
         selected_run_name = RunIdentity.create(run_name).run_id
-        remote_dataset = upload_dataset(dataset_dir, dataset_name=dataset_name)
+        selected_dataset_name = dataset_name
+        upload_dataset(dataset_dir, dataset_name=dataset_name)
+        initial_checkpoint_remote = None
+        if initial_checkpoint is not None:
+            initial_checkpoint_remote = upload_initial_checkpoint(
+                initial_checkpoint,
+                run_name=selected_run_name,
+            )
         resume_checkpoint = None
+    if not gpu.strip():
+        raise ValueError("gpu must not be empty")
     with app.run():
-        return train_l4.spawn(
-            remote_dataset.removeprefix(f"/{DATASET_VOLUME_ROOT}/"),
+        dispatch = train_l4
+        if hasattr(dispatch, "with_options"):
+            dispatch = dispatch.with_options(gpu=gpu)
+        return dispatch.spawn(
+            selected_dataset_name,
             selected_run_name,
             epochs=epochs,
             batch_size=batch_size,
@@ -208,6 +244,8 @@ def launch_modal_training(
             residual_blocks=residual_blocks,
             policy_channels=policy_channels,
             value_hidden_channels=value_hidden_channels,
+            gpu_name=gpu,
+            initial_checkpoint_remote_path=initial_checkpoint_remote,
             resume_checkpoint=resume_checkpoint,
             git_revision=_git_revision(),
         ).get()
@@ -233,6 +271,8 @@ def train_l4(
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     policy_channels: int = MODAL_POLICY_CHANNELS,
     value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
+    gpu_name: str = MODAL_GPU,
+    initial_checkpoint_remote_path: str | None = None,
     resume_checkpoint: str | None = None,
     git_revision: str | None = None,
 ) -> ModalTrainingResult:
@@ -254,6 +294,7 @@ def train_l4(
         residual_blocks = _manifest_int(model_parameters, "residual_blocks")
         policy_channels = _manifest_int(model_parameters, "policy_channels")
         value_hidden_channels = _manifest_int(model_parameters, "value_hidden_channels")
+        gpu_name = _manifest_string_or_default(parameters, "gpu", MODAL_GPU)
 
     _validate_training_arguments(
         epochs=epochs,
@@ -302,10 +343,17 @@ def train_l4(
         split="validation",
         batch_size=batch_size,
         shuffle=False,
+        expected_schema=train_loader.schema,
     )
+    source_identity = train_loader.source_identity
     trainer = Trainer(ChessResNet(model_config), trainer_config)
     if trainer.model_spec is None:
         raise RuntimeError("built-in training model is missing its registered adapter")
+    if initial_checkpoint_remote_path is not None:
+        initial_checkpoint_path = _mounted_remote_path(initial_checkpoint_remote_path)
+        if not initial_checkpoint_path.is_file():
+            raise FileNotFoundError(f"initial checkpoint does not exist: {initial_checkpoint_path}")
+        trainer.load_model_weights(initial_checkpoint_path)
     run_layout = _prepare_run(
         trainer,
         RunStore(MODAL_VOLUME_MOUNT / RUN_VOLUME_ROOT),
@@ -318,9 +366,10 @@ def train_l4(
             RunParameter("device", "cuda"),
             RunParameter("epochs", epochs),
             RunParameter("git_revision", git_revision),
-            RunParameter("gpu", MODAL_GPU),
+            RunParameter("gpu", gpu_name),
             RunParameter("grad_clip_norm", grad_clip_norm),
             RunParameter("learning_rate", learning_rate),
+            RunParameter("parent_checkpoint", initial_checkpoint_remote_path),
             RunParameter("value_weight", MODAL_VALUE_WEIGHT),
             RunParameter("weight_decay", weight_decay),
         ),
@@ -337,12 +386,14 @@ def train_l4(
     metrics_history_path = run_path / METRICS_HISTORY_FILENAME
     final_validation: ValidationMetrics | None = None
     latest_checkpoint: str | None = None
+    expected_train_examples = train_loader.example_count
+    expected_validation_examples = validation_loader.example_count
     _log_event(
         "training_started",
         batch_size=batch_size,
         dataset_name=dataset_name,
         epochs=epochs,
-        gpu=MODAL_GPU,
+        gpu=gpu_name,
         model={
             "channels": channels,
             "policy_channels": policy_channels,
@@ -358,10 +409,10 @@ def train_l4(
         resume_checkpoint=resume_checkpoint,
         run_name=run_name,
         start_epoch=trainer.epoch,
-        train_batches=_total_batches(train_loader.example_count, batch_size),
-        train_examples=train_loader.example_count,
-        validation_batches=_total_batches(validation_loader.example_count, batch_size),
-        validation_examples=validation_loader.example_count,
+        train_batches=_total_batches(expected_train_examples, batch_size),
+        train_examples=expected_train_examples,
+        validation_batches=_total_batches(expected_validation_examples, batch_size),
+        validation_examples=expected_validation_examples,
     )
     while trainer.epoch < epochs:
         epoch_start = time.perf_counter()
@@ -372,20 +423,22 @@ def train_l4(
             step=trainer.step,
             total_epochs=epochs,
         )
+        train_batches = train_loader.iter_batches(epoch=trainer.epoch)
+        validation_batches = validation_loader
         training = trainer.train_epoch(
             _log_batch_progress(
-                train_loader.iter_batches(epoch=trainer.epoch),
+                train_batches,
                 phase="train",
                 epoch=target_epoch,
-                total_batches=_total_batches(train_loader.example_count, batch_size),
+                total_batches=_total_batches(expected_train_examples, batch_size),
             )
         )
         validation = trainer.validate(
             _log_batch_progress(
-                validation_loader,
+                validation_batches,
                 phase="validation",
                 epoch=target_epoch,
-                total_batches=_total_batches(validation_loader.example_count, batch_size),
+                total_batches=_total_batches(expected_validation_examples, batch_size),
             )
         )
         checkpoint: str | None = None
@@ -394,7 +447,7 @@ def train_l4(
             trainer.save_checkpoint(
                 checkpoint_path,
                 metrics=validation,
-                source_manifest=train_loader.source_identity,
+                source_manifest=source_identity,
                 git_revision=git_revision,
             )
             checkpoint = checkpoint_path.name
@@ -430,13 +483,15 @@ def train_l4(
         final_validation = saved_metrics.validation
         latest_checkpoint = saved_metrics.checkpoint
     assert final_validation is not None
+    reported_train_examples = train_loader.example_count
+    reported_validation_examples = validation_loader.example_count
     result = ModalTrainingResult(
         run_name=run_name,
-        gpu=MODAL_GPU,
+        gpu=gpu_name,
         epochs_completed=trainer.epoch,
         optimizer_steps=trainer.step,
-        train_examples=train_loader.example_count,
-        validation_examples=validation_loader.example_count,
+        train_examples=reported_train_examples,
+        validation_examples=reported_validation_examples,
         batch_size=batch_size,
         learning_rate=learning_rate,
         value_weight=MODAL_VALUE_WEIGHT,
@@ -696,6 +751,13 @@ def _manifest_string(parameters: Mapping[str, object], name: str) -> str:
     return value
 
 
+def _manifest_string_or_default(parameters: Mapping[str, object], name: str, default: str) -> str:
+    value = parameters.get(name, default)
+    if not isinstance(value, str):
+        raise ValueError(f"run manifest parameter {name!r} must be a string")
+    return value
+
+
 def _manifest_int(parameters: Mapping[str, object], name: str) -> int:
     value = parameters.get(name)
     if not isinstance(value, int) or isinstance(value, bool):
@@ -785,6 +847,15 @@ def _volume_relative_path(root: str, child: str) -> str:
 def _mounted_volume_path(root: str, child: str) -> Path:
     child_path = _safe_relative_path(child)
     return MODAL_VOLUME_MOUNT / root / Path(*child_path.parts)
+
+
+def _mounted_remote_path(remote_path: str) -> Path:
+    """Resolve an absolute Volume path under the mounted data directory."""
+
+    path = PurePosixPath(remote_path)
+    if not path.is_absolute():
+        raise ValueError(f"remote Volume path must be absolute: {remote_path!r}")
+    return MODAL_VOLUME_MOUNT / Path(*path.parts[1:])
 
 
 def _safe_relative_path(value: str, *, label: str = "path") -> PurePosixPath:

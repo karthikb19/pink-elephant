@@ -55,10 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RUN_ID[@latest]",
         help="start a new run from another run's latest weights",
     )
+    source.add_argument(
+        "--from-checkpoint",
+        type=Path,
+        help="start a fresh optimizer from a compatible checkpoint file",
+    )
     train.add_argument("--name", help="human name for a new or forked run")
     train.add_argument("--dataset", type=Path, help="processed dataset directory")
     train.add_argument("--to-epochs", type=int, required=True, help="target total epoch")
     train.add_argument("--backend", choices=("local", "modal"), default="local")
+    train.add_argument("--gpu", help="Modal GPU type, for example L4 or A100-40GB")
     train.add_argument("--batch-size", type=int)
     train.add_argument("--checkpoint-interval", type=int)
     train.add_argument("--learning-rate", type=float)
@@ -146,14 +152,18 @@ def _list_models(_args: argparse.Namespace) -> int:
 def _train(args: argparse.Namespace) -> int:
     if args.backend == "modal":
         if args.from_run is not None:
-            raise ValueError("Modal weight forks are not supported yet; start a new named run")
+            raise ValueError(
+                "Modal training uses --from-checkpoint for fresh weight initialization"
+            )
         if args.resume is None and (args.name is None or args.dataset is None):
             raise ValueError("new Modal training requires --name and --dataset")
-        from pink_elephant.modal_training import launch_modal_training
+        if args.resume is not None and args.from_checkpoint is not None:
+            raise ValueError("--from-checkpoint cannot be combined with --resume")
+        from pink_elephant.modal_training import MODAL_GPU, launch_modal_training
 
         result = launch_modal_training(
             dataset_dir=args.dataset,
-            dataset_name=args.dataset.name if args.dataset is not None else None,
+            dataset_name=_dataset_name(args.dataset),
             run_name=args.resume or args.name,
             epochs=args.to_epochs,
             batch_size=args.batch_size or 1_024,
@@ -165,10 +175,18 @@ def _train(args: argparse.Namespace) -> int:
             residual_blocks=args.residual_blocks or 12,
             policy_channels=args.policy_channels or 2,
             value_hidden_channels=args.value_hidden_channels or 256,
+            initial_checkpoint=args.from_checkpoint,
+            gpu=args.gpu or MODAL_GPU,
             resume=args.resume is not None,
         )
         print(json.dumps(asdict(result), indent=2))
         return 0
+    if args.gpu is not None:
+        raise ValueError("--gpu requires --backend modal")
+    if args.resume is not None and args.from_checkpoint is not None:
+        raise ValueError("--from-checkpoint cannot be combined with --resume")
+    if args.from_run is not None and args.from_checkpoint is not None:
+        raise ValueError("--from and --from-checkpoint are mutually exclusive")
     store = RunStore(args.runs_root)
     if args.resume is not None:
         if args.name is not None or args.dataset is not None:
@@ -197,6 +215,7 @@ def _train(args: argparse.Namespace) -> int:
             args.name,
             _experiment_config(args),
             target_epochs=args.to_epochs,
+            weights_checkpoint=args.from_checkpoint,
         )
     print(
         json.dumps(
@@ -237,7 +256,11 @@ def _experiment_config(
     return ExperimentConfig(
         model=model,
         dataset_path=dataset_path or fallback.dataset_path,
-        dataset_name=None if fallback is None else fallback.dataset_name,
+        dataset_name=(
+            args.dataset.name
+            if args.dataset is not None
+            else (None if fallback is None else fallback.dataset_name)
+        ),
         batch_size=args.batch_size or (fallback.batch_size if fallback is not None else 256),
         checkpoint_interval=args.checkpoint_interval
         or (fallback.checkpoint_interval if fallback is not None else 1),
@@ -264,6 +287,14 @@ def _experiment_config(
         ),
         backend="local",
     )
+
+
+def _dataset_name(dataset_path: Path | None) -> str | None:
+    """Derive a stable upload name from a processed dataset directory."""
+
+    if dataset_path is None:
+        return None
+    return dataset_path.name
 
 
 def _latest_run_reference(reference: str) -> str:

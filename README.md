@@ -57,6 +57,45 @@ shape inference. The Python `TrainingData` protocol in `experiment.py` is the
 plug-in boundary for another dataset: supply its schema, identity, train
 batches, and validation batches to the same start/resume/fork functions.
 
+## Lichess engine policy/value fine-tuning
+
+First convert the JSONL export into the same versioned Parquet layout used by
+the existing expert dataset. The sharder reads the source incrementally, keeps
+only one bounded shard buffer in memory, and records the source hash and parser
+settings in `manifest.json`. The deepest usable PV provides the legal-masked
+policy target, while centipawn or mate scores become bounded value targets.
+
+Create the processed dataset once:
+
+```sh
+uv run python scripts/shard_engine_eval.py \
+  data/lichess-eval-10m.jsonl \
+  data/processed/expert/v1-lichess-eval-10m \
+  --min-depth 20 \
+  --max-examples-per-shard 50000
+```
+
+Train the processed shards through the normal adapter and run layout:
+
+```sh
+./pe train \
+  --backend modal \
+  --gpu A100-40GB \
+  --name lichess-eval-10m-finetune \
+  --dataset data/processed/expert/v1-lichess-eval-10m \
+  --from-checkpoint checkpoints/epoch-000010-step-000021900.pt \
+  --to-epochs 10 \
+  --batch-size 1024 \
+  --learning-rate 0.0001 \
+  --value-weight 1.0 \
+  --channels 192 \
+  --residual-blocks 12
+```
+
+`--from-checkpoint` loads model weights while resetting optimizer, epoch, and
+step state. Resume a completed run with its run ID and `--to-epochs` like any
+other processed-dataset run.
+
 Inspect local artifacts with the same command:
 
 ```sh

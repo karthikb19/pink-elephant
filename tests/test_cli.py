@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import pink_elephant.cli as cli
 import pink_elephant.modal_training as modal_training
 from pink_elephant.cli import main
 from pink_elephant.model import ChessResNet, ResNetConfig
@@ -97,3 +98,44 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
     assert calls[0]["dataset_dir"] is None
     assert calls[0]["resume"] is True
     assert calls[0]["epochs"] == 20
+
+
+def test_cli_builds_a_processed_training_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    @dataclass(frozen=True)
+    class Result:
+        run_id: str = "run"
+        epoch: int = 1
+        step: int = 1
+        latest_checkpoint: Path = Path("checkpoint.pt")
+
+    def start(_store: object, _name: str, config: object, **kwargs: object) -> Result:
+        captured["config"] = config
+        captured.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(cli, "start_experiment", start)
+    dataset = tmp_path / "processed" / "expert" / "v1-engine-eval"
+
+    assert (
+        cli.main(
+            [
+                "train",
+                "--name",
+                "engine",
+                "--dataset",
+                str(dataset),
+                "--to-epochs",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    config = captured["config"]
+    assert config.dataset_path == dataset.resolve()
+    assert config.dataset_name == dataset.name
+    assert captured["weights_checkpoint"] is None

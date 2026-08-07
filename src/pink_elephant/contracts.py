@@ -34,7 +34,7 @@ class ExpertExample:
     board: NDArray[np.uint8]
     legal_actions: tuple[int, ...]
     played_action: int
-    outcome: int
+    outcome: float
     game_id: str
     ply_index: int
     split: DataSplit
@@ -55,7 +55,12 @@ class ExpertExample:
             raise ValueError(f"legal_actions must be in [0, {POLICY_SIZE})")
         if self.played_action not in self.legal_actions:
             raise ValueError("played_action must be one of legal_actions")
-        if self.outcome not in (-1, 0, 1):
+        if (
+            isinstance(self.outcome, bool)
+            or not isinstance(self.outcome, (int, float))
+            or not math.isfinite(self.outcome)
+            or not -1 <= self.outcome <= 1
+        ):
             raise ValueError("outcome must be -1, 0, or 1")
         if not self.game_id:
             raise ValueError("game_id must not be empty")

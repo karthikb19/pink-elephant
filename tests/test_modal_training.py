@@ -43,6 +43,10 @@ class _FakeBatch:
         self.call.local_path = local_path
         self.call.remote_path = remote_path
 
+    def put_file(self, local_path: Path, remote_path: str) -> None:
+        self.call.local_path = local_path
+        self.call.remote_path = remote_path
+
 
 class _FakeVolume:
     def __init__(self, remote_manifest: bytes | None = None) -> None:
@@ -142,6 +146,26 @@ def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
     assert function.args[0] == "expert-v1"
     assert str(function.args[1]).endswith("-trial")
     assert function.kwargs["resume_checkpoint"] is None
+
+
+def test_initial_checkpoint_upload_uses_stable_volume_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    volume = _FakeVolume()
+    monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
+
+    checkpoint_path = modal_training.upload_initial_checkpoint(
+        checkpoint,
+        run_name="engine-trial",
+        volume_name="test-volume",
+    )
+
+    assert checkpoint_path == "/initial-checkpoints/engine-trial/initial-checkpoint.pt"
+    assert volume.upload_call is not None
+    assert volume.upload_call.local_path == checkpoint.resolve()
+    assert volume.upload_call.remote_path == checkpoint_path
 
 
 def test_volume_paths_reject_absolute_and_parent_traversal() -> None:

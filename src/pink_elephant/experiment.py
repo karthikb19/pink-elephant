@@ -172,14 +172,13 @@ def start_experiment(
     *,
     target_epochs: int,
     data: TrainingData | None = None,
+    weights_checkpoint: Path | None = None,
     created_at: datetime | None = None,
     git_revision: str | None = None,
 ) -> ExperimentResult:
     """Create and train a new immutable run."""
 
-    selected_data = data or ExpertTrainingData.open(
-        config.dataset_path, batch_size=config.batch_size, seed=config.trainer.seed or 0
-    )
+    selected_data = data or open_training_data(config)
     layout = run_store.create(
         run_name,
         config.model,
@@ -191,6 +190,7 @@ def start_experiment(
         config,
         target_epochs=target_epochs,
         data=selected_data,
+        weights_checkpoint=weights_checkpoint,
         git_revision=git_revision,
     )
 
@@ -274,9 +274,7 @@ def _train(
         raise ValueError("target_epochs must be positive")
     if resume_checkpoint is not None and weights_checkpoint is not None:
         raise ValueError("resume and weights checkpoints are mutually exclusive")
-    selected_data = data or ExpertTrainingData.open(
-        config.dataset_path, batch_size=config.batch_size, seed=config.trainer.seed or 0
-    )
+    selected_data = data or open_training_data(config)
     trainer = Trainer(
         build_model(config.model),
         config.trainer,
@@ -328,6 +326,13 @@ def _train(
         step=trainer.step,
         latest_checkpoint=layout.checkpoints.resolve(),
     )
+
+
+def open_training_data(config: ExperimentConfig) -> TrainingData:
+    """Open the processed dataset through the shared training-data adapter."""
+
+    seed = config.trainer.seed or 0
+    return ExpertTrainingData.open(config.dataset_path, batch_size=config.batch_size, seed=seed)
 
 
 def _value(parameters: Mapping[str, object], name: str) -> object:
