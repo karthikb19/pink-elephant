@@ -92,6 +92,7 @@ The same top-level command can launch a new Modal run:
 ```sh
 ./pe train \
   --backend modal \
+  --gpu A100-40GB \
   --name full-data \
   --dataset data/processed/expert/v1-full \
   --to-epochs 10 \
@@ -103,7 +104,7 @@ For a standardized Modal run, resume only needs its run ID and new target epoch;
 the remote `run.json` restores the dataset and model/trainer parameters:
 
 ```sh
-./pe train --backend modal --resume <run-id> --to-epochs 20
+./pe train --backend modal --gpu A100-40GB --resume <run-id> --to-epochs 20
 ```
 
 The original `modal run` entrypoint and its explicit legacy checkpoint resume
@@ -156,6 +157,53 @@ entrypoint submits the job with `spawn(...).get()`, so `--detach` allows the
 remote training job to continue if this computer or terminal disconnects.
 Afterward, retrieve metrics or checkpoints from the Modal Volume with
 `modal volume get` or inspect the run in the Modal dashboard.
+
+## Lichess engine policy/value fine-tuning
+
+Fine-tune checkpoint 10 on the 10M-position JSONL export using a selected Modal
+GPU (`A100-40GB` by default). The job uses the
+deepest PV’s first move for the policy target, calibrated `[-1, 1]` engine
+values for the value target, a deterministic 10% validation split, and a
+900,000-position training window. Start with this one-epoch smoke test; it
+writes a checkpoint and append-only metrics record:
+
+First upload the dataset once:
+
+~~~sh
+uv run modal volume put pink-elephant-training \
+  lichess-eval-10m.jsonl \
+  engine-evals/lichess-eval-10m/data.jsonl
+~~~
+
+Then launch training while reusing that Volume file:
+
+~~~sh
+uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.py \
+  --gpu A100-40GB \
+  --engine-eval-path lichess-eval-10m.jsonl \
+  --initial-checkpoint epoch-000010-step-000021900.pt \
+  --dataset-name lichess-eval-10m \
+  --reuse-uploaded-dataset \
+  --run-name engine-a100-192x12-1ep \
+  --epochs 1 \
+  --batch-size 1024 \
+  --positions-per-epoch 900000 \
+  --validation-positions 100000 \
+  --channels 192 \
+  --residual-blocks 12 \
+  --min-depth 20 \
+  --cp-scale 400
+~~~
+
+`--initial-checkpoint` can point to any compatible local checkpoint, including
+the newest checkpoint from another run. The launcher uploads it to the
+Modal Volume at `runs/<run-name>/initial-checkpoint.pt`; it is not baked into
+the container image. The GPU function mounts that Volume at `/data` and loads
+the checkpoint from there before creating a fresh optimizer.
+
+Metrics download to `data/modal-engine-runs/<run-name>/`. The fine-tuned
+checkpoints remain in the Volume under `runs/<run-name>/` and can be retrieved
+with `uv run modal volume get`.
 
 ## Checkpoint arena
 

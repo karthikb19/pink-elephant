@@ -74,6 +74,11 @@ class _FakeModalFunction:
         self.result = result
         self.args: tuple[object, ...] = ()
         self.kwargs: dict[str, object] = {}
+        self.selected_gpu: str | None = None
+
+    def with_options(self, *, gpu: str) -> _FakeModalFunction:
+        self.selected_gpu = gpu
+        return self
 
     def spawn(self, *args: object, **kwargs: object) -> _FakeFunctionCall:
         self.args = args
@@ -136,11 +141,14 @@ def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
         dataset_name="expert-v1",
         run_name="trial",
         epochs=1,
+        gpu="A100-40GB",
     )
 
     assert actual == expected
     assert function.args[0] == "expert-v1"
     assert str(function.args[1]).endswith("-trial")
+    assert function.selected_gpu == "A100-40GB"
+    assert function.kwargs["gpu_name"] == "A100-40GB"
     assert function.kwargs["resume_checkpoint"] is None
 
 

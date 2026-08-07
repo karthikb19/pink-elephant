@@ -89,6 +89,8 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
             "20260806T010203Z-full-data",
             "--to-epochs",
             "20",
+            "--gpu",
+            "H100",
         ]
     )
 
@@ -97,3 +99,25 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
     assert calls[0]["dataset_dir"] is None
     assert calls[0]["resume"] is True
     assert calls[0]["epochs"] == 20
+    assert calls[0]["gpu"] == "H100"
+
+
+def test_local_training_rejects_a_modal_gpu_option(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = main(
+        [
+            "train",
+            "--name",
+            "local",
+            "--dataset",
+            "missing",
+            "--to-epochs",
+            "1",
+            "--gpu",
+            "L4",
+        ]
+    )
+
+    assert result == 2
+    assert "--gpu requires --backend modal" in capsys.readouterr().err

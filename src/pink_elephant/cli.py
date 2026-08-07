@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--dataset", type=Path, help="processed dataset directory")
     train.add_argument("--to-epochs", type=int, required=True, help="target total epoch")
     train.add_argument("--backend", choices=("local", "modal"), default="local")
+    train.add_argument("--gpu", help="Modal GPU type, for example L4 or A100-40GB")
     train.add_argument("--batch-size", type=int)
     train.add_argument("--checkpoint-interval", type=int)
     train.add_argument("--learning-rate", type=float)
@@ -149,7 +150,7 @@ def _train(args: argparse.Namespace) -> int:
             raise ValueError("Modal weight forks are not supported yet; start a new named run")
         if args.resume is None and (args.name is None or args.dataset is None):
             raise ValueError("new Modal training requires --name and --dataset")
-        from pink_elephant.modal_training import launch_modal_training
+        from pink_elephant.modal_training import MODAL_GPU, launch_modal_training
 
         result = launch_modal_training(
             dataset_dir=args.dataset,
@@ -165,10 +166,13 @@ def _train(args: argparse.Namespace) -> int:
             residual_blocks=args.residual_blocks or 12,
             policy_channels=args.policy_channels or 2,
             value_hidden_channels=args.value_hidden_channels or 256,
+            gpu=args.gpu or MODAL_GPU,
             resume=args.resume is not None,
         )
         print(json.dumps(asdict(result), indent=2))
         return 0
+    if args.gpu is not None:
+        raise ValueError("--gpu requires --backend modal")
     store = RunStore(args.runs_root)
     if args.resume is not None:
         if args.name is not None or args.dataset is not None:

@@ -268,6 +268,34 @@ def test_checkpoint_round_trip_restores_model_optimizer_and_metadata(tmp_path: P
         trainer.save_checkpoint(checkpoint)
 
 
+def test_load_model_weights_starts_a_fresh_finetune_optimizer(tmp_path: Path) -> None:
+    source = Trainer(
+        TinyPolicyValueModel(),
+        TrainerConfig(learning_rate=0.1, weight_decay=0.0),
+        model_spec=TINY_MODEL_SPEC,
+    )
+    source.train_epoch([_batch()])
+    checkpoint = tmp_path / "checkpoint.pt"
+    source.save_checkpoint(checkpoint)
+
+    finetune = Trainer(
+        TinyPolicyValueModel(),
+        TrainerConfig(learning_rate=0.0001, weight_decay=0.0, value_weight=1.0),
+        model_spec=TINY_MODEL_SPEC,
+    )
+    metadata = finetune.load_model_weights(checkpoint)
+
+    assert metadata.epoch == 1
+    assert metadata.step == 1
+    assert finetune.epoch == 0
+    assert finetune.step == 0
+    assert not finetune.optimizer.state
+    for expected, actual in zip(
+        source.model.parameters(), finetune.model.parameters(), strict=True
+    ):
+        assert torch.equal(expected, actual)
+
+
 def test_fit_writes_one_immutable_checkpoint_per_epoch(tmp_path: Path) -> None:
     trainer = Trainer(
         TinyPolicyValueModel(),

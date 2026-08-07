@@ -236,6 +236,7 @@ Launch the established L4 configuration through the same command surface:
 ```sh
 ./pe train \
   --backend modal \
+  --gpu A100-40GB \
   --name l4-192x12-full \
   --dataset data/processed/expert/v1-full \
   --to-epochs 10 \
@@ -250,9 +251,12 @@ Launch the established L4 configuration through the same command surface:
   --value-hidden-channels 256
 ```
 
-Modal uses CUDA, seed 0, and value weight `1.0`. The command uploads the dataset,
-waits for the remote job, and prints the result. Follow progress from another
-terminal while it is running:
+`--gpu` accepts Modal GPU names such as `L4`, `A10G`, `A100-40GB`,
+`A100-80GB`, or `H100`; Modal performs final availability and specification
+validation. If omitted, standard training uses `L4`. Modal uses CUDA, seed 0,
+and value weight `1.0`. The command uploads the dataset, waits for the remote
+job, and prints the result. Follow progress from another terminal while it is
+running:
 
 ```sh
 uv run modal app logs pink-elephant-training -f
@@ -264,6 +268,7 @@ parameters:
 ```sh
 ./pe train \
   --backend modal \
+  --gpu A100-40GB \
   --resume <run-id> \
   --to-epochs 20
 ```
@@ -278,6 +283,7 @@ the original Modal entrypoint:
 
 ```sh
 uv run modal run --detach --timestamps src/pink_elephant/modal_training.py \
+  --gpu A100-40GB \
   --dataset-dir data/processed/expert/v1-full \
   --dataset-name expert-v1-full \
   --run-name l4-192x12-full \
