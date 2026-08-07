@@ -70,8 +70,8 @@ counts in the starting position:
   castling rights;
 - ordinary middlegame and sparse endgame: every square belongs to exactly one
   of the twelve piece planes or the empty-square plane;
-- color-flip pairs: a board and `board.mirror()` encode identically, including
-  turn, piece ownership, castling, en-passant, and halfmove state;
+- 180-degree color-flip pairs without castling rights: a board and its
+  color-swapped, 180-degree transformed equivalent encode identically;
 - asymmetric castling rights and a clock above 150: rights stay relative to the
   current player and the clock clips without overflow;
 - legal en-passant opportunities for White and Black: exactly the canonical

@@ -2,7 +2,8 @@ import chess
 import numpy as np
 import pytest
 
-from pink_elephant.encoding import ENCODER_VERSION, encode_board
+from pink_elephant.action_mapping import ACTION_PLANES, move_to_policy_index
+from pink_elephant.encoding import BOARD_SIZE, ENCODER_VERSION, encode_board
 
 
 def test_starting_position_has_expected_planes() -> None:
@@ -30,16 +31,26 @@ def test_starting_position_has_expected_planes() -> None:
 
 
 def test_encoder_schema_has_a_stable_version() -> None:
-    assert ENCODER_VERSION == "v1"
+    assert ENCODER_VERSION == "v2"
 
 
-def test_black_turn_mirrors_ranks_and_keeps_piece_plane_roles() -> None:
+def test_black_turn_uses_a_full_180_degree_rotation() -> None:
     board = chess.Board("4k3/8/8/8/8/8/4P3/4K3 b - - 0 1")
     encoded = encode_board(board)
 
-    # Rank mirroring gives both sides the same forward direction.
-    assert encoded[5, 0, 4] == 1
-    assert encoded[6, 6, 4] == 1
+    assert encoded[5, 0, 3] == 1
+    assert encoded[6, 6, 3] == 1
+
+
+def test_black_board_encoding_and_move_target_share_the_same_orientation() -> None:
+    board = chess.Board()
+    board.push_uci("e2e4")
+    played_action = move_to_policy_index(board, chess.Move.from_uci("e7e5"))
+    origin, _ = divmod(played_action, ACTION_PLANES)
+    origin_row, origin_column = divmod(origin, BOARD_SIZE)
+
+    assert (origin_row, origin_column) == (1, 3)
+    assert encode_board(board)[0, origin_row, origin_column] == 1
 
 
 @pytest.mark.parametrize(
@@ -60,15 +71,16 @@ def test_every_square_has_exactly_one_occupancy_state(fen: str) -> None:
 @pytest.mark.parametrize(
     "fen",
     (
-        chess.STARTING_FEN,
-        "r3k2r/pppq1ppp/2npbn2/3Np3/3PP3/2N2N2/PPP1BPPP/R2Q1RK1 w kq - 6 10",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
+        "r3k2r/pppq1ppp/2npbn2/3Np3/3PP3/2N2N2/PPP1BPPP/R2Q1RK1 w - - 6 10",
         "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
     ),
 )
-def test_color_flipped_positions_have_identical_encodings(fen: str) -> None:
+def test_180_degree_color_flipped_positions_have_identical_encodings(fen: str) -> None:
     board = chess.Board(fen)
+    color_flipped = board.mirror().transform(chess.flip_horizontal)
 
-    assert np.array_equal(encode_board(board), encode_board(board.mirror()))
+    assert np.array_equal(encode_board(board), encode_board(color_flipped))
 
 
 def test_state_planes_are_canonical_and_clipped() -> None:
@@ -79,14 +91,14 @@ def test_state_planes_are_canonical_and_clipped() -> None:
     assert encoded[14].min() == 1  # Black's queen-side right is available.
     assert encoded[15].min() == 1  # White's king-side right is available.
     assert encoded[16].min() == 0  # White's queen-side right is absent.
-    assert encoded[17, 5, 4] == 1  # e3 is rank-mirrored for Black.
+    assert encoded[17, 5, 3] == 1  # e3 is 180-degree rotated for Black.
     assert encoded[18].min() == 150
 
 
 @pytest.mark.parametrize(
     ("fen", "tensor_square"),
     (
-        ("4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1", (5, 4)),
+        ("4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1", (5, 3)),
         ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", (5, 3)),
     ),
 )

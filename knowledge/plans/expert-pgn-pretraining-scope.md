@@ -22,7 +22,7 @@ not intended to measure playing strength.
 - Value output: one signed scalar in `[-1, 1]` from the side-to-move's
   perspective.
 - Legal move authority: `python-chess`.
-- Board schema version: `v1`.
+- Board schema version: `v2`.
 - Action schema version: `v1`.
 
 The current model has two heads total: one policy head and one scalar value
