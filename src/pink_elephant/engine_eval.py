@@ -23,7 +23,6 @@ ENGINE_EVAL_VERSION: Final[str] = "lichess-eval/policy-value-v1"
 ENGINE_EVAL_DATASET_FORMAT: Final[str] = "engine-eval"
 DEFAULT_CP_SCALE: Final[float] = 400.0
 DEFAULT_VALIDATION_FRACTION: Final[float] = 0.1
-DEFAULT_SHUFFLE_BUFFER_SIZE: Final[int] = 8_192
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +33,6 @@ class EngineValueConfig:
     min_depth: int = 0
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION
     ignore_fen_history: bool = True
-    shuffle_buffer_size: int = DEFAULT_SHUFFLE_BUFFER_SIZE
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.cp_scale) or self.cp_scale <= 0:
@@ -43,8 +41,6 @@ class EngineValueConfig:
             raise ValueError("min_depth must be non-negative")
         if not 0 <= self.validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0, 1)")
-        if self.shuffle_buffer_size < 1:
-            raise ValueError("shuffle_buffer_size must be positive")
 
     @property
     def parser_version(self) -> str:
