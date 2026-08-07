@@ -1,35 +1,29 @@
-"""Stream Lichess engine evaluations into the shared policy/value contract."""
+"""Parse Lichess engine evaluations into the processed training schema."""
 
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import math
-import random
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
 
 import chess
 import numpy as np
-import torch
 from numpy.typing import NDArray
 
-from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, move_to_policy_index
-from pink_elephant.contracts import DatasetSchema, DataSplit, TrainingBatch
+from pink_elephant.action_mapping import legal_policy_indices, move_to_policy_index
+from pink_elephant.contracts import DataSplit, ExpertExample
 from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT, encode_board
+from pink_elephant.pgn import Count, ParserStatsSnapshot
 
 ENGINE_EVAL_VERSION: Final[str] = "lichess-eval/policy-value-v1"
 ENGINE_EVAL_DATASET_FORMAT: Final[str] = "engine-eval"
 DEFAULT_CP_SCALE: Final[float] = 400.0
 DEFAULT_VALIDATION_FRACTION: Final[float] = 0.1
 DEFAULT_SHUFFLE_BUFFER_SIZE: Final[int] = 8_192
-DEFAULT_POSITIONS_PER_EPOCH: Final[int] = 900_000
-DEFAULT_VALIDATION_POSITIONS: Final[int] = 100_000
-HALFMOVE_PLANE: Final[int] = 18
-HALFMOVE_SCALE: Final[float] = 150.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,10 +46,27 @@ class EngineValueConfig:
         if self.shuffle_buffer_size < 1:
             raise ValueError("shuffle_buffer_size must be positive")
 
+    @property
+    def parser_version(self) -> str:
+        """Return the parser version recorded in processed metadata."""
+
+        return ENGINE_EVAL_VERSION
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the preprocessing configuration for a dataset manifest."""
+
+        return {
+            "parser_version": self.parser_version,
+            "cp_scale": self.cp_scale,
+            "min_depth": self.min_depth,
+            "validation_fraction": self.validation_fraction,
+            "ignore_fen_history": self.ignore_fen_history,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class EngineValueExample:
-    """One board, engine policy target, and bounded value target."""
+    """One encoded engine policy/value target ready for processed storage."""
 
     board: NDArray[np.uint8]
     legal_actions: tuple[int, ...]
@@ -63,6 +74,8 @@ class EngineValueExample:
     target: float
     fen: str
     depth: int
+    record_index: int
+    split: DataSplit
 
     def __post_init__(self) -> None:
         expected_shape = (PLANE_COUNT, BOARD_SIZE, BOARD_SIZE)
@@ -80,17 +93,53 @@ class EngineValueExample:
             raise ValueError("fen must not be empty")
         if self.depth < 0:
             raise ValueError("depth must be non-negative")
+        if self.record_index < 0:
+            raise ValueError("record_index must be non-negative")
+        if self.split not in ("train", "validation"):
+            raise ValueError("split must be train or validation")
+
+    def to_expert_example(self) -> ExpertExample:
+        """Adapt one engine record to the existing processed row contract."""
+
+        game_id = f"engine-{hashlib.sha256(self.fen.encode('utf-8')).hexdigest()}"
+        return ExpertExample(
+            board=self.board,
+            legal_actions=self.legal_actions,
+            played_action=self.played_action,
+            outcome=self.target,
+            game_id=game_id,
+            ply_index=self.record_index,
+            split=self.split,
+        )
 
 
 @dataclass
 class EngineValueStats:
-    """Counters collected while streaming an engine-evaluation file."""
+    """Counters collected while preprocessing an engine-evaluation file."""
 
     records_seen: int = 0
     records_emitted: int = 0
     records_skipped: int = 0
     cp_records: int = 0
     mate_records: int = 0
+    train_records: int = 0
+    validation_records: int = 0
+
+    def snapshot(self) -> ParserStatsSnapshot:
+        """Return counts in the standard processed-dataset manifest shape."""
+
+        return ParserStatsSnapshot(
+            games_seen=self.records_seen,
+            accepted_games=self.records_emitted,
+            skipped_games=self.records_skipped,
+            positions_emitted=self.records_emitted,
+            train_positions=self.train_records,
+            validation_positions=self.validation_records,
+            skip_counts=(Count("invalid_record", self.records_skipped),),
+            event_counts=(Count("cp", self.cp_records), Count("mate", self.mate_records)),
+            result_counts=(),
+            rating_counts=(),
+        )
 
 
 def cp_to_value(cp: int, *, scale: float = DEFAULT_CP_SCALE) -> float:
@@ -113,181 +162,18 @@ def mate_to_value(mate: int) -> float:
     return 1.0 if mate > 0 else -1.0
 
 
-class EngineValueLoader:
-    """Stream JSONL evaluations with bounded memory for both model heads."""
-
-    def __init__(
-        self,
-        source_path: Path,
-        *,
-        batch_size: int,
-        split: DataSplit = "train",
-        config: EngineValueConfig | None = None,
-        seed: int = 0,
-        shuffle: bool | None = None,
-    ) -> None:
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive")
-        if split not in ("train", "validation"):
-            raise ValueError(f"split must be train or validation, got {split!r}")
-        if seed < 0:
-            raise ValueError("seed must be non-negative")
-        if not source_path.is_file():
-            raise FileNotFoundError(f"engine evaluation file does not exist: {source_path}")
-        self.source_path = source_path
-        self.batch_size = batch_size
-        self.split = split
-        self.config = config or EngineValueConfig()
-        self.seed = seed
-        self.shuffle = split == "train" if shuffle is None else shuffle
-
-    @property
-    def source_identity(self) -> str:
-        """Return the source path used for checkpoint provenance."""
-
-        return f"{ENGINE_EVAL_VERSION}:{self.source_path.resolve()}"
-
-    def iter_batches(
-        self,
-        *,
-        epoch: int = 0,
-        positions_per_epoch: int | None = None,
-        start_position: int | None = None,
-        stats: EngineValueStats | None = None,
-    ) -> Iterator[TrainingBatch]:
-        """Yield a bounded slice without materializing the source file."""
-
-        if epoch < 0:
-            raise ValueError("epoch must be non-negative")
-        if positions_per_epoch is not None and positions_per_epoch < 1:
-            raise ValueError("positions_per_epoch must be positive")
-        if start_position is not None and start_position < 0:
-            raise ValueError("start_position must be non-negative")
-        selected_start = (
-            start_position
-            if start_position is not None
-            else (epoch * positions_per_epoch if positions_per_epoch is not None else 0)
-        )
-        examples: Iterable[EngineValueExample] = iter_engine_value_examples(
-            self.source_path,
-            split=self.split,
-            config=self.config,
-            stats=stats,
-        )
-        if selected_start:
-            examples = itertools.islice(examples, selected_start, None)
-        if positions_per_epoch is not None:
-            examples = itertools.islice(examples, positions_per_epoch)
-        if self.shuffle:
-            examples = _buffer_shuffle(
-                examples,
-                seed=self.seed + epoch,
-                buffer_size=self.config.shuffle_buffer_size,
-            )
-        yield from _batch_engine_examples(examples, batch_size=self.batch_size)
-
-
-@dataclass(frozen=True, slots=True)
-class EngineEvaluationTrainingData:
-    """Adapt the raw engine stream to the shared experiment training boundary."""
-
-    train: EngineValueLoader
-    validation: EngineValueLoader
-    positions_per_epoch: int
-    validation_positions: int
-    schema: DatasetSchema = DatasetSchema()
-
-    @classmethod
-    def open(
-        cls,
-        source_path: Path,
-        *,
-        batch_size: int,
-        positions_per_epoch: int = DEFAULT_POSITIONS_PER_EPOCH,
-        validation_positions: int = DEFAULT_VALIDATION_POSITIONS,
-        config: EngineValueConfig | None = None,
-        seed: int = 0,
-    ) -> EngineEvaluationTrainingData:
-        """Open train and validation views over one raw JSONL source."""
-
-        if positions_per_epoch < 1:
-            raise ValueError("positions_per_epoch must be positive")
-        if validation_positions < 1:
-            raise ValueError("validation_positions must be positive")
-        selected_config = config or EngineValueConfig()
-        return cls(
-            train=EngineValueLoader(
-                source_path,
-                batch_size=batch_size,
-                split="train",
-                config=selected_config,
-                seed=seed,
-                shuffle=True,
-            ),
-            validation=EngineValueLoader(
-                source_path,
-                batch_size=batch_size,
-                split="validation",
-                config=selected_config,
-                seed=seed,
-                shuffle=False,
-            ),
-            positions_per_epoch=positions_per_epoch,
-            validation_positions=validation_positions,
-        )
-
-    @property
-    def source_identity(self) -> str:
-        """Return the engine source identity recorded in checkpoints."""
-
-        return self.train.source_identity
-
-    def train_batches(self, epoch: int) -> Iterable[TrainingBatch]:
-        """Stream one deterministic training window for an epoch."""
-
-        return self.train.iter_batches(epoch=epoch, positions_per_epoch=self.positions_per_epoch)
-
-    def validation_batches(self) -> Iterable[TrainingBatch]:
-        """Stream the fixed validation window from the beginning of the source."""
-
-        return self.validation.iter_batches(positions_per_epoch=self.validation_positions)
-
-
-def collate_engine_examples(examples: Sequence[EngineValueExample]) -> TrainingBatch:
-    """Convert streamed engine examples into a joint policy/value batch."""
-
-    if not examples:
-        raise ValueError("at least one engine example is required")
-    positions = torch.from_numpy(np.stack([example.board for example in examples])).to(
-        dtype=torch.float32
-    )
-    positions[:, HALFMOVE_PLANE] /= HALFMOVE_SCALE
-    legal_mask = torch.zeros((len(examples), POLICY_SIZE), dtype=torch.bool)
-    for row, example in enumerate(examples):
-        legal_mask[row, list(example.legal_actions)] = True
-    return TrainingBatch(
-        positions=positions,
-        legal_mask=legal_mask,
-        played_actions=torch.tensor(
-            [example.played_action for example in examples], dtype=torch.int64
-        ),
-        outcomes=torch.tensor([example.target for example in examples], dtype=torch.float32),
-    )
-
-
 def iter_engine_value_examples(
     source_path: Path,
     *,
-    split: DataSplit | None = None,
     config: EngineValueConfig | None = None,
     stats: EngineValueStats | None = None,
 ) -> Iterator[EngineValueExample]:
-    """Stream valid engine-value examples, skipping unusable source records."""
+    """Read valid JSONL records one at a time for the shard writer."""
 
     selected_config = config or EngineValueConfig()
     counters = stats if stats is not None else EngineValueStats()
     with source_path.open("r", encoding="utf-8") as source:
-        for line in source:
+        for record_index, line in enumerate(source):
             if not line.strip():
                 continue
             counters.records_seen += 1
@@ -296,8 +182,6 @@ def iter_engine_value_examples(
                 fen, target, depth, first_move, score_kind = _parse_engine_record(
                     payload, selected_config
                 )
-                if split is not None and _fen_split(fen, selected_config) != split:
-                    continue
                 board = _board_from_fen(fen, ignore_history=selected_config.ignore_fen_history)
                 move = board.parse_uci(first_move)
                 legal_actions = legal_policy_indices(board)
@@ -305,7 +189,12 @@ def iter_engine_value_examples(
             except (TypeError, ValueError, json.JSONDecodeError, chess.InvalidMoveError):
                 counters.records_skipped += 1
                 continue
+            split = _fen_split(fen, selected_config)
             counters.records_emitted += 1
+            if split == "train":
+                counters.train_records += 1
+            else:
+                counters.validation_records += 1
             if score_kind == "cp":
                 counters.cp_records += 1
             else:
@@ -317,6 +206,8 @@ def iter_engine_value_examples(
                 target=target,
                 fen=fen,
                 depth=depth,
+                record_index=record_index,
+                split=split,
             )
 
 
@@ -326,7 +217,7 @@ def _parse_engine_record(
 ) -> tuple[str, float, int, str, Literal["cp", "mate"]]:
     """Choose the deepest available principal variation score."""
 
-    record = _mapping(payload, "record")
+    record = _mapping(payload, "evaluation record")
     fen = _text(record, "fen")
     evaluations = _sequence(record.get("evals"), "evals")
     candidates: list[tuple[int, float, str, Literal["cp", "mate"]]] = []
@@ -374,39 +265,6 @@ def _fen_split(fen: str, config: EngineValueConfig) -> DataSplit:
     bucket = int.from_bytes(hashlib.sha256(fen.encode("utf-8")).digest()[:8], "big")
     fraction = bucket / float(1 << 64)
     return "validation" if fraction < config.validation_fraction else "train"
-
-
-def _batch_engine_examples(
-    examples: Iterable[EngineValueExample], *, batch_size: int
-) -> Iterator[TrainingBatch]:
-    """Group engine examples into full and final partial batches."""
-
-    pending: list[EngineValueExample] = []
-    for example in examples:
-        pending.append(example)
-        if len(pending) == batch_size:
-            yield collate_engine_examples(pending)
-            pending = []
-    if pending:
-        yield collate_engine_examples(pending)
-
-
-def _buffer_shuffle(
-    examples: Iterable[EngineValueExample], *, seed: int, buffer_size: int
-) -> Iterator[EngineValueExample]:
-    """Shuffle a streamed window with bounded memory."""
-
-    generator = random.Random(seed)
-    buffer: list[EngineValueExample] = []
-    for example in examples:
-        if len(buffer) < buffer_size:
-            buffer.append(example)
-            continue
-        index = generator.randrange(len(buffer))
-        yield buffer[index]
-        buffer[index] = example
-    while buffer:
-        yield buffer.pop(generator.randrange(len(buffer)))
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:

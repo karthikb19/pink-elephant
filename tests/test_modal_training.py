@@ -148,87 +148,20 @@ def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
     assert function.kwargs["resume_checkpoint"] is None
 
 
-def test_engine_cli_launch_uploads_jsonl_and_dispatches_streaming_parameters(
+def test_initial_checkpoint_upload_uses_stable_volume_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    validation = ValidationMetrics(2, 1.0, 2.0, 0.5, 1.0, 0.25, 0.5)
-    expected = modal_training.ModalTrainingResult(
-        run_name="remote-run",
-        gpu="A100-40GB",
-        epochs_completed=1,
-        optimizer_steps=2,
-        train_examples=2,
-        validation_examples=2,
-        batch_size=2,
-        learning_rate=0.001,
-        value_weight=1.0,
-        channels=2,
-        residual_blocks=1,
-        final_validation=validation,
-        metrics_path="/runs/remote-run/metrics.json",
-        metrics_history_path="/runs/remote-run/metrics-history.jsonl",
-        latest_checkpoint="checkpoint.pt",
-    )
-    function = _FakeModalFunction(expected)
-    monkeypatch.setattr(modal_training, "train_l4", function)
-    monkeypatch.setattr(modal_training.app, "run", nullcontext)
-    upload_calls: list[tuple[Path, str]] = []
-    monkeypatch.setattr(
-        modal_training,
-        "upload_engine_evaluations",
-        lambda path, *, dataset_name: upload_calls.append((path, dataset_name)) or "remote",
-    )
-    monkeypatch.setattr(modal_training, "_git_revision", lambda: "abc123")
-
-    source = tmp_path / "lichess-eval-10m.jsonl"
-    source.write_text("{}\n", encoding="utf-8")
-    actual = modal_training.launch_modal_training(
-        dataset_dir=source,
-        dataset_name="lichess-eval-10m",
-        run_name="trial",
-        epochs=1,
-        dataset_format="engine-eval",
-        positions_per_epoch=8,
-        validation_positions=2,
-        cp_scale=300.0,
-        min_depth=20,
-        gpu="A100-40GB",
-    )
-
-    assert actual == expected
-    assert upload_calls == [(source, "lichess-eval-10m")]
-    assert function.args[0] == "lichess-eval-10m"
-    assert function.kwargs["dataset_format"] == "engine-eval"
-    assert function.kwargs["positions_per_epoch"] == 8
-    assert function.kwargs["validation_positions"] == 2
-    assert function.kwargs["cp_scale"] == 300.0
-    assert function.kwargs["min_depth"] == 20
-    assert function.kwargs["gpu_name"] == "A100-40GB"
-
-
-def test_engine_upload_helpers_use_stable_volume_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = tmp_path / "lichess-eval.jsonl"
-    source.write_text("{}\n", encoding="utf-8")
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"checkpoint")
     volume = _FakeVolume()
     monkeypatch.setattr(modal_training.modal.Volume, "from_name", lambda *args, **kwargs: volume)
 
-    engine_path = modal_training.upload_engine_evaluations(
-        source,
-        dataset_name="lichess-eval-10m",
-        volume_name="test-volume",
-        overwrite=True,
-    )
     checkpoint_path = modal_training.upload_initial_checkpoint(
         checkpoint,
         run_name="engine-trial",
         volume_name="test-volume",
     )
 
-    assert engine_path == "/engine-evals/lichess-eval-10m/data.jsonl"
     assert checkpoint_path == "/initial-checkpoints/engine-trial/initial-checkpoint.pt"
     assert volume.upload_call is not None
     assert volume.upload_call.local_path == checkpoint.resolve()

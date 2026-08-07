@@ -7,7 +7,7 @@ import json
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, cast
+from typing import Protocol, TextIO, cast
 
 import numpy as np
 import pyarrow as pa
@@ -59,7 +59,7 @@ class DatasetManifest:
     schema: DatasetSchema
     source_identity: str
     parser_version: str
-    filter_configuration: PgnParserConfig
+    filter_configuration: Mapping[str, object]
     max_examples_per_shard: int
     compression: str
     stats: ParserStatsSnapshot
@@ -74,7 +74,7 @@ class DatasetManifest:
             "action_schema_version": self.schema.action_schema_version,
             "source_identity": self.source_identity,
             "parser_version": self.parser_version,
-            "filter_configuration": self.filter_configuration.as_dict(),
+            "filter_configuration": dict(self.filter_configuration),
             "max_examples_per_shard": self.max_examples_per_shard,
             "compression": self.compression,
             "stats": self.stats.as_dict(),
@@ -89,14 +89,30 @@ class _StoredRow:
     board: bytes
     legal_actions: tuple[int, ...]
     played_action: int
-    outcome: int
+    outcome: float
     game_id: str
     ply_index: int
     split: DataSplit
 
 
 def processed_arrow_schema() -> pa.Schema:
-    """Return the fixed schema for ``expert/v1`` Parquet rows."""
+    """Return the current schema for processed policy/value Parquet rows."""
+
+    return pa.schema(
+        [
+            pa.field("board", pa.binary(BOARD_BYTE_COUNT), nullable=False),
+            pa.field("legal_actions", pa.list_(pa.uint16()), nullable=False),
+            pa.field("played_action", pa.uint16(), nullable=False),
+            pa.field("outcome", pa.float32(), nullable=False),
+            pa.field("game_id", pa.string(), nullable=False),
+            pa.field("ply_index", pa.uint32(), nullable=False),
+            pa.field("split", pa.string(), nullable=False),
+        ]
+    )
+
+
+def _legacy_processed_arrow_schema() -> pa.Schema:
+    """Return the original integer-outcome schema for existing local shards."""
 
     return pa.schema(
         [
@@ -111,6 +127,15 @@ def processed_arrow_schema() -> pa.Schema:
     )
 
 
+class ShardFilterConfiguration(Protocol):
+    """Configuration that can be recorded in a processed-data manifest."""
+
+    parser_version: str
+
+    def as_dict(self) -> dict[str, object]:
+        """Return JSON-compatible configuration values."""
+
+
 class ProcessedShardWriter:
     """Accumulate bounded split-specific buffers and write Parquet shards."""
 
@@ -120,7 +145,7 @@ class ProcessedShardWriter:
         *,
         schema: DatasetSchema | None = None,
         source_identity: str = "",
-        parser_config: PgnParserConfig | None = None,
+        parser_config: ShardFilterConfiguration | None = None,
         max_examples_per_shard: int = 50_000,
         compression: str = "zstd",
     ) -> None:
@@ -187,7 +212,7 @@ class ProcessedShardWriter:
             schema=self.schema,
             source_identity=self.source_identity,
             parser_version=self.parser_config.parser_version,
-            filter_configuration=self.parser_config,
+            filter_configuration=self.parser_config.as_dict(),
             max_examples_per_shard=self.max_examples_per_shard,
             compression=self.compression,
             stats=snapshot,
@@ -258,6 +283,39 @@ def write_pgn_dataset(
     return writer.finish(stats)
 
 
+def write_engine_eval_dataset(
+    source_path: Path,
+    output_dir: Path,
+    *,
+    source_identity: str = "",
+    config: object | None = None,
+    max_examples_per_shard: int = 50_000,
+    compression: str = "zstd",
+) -> DatasetManifest:
+    """Convert Lichess engine JSONL into the standard processed shard layout."""
+
+    from pink_elephant.engine_eval import (
+        EngineValueConfig,
+        EngineValueStats,
+        iter_engine_value_examples,
+    )
+
+    selected_config = config if config is not None else EngineValueConfig()
+    if not isinstance(selected_config, EngineValueConfig):
+        raise TypeError("config must be an EngineValueConfig")
+    stats = EngineValueStats()
+    writer = ProcessedShardWriter(
+        output_dir,
+        source_identity=source_identity,
+        parser_config=selected_config,
+        max_examples_per_shard=max_examples_per_shard,
+        compression=compression,
+    )
+    for example in iter_engine_value_examples(source_path, stats=stats, config=selected_config):
+        writer.add(example.to_expert_example())
+    return writer.finish(stats.snapshot())
+
+
 def iter_processed_examples(
     dataset_dir: Path,
     *,
@@ -293,7 +351,10 @@ def iter_processed_shard(
     parquet_file = pq.ParquetFile(path)
     schema = expected_schema if expected_schema is not None else _DEFAULT_SCHEMA
     actual_schema = parquet_file.schema_arrow
-    if not actual_schema.equals(processed_arrow_schema(), check_metadata=False):
+    if not (
+        actual_schema.equals(processed_arrow_schema(), check_metadata=False)
+        or actual_schema.equals(_legacy_processed_arrow_schema(), check_metadata=False)
+    ):
         raise ValueError(f"unexpected Parquet schema in {path}")
     metadata = actual_schema.metadata or {}
     _validate_metadata(metadata, schema, path)
@@ -326,7 +387,7 @@ def iter_processed_shard(
                 board=cast(NDArray[np.uint8], board),
                 legal_actions=tuple(int(action) for action in legal_actions),
                 played_action=int(columns["played_action"][index].as_py()),
-                outcome=int(columns["outcome"][index].as_py()),
+                outcome=float(columns["outcome"][index].as_py()),
                 game_id=str(columns["game_id"][index].as_py()),
                 ply_index=int(columns["ply_index"][index].as_py()),
                 split=cast(DataSplit, str(columns["split"][index].as_py())),
@@ -348,13 +409,6 @@ def load_dataset_manifest(path: Path) -> DatasetManifest:
         action_schema_version=_required_text(payload, "action_schema_version"),
     )
     filter_payload = _required_mapping(payload, "filter_configuration")
-    allowed_variants = _required_list_of_text(filter_payload, "allowed_variants")
-    parser_config = PgnParserConfig(
-        validation_fraction=float(filter_payload["validation_fraction"]),
-        game_id_header=_required_text(filter_payload, "game_id_header"),
-        allowed_variants=tuple(allowed_variants),
-        parser_version=_required_text(filter_payload, "parser_version"),
-    )
     stats = _stats_from_mapping(_required_mapping(payload, "stats"))
     shard_payloads = payload.get("shards")
     if not isinstance(shard_payloads, list):
@@ -364,7 +418,7 @@ def load_dataset_manifest(path: Path) -> DatasetManifest:
         schema=schema,
         source_identity=_required_text(payload, "source_identity"),
         parser_version=_required_text(payload, "parser_version"),
-        filter_configuration=parser_config,
+        filter_configuration=filter_payload,
         max_examples_per_shard=int(payload["max_examples_per_shard"]),
         compression=_required_text(payload, "compression"),
         stats=stats,
@@ -380,7 +434,7 @@ def _table_from_rows(rows: list[_StoredRow]) -> pa.Table:
             pa.array([row.board for row in rows], type=pa.binary(BOARD_BYTE_COUNT)),
             pa.array([list(row.legal_actions) for row in rows], type=pa.list_(pa.uint16())),
             pa.array([row.played_action for row in rows], type=pa.uint16()),
-            pa.array([row.outcome for row in rows], type=pa.int8()),
+            pa.array([row.outcome for row in rows], type=pa.float32()),
             pa.array([row.game_id for row in rows], type=pa.string()),
             pa.array([row.ply_index for row in rows], type=pa.uint32()),
             pa.array([row.split for row in rows], type=pa.string()),
@@ -393,7 +447,7 @@ def _metadata_for_shard(
     *,
     schema: DatasetSchema,
     source_identity: str,
-    parser_config: PgnParserConfig,
+    parser_config: ShardFilterConfiguration,
     split: DataSplit,
     example_count: int,
 ) -> dict[bytes, bytes]:

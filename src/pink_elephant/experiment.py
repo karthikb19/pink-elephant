@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -13,13 +13,6 @@ from typing import Protocol
 from pink_elephant.artifacts import RunLayout, RunManifest, RunParameter, RunStore
 from pink_elephant.contracts import DatasetSchema, TrainingBatch, ValidationMetrics
 from pink_elephant.dataset import ExpertBatchLoader
-from pink_elephant.engine_eval import (
-    DEFAULT_POSITIONS_PER_EPOCH,
-    DEFAULT_VALIDATION_POSITIONS,
-    ENGINE_EVAL_DATASET_FORMAT,
-    EngineEvaluationTrainingData,
-    EngineValueConfig,
-)
 from pink_elephant.model_adapter import ModelSpec, build_model
 from pink_elephant.training import Trainer, TrainerConfig, TrainingSummary
 
@@ -96,10 +89,6 @@ class ExperimentConfig:
     backend: str = "local"
     dataset_name: str | None = None
     parent_checkpoint: str | None = None
-    dataset_format: str = "processed"
-    positions_per_epoch: int = DEFAULT_POSITIONS_PER_EPOCH
-    validation_positions: int = DEFAULT_VALIDATION_POSITIONS
-    engine_value: EngineValueConfig = field(default_factory=EngineValueConfig)
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -108,12 +97,6 @@ class ExperimentConfig:
             raise ValueError("checkpoint_interval must be positive")
         if self.backend not in ("local", "modal"):
             raise ValueError("backend must be 'local' or 'modal'")
-        if self.dataset_format not in ("processed", ENGINE_EVAL_DATASET_FORMAT):
-            raise ValueError(f"unsupported dataset format: {self.dataset_format!r}")
-        if self.positions_per_epoch < 1:
-            raise ValueError("positions_per_epoch must be positive")
-        if self.validation_positions < 1:
-            raise ValueError("validation_positions must be positive")
 
     def run_parameters(self) -> tuple[RunParameter, ...]:
         """Return the stable manifest representation used for resume."""
@@ -124,20 +107,12 @@ class ExperimentConfig:
             "checkpoint_interval": self.checkpoint_interval,
             "dataset_name": self.dataset_name,
             "dataset_path": str(self.dataset_path),
-            "dataset_format": self.dataset_format,
             "device": self.trainer.device,
             "grad_clip_norm": self.trainer.grad_clip_norm,
             "learning_rate": self.trainer.learning_rate,
-            "positions_per_epoch": self.positions_per_epoch,
             "parent_checkpoint": self.parent_checkpoint,
-            "engine_cp_scale": self.engine_value.cp_scale,
-            "engine_min_depth": self.engine_value.min_depth,
-            "engine_validation_fraction": self.engine_value.validation_fraction,
-            "engine_ignore_fen_history": self.engine_value.ignore_fen_history,
-            "engine_shuffle_buffer_size": self.engine_value.shuffle_buffer_size,
             "seed": self.trainer.seed,
             "value_weight": self.trainer.value_weight,
-            "validation_positions": self.validation_positions,
             "weight_decay": self.trainer.weight_decay,
         }
         return tuple(RunParameter(name, value) for name, value in sorted(values.items()))
@@ -155,22 +130,6 @@ class ExperimentConfig:
             checkpoint_interval=_integer(values, "checkpoint_interval"),
             backend=_string(values, "backend"),
             parent_checkpoint=_optional_string(values, "parent_checkpoint"),
-            dataset_format=_string_or_default(values, "dataset_format", "processed"),
-            positions_per_epoch=_integer_or_default(
-                values, "positions_per_epoch", DEFAULT_POSITIONS_PER_EPOCH
-            ),
-            validation_positions=_integer_or_default(
-                values, "validation_positions", DEFAULT_VALIDATION_POSITIONS
-            ),
-            engine_value=EngineValueConfig(
-                cp_scale=_number_or_default(values, "engine_cp_scale", 400.0),
-                min_depth=_integer_or_default(values, "engine_min_depth", 0),
-                validation_fraction=_number_or_default(values, "engine_validation_fraction", 0.1),
-                ignore_fen_history=_boolean_or_default(values, "engine_ignore_fen_history", True),
-                shuffle_buffer_size=_integer_or_default(
-                    values, "engine_shuffle_buffer_size", 8_192
-                ),
-            ),
             trainer=TrainerConfig(
                 learning_rate=_number(values, "learning_rate"),
                 weight_decay=_number(values, "weight_decay"),
@@ -284,10 +243,6 @@ def fork_experiment(
         trainer=selected.trainer,
         backend=selected.backend,
         parent_checkpoint=f"{source_run_id}@{source_checkpoint.name}",
-        dataset_format=selected.dataset_format,
-        positions_per_epoch=selected.positions_per_epoch,
-        validation_positions=selected.validation_positions,
-        engine_value=selected.engine_value,
     )
     layout = run_store.create(
         run_name,
@@ -374,18 +329,9 @@ def _train(
 
 
 def open_training_data(config: ExperimentConfig) -> TrainingData:
-    """Open the configured processed or streaming engine-evaluation source."""
+    """Open the processed dataset through the shared training-data adapter."""
 
     seed = config.trainer.seed or 0
-    if config.dataset_format == ENGINE_EVAL_DATASET_FORMAT:
-        return EngineEvaluationTrainingData.open(
-            config.dataset_path,
-            batch_size=config.batch_size,
-            positions_per_epoch=config.positions_per_epoch,
-            validation_positions=config.validation_positions,
-            config=config.engine_value,
-            seed=seed,
-        )
     return ExpertTrainingData.open(config.dataset_path, batch_size=config.batch_size, seed=seed)
 
 
@@ -409,13 +355,6 @@ def _optional_string(parameters: Mapping[str, object], name: str) -> str | None:
     return value
 
 
-def _string_or_default(parameters: Mapping[str, object], name: str, default: str) -> str:
-    value = parameters.get(name, default)
-    if not isinstance(value, str):
-        raise ValueError(f"run parameter {name!r} must be a string")
-    return value
-
-
 def _integer(parameters: Mapping[str, object], name: str) -> int:
     value = _value(parameters, name)
     if not isinstance(value, int) or isinstance(value, bool):
@@ -427,13 +366,6 @@ def _optional_integer(parameters: Mapping[str, object], name: str) -> int | None
     value = _value(parameters, name)
     if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
         raise ValueError(f"run parameter {name!r} must be an integer or null")
-    return value
-
-
-def _integer_or_default(parameters: Mapping[str, object], name: str, default: int) -> int:
-    value = parameters.get(name, default)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"run parameter {name!r} must be an integer")
     return value
 
 
@@ -451,17 +383,3 @@ def _optional_number(parameters: Mapping[str, object], name: str) -> float | Non
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"run parameter {name!r} must be numeric or null")
     return float(value)
-
-
-def _number_or_default(parameters: Mapping[str, object], name: str, default: float) -> float:
-    value = parameters.get(name, default)
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"run parameter {name!r} must be numeric")
-    return float(value)
-
-
-def _boolean_or_default(parameters: Mapping[str, object], name: str, default: bool) -> bool:
-    value = parameters.get(name, default)
-    if not isinstance(value, bool):
-        raise ValueError(f"run parameter {name!r} must be boolean")
-    return value

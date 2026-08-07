@@ -17,13 +17,6 @@ import torch
 from pink_elephant.artifacts import RunIdentity, RunLayout, RunParameter, RunStore
 from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.dataset import ExpertBatchLoader
-from pink_elephant.engine_eval import (
-    DEFAULT_POSITIONS_PER_EPOCH,
-    DEFAULT_VALIDATION_POSITIONS,
-    ENGINE_EVAL_DATASET_FORMAT,
-    EngineValueConfig,
-    EngineValueLoader,
-)
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.model_adapter import ModelSpec
 from pink_elephant.shards import MANIFEST_FILENAME, load_dataset_manifest
@@ -36,9 +29,7 @@ MODAL_GPU: Final[str] = "L4"
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 DATASET_VOLUME_ROOT: Final[str] = "datasets"
-ENGINE_EVAL_VOLUME_ROOT: Final[str] = "engine-evals"
 INPUT_VOLUME_ROOT: Final[str] = "initial-checkpoints"
-ENGINE_EVAL_FILENAME: Final[str] = "data.jsonl"
 RUN_VOLUME_ROOT: Final[str] = "runs"
 METRICS_FILENAME: Final[str] = "metrics.json"
 METRICS_HISTORY_FILENAME: Final[str] = "metrics-history.jsonl"
@@ -143,28 +134,6 @@ def upload_dataset(
     return remote_path
 
 
-def upload_engine_evaluations(
-    source_path: Path,
-    *,
-    dataset_name: str,
-    volume_name: str = MODAL_VOLUME_NAME,
-    overwrite: bool = False,
-) -> str:
-    """Upload one raw JSONL engine-evaluation source to a stable Volume path."""
-
-    local_path = source_path.expanduser().resolve()
-    if not local_path.is_file():
-        raise FileNotFoundError(f"engine evaluation file does not exist: {local_path}")
-    remote_path = str(
-        PurePosixPath(_volume_relative_path(ENGINE_EVAL_VOLUME_ROOT, dataset_name))
-        / ENGINE_EVAL_FILENAME
-    )
-    volume = modal.Volume.from_name(volume_name, create_if_missing=True)
-    with volume.batch_upload(force=overwrite) as batch:
-        batch.put_file(local_path, remote_path)
-    return remote_path
-
-
 def upload_initial_checkpoint(
     checkpoint_path: Path,
     *,
@@ -232,14 +201,8 @@ def launch_modal_training(
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     policy_channels: int = MODAL_POLICY_CHANNELS,
     value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
-    dataset_format: str = "processed",
-    positions_per_epoch: int = DEFAULT_POSITIONS_PER_EPOCH,
-    validation_positions: int = DEFAULT_VALIDATION_POSITIONS,
-    cp_scale: float = 400.0,
-    min_depth: int = 0,
     initial_checkpoint: Path | None = None,
     gpu: str = MODAL_GPU,
-    reuse_uploaded_dataset: bool = False,
     resume: bool = False,
 ) -> ModalTrainingResult:
     """Upload when needed and dispatch the same run/resume request to Modal."""
@@ -252,14 +215,9 @@ def launch_modal_training(
     else:
         if dataset_dir is None or dataset_name is None:
             raise ValueError("new Modal training requires a dataset directory and name")
-        if dataset_format not in ("processed", ENGINE_EVAL_DATASET_FORMAT):
-            raise ValueError(f"unsupported dataset format: {dataset_format!r}")
         selected_run_name = RunIdentity.create(run_name).run_id
         selected_dataset_name = dataset_name
-        if dataset_format == ENGINE_EVAL_DATASET_FORMAT and not reuse_uploaded_dataset:
-            upload_engine_evaluations(dataset_dir, dataset_name=dataset_name)
-        elif dataset_format == "processed":
-            upload_dataset(dataset_dir, dataset_name=dataset_name)
+        upload_dataset(dataset_dir, dataset_name=dataset_name)
         initial_checkpoint_remote = None
         if initial_checkpoint is not None:
             initial_checkpoint_remote = upload_initial_checkpoint(
@@ -286,11 +244,6 @@ def launch_modal_training(
             residual_blocks=residual_blocks,
             policy_channels=policy_channels,
             value_hidden_channels=value_hidden_channels,
-            dataset_format=dataset_format,
-            positions_per_epoch=positions_per_epoch,
-            validation_positions=validation_positions,
-            cp_scale=cp_scale,
-            min_depth=min_depth,
             gpu_name=gpu,
             initial_checkpoint_remote_path=initial_checkpoint_remote,
             resume_checkpoint=resume_checkpoint,
@@ -318,11 +271,6 @@ def train_l4(
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     policy_channels: int = MODAL_POLICY_CHANNELS,
     value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
-    dataset_format: str = "processed",
-    positions_per_epoch: int = DEFAULT_POSITIONS_PER_EPOCH,
-    validation_positions: int = DEFAULT_VALIDATION_POSITIONS,
-    cp_scale: float = 400.0,
-    min_depth: int = 0,
     gpu_name: str = MODAL_GPU,
     initial_checkpoint_remote_path: str | None = None,
     resume_checkpoint: str | None = None,
@@ -346,15 +294,6 @@ def train_l4(
         residual_blocks = _manifest_int(model_parameters, "residual_blocks")
         policy_channels = _manifest_int(model_parameters, "policy_channels")
         value_hidden_channels = _manifest_int(model_parameters, "value_hidden_channels")
-        dataset_format = _manifest_string_or_default(parameters, "dataset_format", "processed")
-        positions_per_epoch = _manifest_int_or_default(
-            parameters, "positions_per_epoch", DEFAULT_POSITIONS_PER_EPOCH
-        )
-        validation_positions = _manifest_int_or_default(
-            parameters, "validation_positions", DEFAULT_VALIDATION_POSITIONS
-        )
-        cp_scale = _manifest_float_or_default(parameters, "cp_scale", 400.0)
-        min_depth = _manifest_int_or_default(parameters, "min_depth", 0)
         gpu_name = _manifest_string_or_default(parameters, "gpu", MODAL_GPU)
 
     _validate_training_arguments(
@@ -368,24 +307,11 @@ def train_l4(
         residual_blocks=residual_blocks,
         policy_channels=policy_channels,
         value_hidden_channels=value_hidden_channels,
-        positions_per_epoch=positions_per_epoch,
-        validation_positions=validation_positions,
-        cp_scale=cp_scale,
-        min_depth=min_depth,
     )
-    if dataset_format == "processed":
-        dataset_path = _mounted_volume_path(DATASET_VOLUME_ROOT, dataset_name)
-        manifest_path = dataset_path / MANIFEST_FILENAME
-        if not manifest_path.is_file():
-            raise FileNotFoundError(f"dataset manifest does not exist: {manifest_path}")
-    elif dataset_format == ENGINE_EVAL_DATASET_FORMAT:
-        dataset_path = _mounted_volume_path(
-            ENGINE_EVAL_VOLUME_ROOT, f"{dataset_name}/{ENGINE_EVAL_FILENAME}"
-        )
-        if not dataset_path.is_file():
-            raise FileNotFoundError(f"engine evaluation file does not exist: {dataset_path}")
-    else:
-        raise ValueError(f"unsupported dataset format: {dataset_format!r}")
+    dataset_path = _mounted_volume_path(DATASET_VOLUME_ROOT, dataset_name)
+    manifest_path = dataset_path / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"dataset manifest does not exist: {manifest_path}")
 
     model_config = ResNetConfig(
         channels=channels,
@@ -405,40 +331,21 @@ def train_l4(
         raise RuntimeError("Modal L4 training requires CUDA, but CUDA is unavailable")
     torch.set_float32_matmul_precision("high")
 
-    if dataset_format == "processed":
-        train_loader = ExpertBatchLoader(
-            dataset_path,
-            split="train",
-            batch_size=batch_size,
-            seed=0,
-            shuffle_buffer_size=max(batch_size * 8, 8_192),
-        )
-        validation_loader = ExpertBatchLoader(
-            dataset_path,
-            split="validation",
-            batch_size=batch_size,
-            shuffle=False,
-        )
-        source_identity = train_loader.source_identity
-    else:
-        engine_config = EngineValueConfig(cp_scale=cp_scale, min_depth=min_depth)
-        train_loader = EngineValueLoader(
-            dataset_path,
-            batch_size=batch_size,
-            split="train",
-            config=engine_config,
-            seed=0,
-            shuffle=True,
-        )
-        validation_loader = EngineValueLoader(
-            dataset_path,
-            batch_size=batch_size,
-            split="validation",
-            config=engine_config,
-            seed=0,
-            shuffle=False,
-        )
-        source_identity = train_loader.source_identity
+    train_loader = ExpertBatchLoader(
+        dataset_path,
+        split="train",
+        batch_size=batch_size,
+        seed=0,
+        shuffle_buffer_size=max(batch_size * 8, 8_192),
+    )
+    validation_loader = ExpertBatchLoader(
+        dataset_path,
+        split="validation",
+        batch_size=batch_size,
+        shuffle=False,
+        expected_schema=train_loader.schema,
+    )
+    source_identity = train_loader.source_identity
     trainer = Trainer(ChessResNet(model_config), trainer_config)
     if trainer.model_spec is None:
         raise RuntimeError("built-in training model is missing its registered adapter")
@@ -456,17 +363,12 @@ def train_l4(
             RunParameter("batch_size", batch_size),
             RunParameter("checkpoint_interval", checkpoint_interval),
             RunParameter("dataset_name", dataset_name),
-            RunParameter("dataset_format", dataset_format),
             RunParameter("device", "cuda"),
             RunParameter("epochs", epochs),
             RunParameter("git_revision", git_revision),
             RunParameter("gpu", gpu_name),
             RunParameter("grad_clip_norm", grad_clip_norm),
             RunParameter("learning_rate", learning_rate),
-            RunParameter("positions_per_epoch", positions_per_epoch),
-            RunParameter("validation_positions", validation_positions),
-            RunParameter("cp_scale", cp_scale),
-            RunParameter("min_depth", min_depth),
             RunParameter("parent_checkpoint", initial_checkpoint_remote_path),
             RunParameter("value_weight", MODAL_VALUE_WEIGHT),
             RunParameter("weight_decay", weight_decay),
@@ -484,18 +386,8 @@ def train_l4(
     metrics_history_path = run_path / METRICS_HISTORY_FILENAME
     final_validation: ValidationMetrics | None = None
     latest_checkpoint: str | None = None
-    expected_train_examples = (
-        positions_per_epoch
-        if dataset_format == ENGINE_EVAL_DATASET_FORMAT
-        else train_loader.example_count
-    )
-    expected_validation_examples = (
-        validation_positions
-        if dataset_format == ENGINE_EVAL_DATASET_FORMAT
-        else validation_loader.example_count
-    )
-    total_train_examples = 0
-    last_validation_examples = 0
+    expected_train_examples = train_loader.example_count
+    expected_validation_examples = validation_loader.example_count
     _log_event(
         "training_started",
         batch_size=batch_size,
@@ -531,19 +423,8 @@ def train_l4(
             step=trainer.step,
             total_epochs=epochs,
         )
-        train_batches = (
-            train_loader.iter_batches(
-                epoch=trainer.epoch,
-                positions_per_epoch=positions_per_epoch,
-            )
-            if dataset_format == ENGINE_EVAL_DATASET_FORMAT
-            else train_loader.iter_batches(epoch=trainer.epoch)
-        )
-        validation_batches = (
-            validation_loader.iter_batches(positions_per_epoch=validation_positions)
-            if dataset_format == ENGINE_EVAL_DATASET_FORMAT
-            else validation_loader
-        )
+        train_batches = train_loader.iter_batches(epoch=trainer.epoch)
+        validation_batches = validation_loader
         training = trainer.train_epoch(
             _log_batch_progress(
                 train_batches,
@@ -560,8 +441,6 @@ def train_l4(
                 total_batches=_total_batches(expected_validation_examples, batch_size),
             )
         )
-        total_train_examples += training.example_count
-        last_validation_examples = validation.example_count
         checkpoint: str | None = None
         if target_epoch % checkpoint_interval == 0 or target_epoch == epochs:
             checkpoint_path = checkpoint_store.path_for(target_epoch, trainer.step)
@@ -603,17 +482,9 @@ def train_l4(
         saved_metrics = _read_metrics(metrics_path)
         final_validation = saved_metrics.validation
         latest_checkpoint = saved_metrics.checkpoint
-        total_train_examples = saved_metrics.train_examples
-        last_validation_examples = saved_metrics.validation.example_count
     assert final_validation is not None
-    reported_train_examples = (
-        train_loader.example_count if dataset_format == "processed" else total_train_examples
-    )
-    reported_validation_examples = (
-        validation_loader.example_count
-        if dataset_format == "processed"
-        else last_validation_examples
-    )
+    reported_train_examples = train_loader.example_count
+    reported_validation_examples = validation_loader.example_count
     result = ModalTrainingResult(
         run_name=run_name,
         gpu=gpu_name,
@@ -806,10 +677,6 @@ def _validate_training_arguments(
     residual_blocks: int,
     policy_channels: int,
     value_hidden_channels: int,
-    positions_per_epoch: int,
-    validation_positions: int,
-    cp_scale: float,
-    min_depth: int,
 ) -> None:
     if epochs < 1:
         raise ValueError("epochs must be positive")
@@ -823,14 +690,6 @@ def _validate_training_arguments(
         raise ValueError("weight_decay must be non-negative")
     if grad_clip_norm is not None and grad_clip_norm <= 0:
         raise ValueError("grad_clip_norm must be positive when provided")
-    if positions_per_epoch < 1:
-        raise ValueError("positions_per_epoch must be positive")
-    if validation_positions < 1:
-        raise ValueError("validation_positions must be positive")
-    if cp_scale <= 0:
-        raise ValueError("cp_scale must be positive")
-    if min_depth < 0:
-        raise ValueError("min_depth must be non-negative")
     for name, value in (
         ("channels", channels),
         ("residual_blocks", residual_blocks),
@@ -906,24 +765,8 @@ def _manifest_int(parameters: Mapping[str, object], name: str) -> int:
     return value
 
 
-def _manifest_int_or_default(parameters: Mapping[str, object], name: str, default: int) -> int:
-    value = parameters.get(name, default)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"run manifest parameter {name!r} must be an integer")
-    return value
-
-
 def _manifest_float(parameters: Mapping[str, object], name: str) -> float:
     value = parameters.get(name)
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"run manifest parameter {name!r} must be numeric")
-    return float(value)
-
-
-def _manifest_float_or_default(
-    parameters: Mapping[str, object], name: str, default: float
-) -> float:
-    value = parameters.get(name, default)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"run manifest parameter {name!r} must be numeric")
     return float(value)

@@ -100,7 +100,7 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
     assert calls[0]["epochs"] == 20
 
 
-def test_engine_eval_cli_builds_a_streaming_training_config(
+def test_cli_builds_a_processed_training_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -118,7 +118,7 @@ def test_engine_eval_cli_builds_a_streaming_training_config(
         return Result()
 
     monkeypatch.setattr(cli, "start_experiment", start)
-    dataset = tmp_path / "lichess-eval-10m.jsonl"
+    dataset = tmp_path / "processed" / "expert" / "v1-engine-eval"
 
     assert (
         cli.main(
@@ -130,23 +130,12 @@ def test_engine_eval_cli_builds_a_streaming_training_config(
                 str(dataset),
                 "--to-epochs",
                 "1",
-                "--positions-per-epoch",
-                "8",
-                "--validation-positions",
-                "2",
-                "--cp-scale",
-                "300",
-                "--min-depth",
-                "20",
             ]
         )
         == 0
     )
 
     config = captured["config"]
-    assert config.dataset_format == "engine-eval"
-    assert config.positions_per_epoch == 8
-    assert config.validation_positions == 2
-    assert config.engine_value.cp_scale == 300.0
-    assert config.engine_value.min_depth == 20
+    assert config.dataset_path == dataset.resolve()
+    assert config.dataset_name == dataset.name
     assert captured["weights_checkpoint"] is None
