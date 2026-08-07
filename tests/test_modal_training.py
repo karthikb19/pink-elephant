@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,10 +11,13 @@ import torch
 
 import pink_elephant.modal_training as modal_training
 from pink_elephant.action_mapping import POLICY_SIZE
+from pink_elephant.artifacts import RunIdentity, RunStore
 from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
+from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.pgn import PgnParserConfig
 from pink_elephant.shards import write_pgn_dataset
+from pink_elephant.training import Trainer, TrainerConfig
 
 FIXTURE = Path(__file__).parent / "fixtures" / "real_pilot_sample.pgn"
 
@@ -56,6 +61,26 @@ class _FakeVolume:
         return [b'{"epoch": 1}']
 
 
+class _FakeFunctionCall:
+    def __init__(self, result: modal_training.ModalTrainingResult) -> None:
+        self.result = result
+
+    def get(self) -> modal_training.ModalTrainingResult:
+        return self.result
+
+
+class _FakeModalFunction:
+    def __init__(self, result: modal_training.ModalTrainingResult) -> None:
+        self.result = result
+        self.args: tuple[object, ...] = ()
+        self.kwargs: dict[str, object] = {}
+
+    def spawn(self, *args: object, **kwargs: object) -> _FakeFunctionCall:
+        self.args = args
+        self.kwargs = kwargs
+        return _FakeFunctionCall(self.result)
+
+
 def _write_dataset(output_dir: Path) -> None:
     with FIXTURE.open(encoding="utf-8") as source:
         write_pgn_dataset(
@@ -73,6 +98,50 @@ def test_modal_defaults_target_an_l4_with_equal_policy_and_value_weight() -> Non
     assert modal_training.MODAL_CHANNELS == 192
     assert modal_training.MODAL_RESIDUAL_BLOCKS == 12
     assert pytest.approx(1.0) == modal_training.MODAL_VALUE_WEIGHT
+
+
+def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validation = ValidationMetrics(2, 1.0, 2.0, 0.5, 1.0, 0.25, 0.5)
+    expected = modal_training.ModalTrainingResult(
+        run_name="remote-run",
+        gpu="L4",
+        epochs_completed=1,
+        optimizer_steps=2,
+        train_examples=2,
+        validation_examples=2,
+        batch_size=2,
+        learning_rate=0.001,
+        value_weight=1.0,
+        channels=2,
+        residual_blocks=1,
+        final_validation=validation,
+        metrics_path="/runs/remote-run/metrics.json",
+        metrics_history_path="/runs/remote-run/metrics-history.jsonl",
+        latest_checkpoint="checkpoint.pt",
+    )
+    function = _FakeModalFunction(expected)
+    monkeypatch.setattr(modal_training, "train_l4", function)
+    monkeypatch.setattr(modal_training.app, "run", nullcontext)
+    monkeypatch.setattr(
+        modal_training,
+        "upload_dataset",
+        lambda *args, **kwargs: "/datasets/expert-v1",
+    )
+    monkeypatch.setattr(modal_training, "_git_revision", lambda: "abc123")
+
+    actual = modal_training.launch_modal_training(
+        dataset_dir=tmp_path / "expert-v1",
+        dataset_name="expert-v1",
+        run_name="trial",
+        epochs=1,
+    )
+
+    assert actual == expected
+    assert function.args[0] == "expert-v1"
+    assert str(function.args[1]).endswith("-trial")
+    assert function.kwargs["resume_checkpoint"] is None
 
 
 def test_volume_paths_reject_absolute_and_parent_traversal() -> None:
@@ -228,3 +297,63 @@ def test_local_dataset_validation_rejects_a_missing_manifest_shard(tmp_path: Pat
 
     with pytest.raises(FileNotFoundError, match="manifest shard"):
         modal_training._validate_local_dataset(dataset_dir)
+
+
+def test_prepare_run_uses_manifest_and_checkpoint_store_for_resume(tmp_path: Path) -> None:
+    config = ResNetConfig(channels=2, residual_blocks=1, policy_channels=1, value_hidden_channels=2)
+    trainer_config = TrainerConfig(weight_decay=0.0)
+    trainer = Trainer(ChessResNet(config), trainer_config)
+    assert trainer.model_spec is not None
+    identity = RunIdentity.create(
+        "modal trial", created_at=datetime(2026, 8, 6, 1, 2, 3, tzinfo=UTC)
+    )
+    run_store = RunStore(tmp_path / "runs")
+
+    layout = modal_training._prepare_run(
+        trainer,
+        run_store,
+        run_name=identity.run_id,
+        model_spec=trainer.model_spec,
+        run_parameters=(),
+        resume_checkpoint=None,
+    )
+    checkpoint = layout.checkpoints.path_for(0, 0)
+    trainer.save_checkpoint(checkpoint)
+    resumed = Trainer(ChessResNet(config), trainer_config)
+    assert resumed.model_spec is not None
+
+    resumed_layout = modal_training._prepare_run(
+        resumed,
+        run_store,
+        run_name=identity.run_id,
+        model_spec=resumed.model_spec,
+        run_parameters=(),
+        resume_checkpoint=checkpoint.name,
+    )
+
+    assert resumed_layout == layout
+    assert resumed.epoch == 0
+    assert resumed.step == 0
+
+
+def test_prepare_run_preserves_legacy_modal_resume_paths(tmp_path: Path) -> None:
+    config = ResNetConfig(channels=2, residual_blocks=1, policy_channels=1, value_hidden_channels=2)
+    trainer_config = TrainerConfig(weight_decay=0.0)
+    original = Trainer(ChessResNet(config), trainer_config)
+    legacy_directory = tmp_path / "runs" / "old-modal-label"
+    checkpoint = legacy_directory / "epoch-000001-step-000000003.pt"
+    original.save_checkpoint(checkpoint)
+    resumed = Trainer(ChessResNet(config), trainer_config)
+    assert resumed.model_spec is not None
+
+    layout = modal_training._prepare_run(
+        resumed,
+        RunStore(tmp_path / "runs"),
+        run_name="old-modal-label",
+        model_spec=resumed.model_spec,
+        run_parameters=(),
+        resume_checkpoint=checkpoint.name,
+    )
+
+    assert layout.directory == legacy_directory
+    assert layout.checkpoints.path_for(2, 4) == legacy_directory / "epoch-000002-step-000000004.pt"

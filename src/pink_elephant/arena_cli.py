@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import chess
@@ -12,6 +15,7 @@ import chess.engine
 import torch
 
 from pink_elephant.arena import CheckpointEvaluator, ModelPlayer, load_checkpoint_model, play_game
+from pink_elephant.artifacts import DEFAULT_RUNS_ROOT, RunStore
 from pink_elephant.mcts import MCTSConfig
 from pink_elephant.stockfish import (
     MAX_UCI_ELO,
@@ -26,10 +30,32 @@ from pink_elephant.stockfish import (
 def build_parser() -> argparse.ArgumentParser:
     """Build the arena CLI parser."""
 
-    parser = argparse.ArgumentParser(
-        description="Play a Pink Elephant checkpoint against Stockfish"
+    parser = argparse.ArgumentParser(description="Play a checkpoint against Stockfish")
+    configure_parser(parser)
+    return parser
+
+
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    """Add arena arguments to a standalone or unified command parser."""
+
+    checkpoint_source = parser.add_mutually_exclusive_group()
+    checkpoint_source.add_argument(
+        "--checkpoint", type=Path, help="direct path to a training checkpoint"
     )
-    parser.add_argument("--checkpoint", type=Path, help="training checkpoint to evaluate")
+    checkpoint_source.add_argument(
+        "--run-id", help="standardized run identifier containing the checkpoint"
+    )
+    parser.add_argument(
+        "--checkpoint-name",
+        default="latest",
+        help="checkpoint filename within --run-id (default: latest)",
+    )
+    parser.add_argument(
+        "--runs-root",
+        type=Path,
+        default=DEFAULT_RUNS_ROOT,
+        help="standardized run root used with --run-id (default: data/runs)",
+    )
     parser.add_argument(
         "--stockfish-elo",
         type=int,
@@ -78,7 +104,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="download/cache Stockfish and exit without loading a checkpoint",
     )
-    return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -86,10 +111,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.download_only and args.checkpoint is None:
-        parser.error("--checkpoint is required unless --download-only is set")
+    return run(args, parser=parser)
+
+
+def run(args: argparse.Namespace, *, parser: argparse.ArgumentParser | None = None) -> int:
+    """Run an already-parsed arena command."""
+
+    if not args.download_only and args.checkpoint is None and args.run_id is None:
+        if parser is not None:
+            parser.error("--checkpoint or --run-id is required unless --download-only is set")
+        raise ValueError("--checkpoint or --run-id is required unless --download-only is set")
     if args.games < 1:
-        parser.error("--games must be positive")
+        if parser is not None:
+            parser.error("--games must be positive")
+        raise ValueError("games must be positive")
 
     try:
         stockfish_config = StockfishConfig(
@@ -108,33 +143,72 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.download_only:
             return 0
 
-        loaded = load_checkpoint_model(args.checkpoint, args.device)
+        checkpoint_path = _resolve_checkpoint_path(args)
+        loaded = load_checkpoint_model(checkpoint_path, args.device)
+        model_parameters = ", ".join(
+            f"{parameter.name}={parameter.value}" for parameter in loaded.model_spec.parameters
+        )
         print(
-            f"Checkpoint: {args.checkpoint} (epoch={loaded.epoch}, step={loaded.step}, "
-            f"model={loaded.config.channels}x{loaded.config.residual_blocks})"
+            f"Checkpoint: {checkpoint_path} (epoch={loaded.epoch}, step={loaded.step}, "
+            f"model={loaded.model_spec.adapter}, {model_parameters})"
         )
         evaluator = CheckpointEvaluator(loaded.model, torch.device(args.device))
         model_player = ModelPlayer(evaluator=evaluator, config=mcts_config)
         engine = start_stockfish(binary_path, stockfish_config)
         try:
-            _play_games(
+            summary = _play_games(
                 args, model_player, StockfishPlayer(engine, stockfish_config.search_limit())
             )
         finally:
             engine.quit()
+        if args.run_id is not None:
+            evaluation_path = _persist_evaluation(args, checkpoint_path, summary)
+            print(f"Evaluation: {evaluation_path}")
     except (OSError, RuntimeError, ValueError, chess.engine.EngineError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     return 0
 
 
+@dataclass(frozen=True, slots=True)
+class ArenaGame:
+    """One persisted game plus the model's color."""
+
+    model_color: str
+    result: str
+    termination: str
+    plies: int
+    pgn: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArenaSummary:
+    """Aggregate and individual results from one arena invocation."""
+
+    games: tuple[ArenaGame, ...]
+    wins: int
+    draws: int
+    losses: int
+    unfinished: int
+    score: float
+
+
+def _resolve_checkpoint_path(args: argparse.Namespace) -> Path:
+    if args.checkpoint is not None:
+        return args.checkpoint
+    if args.run_id is None:
+        raise ValueError("checkpoint source is required")
+    return RunStore(args.runs_root).open(args.run_id).checkpoints.resolve(args.checkpoint_name)
+
+
 def _play_games(
     args: argparse.Namespace, model_player: ModelPlayer, stockfish_player: StockfishPlayer
-) -> None:
+) -> ArenaSummary:
     model_wins = 0
     draws = 0
     model_losses = 0
     unfinished = 0
+    games: list[ArenaGame] = []
     for game_index in range(args.games):
         model_color = _model_color(args.model_color, game_index)
         print(f"\nGame {game_index + 1}/{args.games}: checkpoint={_color_name(model_color)}")
@@ -147,6 +221,15 @@ def _play_games(
         )
         print(f"\nResult: {result.result} ({result.termination}, {result.plies} plies)")
         print(result.pgn)
+        games.append(
+            ArenaGame(
+                model_color=_color_name(model_color),
+                result=result.result,
+                termination=result.termination,
+                plies=result.plies,
+                pgn=result.pgn,
+            )
+        )
         if result.result == "*":
             unfinished += 1
         elif result.result == "1/2-1/2":
@@ -165,6 +248,34 @@ def _play_games(
         f"wins={model_wins}, draws={draws}, losses={model_losses}, "
         f"unfinished={unfinished}, score={score:.3f}"
     )
+    return ArenaSummary(
+        games=tuple(games),
+        wins=model_wins,
+        draws=draws,
+        losses=model_losses,
+        unfinished=unfinished,
+        score=score,
+    )
+
+
+def _persist_evaluation(
+    args: argparse.Namespace, checkpoint_path: Path, summary: ArenaSummary
+) -> Path:
+    layout = RunStore(args.runs_root).open(args.run_id)
+    layout.evaluations_directory.mkdir(exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = layout.evaluations_directory / f"{timestamp}-stockfish-elo-{args.stockfish_elo}.json"
+    payload = {
+        "format_version": "stockfish-evaluation/v1",
+        "run_id": args.run_id,
+        "checkpoint": checkpoint_path.name,
+        "stockfish_elo": args.stockfish_elo,
+        "model_simulations": args.model_simulations,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "summary": asdict(summary),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def _model_color(setting: str, game_index: int) -> chess.Color:
