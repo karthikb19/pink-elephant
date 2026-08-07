@@ -131,6 +131,46 @@ A weights-only fork must keep the source model dimensions. Start a completely
 new run when comparing a different channel count, block count, or head width.
 The fork's `run.json` records its exact parent checkpoint.
 
+## Stream Lichess engine evaluations
+
+The Lichess evaluation export is a raw JSONL source, not a processed PGN
+dataset. `pe train` parses it incrementally and keeps only the configured
+shuffle window and current batch in memory. Each record contributes the
+deepest usable principal variation's first move as the policy label and a
+`tanh(cp / 400)` or signed mate value label. The examples use the existing
+board/action schema and `TrainingBatch` contract; the run manifest records the
+engine parser settings.
+
+Launch the 10M-position fine-tune from the loose checkpoint in this checkout:
+
+```sh
+./pe train \
+  --backend modal \
+  --gpu A100-40GB \
+  --name lichess-eval-10m-finetune \
+  --dataset data/lichess-eval-10m.jsonl \
+  --from-checkpoint checkpoints/epoch-000010-step-000021900.pt \
+  --to-epochs 10 \
+  --batch-size 1024 \
+  --positions-per-epoch 900000 \
+  --validation-positions 100000 \
+  --learning-rate 0.0001 \
+  --value-weight 1.0 \
+  --cp-scale 400 \
+  --min-depth 20 \
+  --channels 192 \
+  --residual-blocks 12
+```
+
+The `.jsonl` suffix infers `--dataset-format engine-eval`. The source is
+uploaded once to the Modal Volume under
+`engine-evals/lichess-eval-10m/data.jsonl`; checkpoints and metrics remain in
+the standard `runs/<run-id>/` tree. Use `--from-checkpoint` for a fresh
+optimizer; use `--resume <run-id>` to continue an existing run with its saved
+configuration. On later launches, add `--reuse-uploaded-dataset` to skip the
+large upload. A local smoke test can use the same command with
+`--backend local`, a small model, and low position limits.
+
 For example, launch three independent architectures against the same dataset:
 
 ```sh
@@ -269,9 +309,9 @@ parameters:
 ```
 
 The target is again the total desired epoch. The remote `run.json` supplies the
-saved configuration and `latest` supplies full optimizer progress. Modal
-weights-only forks are not currently supported; start a new Modal run for a new
-architecture or download a checkpoint and fork it locally.
+saved configuration and `latest` supplies full optimizer progress. Use
+`--from-checkpoint` when a new Modal run should start from compatible weights
+with a fresh optimizer.
 
 For a detached submission that should survive terminal disconnection, retain
 the original Modal entrypoint:

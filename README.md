@@ -57,6 +57,41 @@ shape inference. The Python `TrainingData` protocol in `experiment.py` is the
 plug-in boundary for another dataset: supply its schema, identity, train
 batches, and validation batches to the same start/resume/fork functions.
 
+## Lichess engine policy/value fine-tuning
+
+The 10M-position Lichess evaluation export can be used directly through the
+same `pe train` command. JSONL records are parsed lazily, the deepest usable PV
+provides the legal-masked policy target, and centipawn or mate scores become
+bounded value targets. The source is streamed in bounded training and
+validation windows, so it is not loaded into memory or duplicated into another
+multi-gigabyte dataset. Runs still use the normal `data/runs/<run-id>/` layout
+and record the source and engine-data settings in `run.json`.
+
+Start a fresh optimizer from a compatible checkpoint:
+
+```sh
+./pe train \
+  --backend modal \
+  --gpu A100-40GB \
+  --name lichess-eval-10m-finetune \
+  --dataset data/lichess-eval-10m.jsonl \
+  --from-checkpoint checkpoints/epoch-000010-step-000021900.pt \
+  --to-epochs 10 \
+  --batch-size 1024 \
+  --positions-per-epoch 900000 \
+  --validation-positions 100000 \
+  --learning-rate 0.0001 \
+  --value-weight 1.0 \
+  --min-depth 20 \
+  --channels 192 \
+  --residual-blocks 12
+```
+
+`.jsonl` sources infer `--dataset-format engine-eval`; it can also be supplied
+explicitly. `--from-checkpoint` loads model weights while resetting optimizer,
+epoch, and step state. Resume a completed engine run with its run ID and
+`--to-epochs` just like any other Modal run.
+
 Inspect local artifacts with the same command:
 
 ```sh

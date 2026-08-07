@@ -15,6 +15,12 @@ from pink_elephant.arena import LoadedCheckpoint, load_checkpoint_model
 from pink_elephant.arena_cli import configure_parser as configure_arena_parser
 from pink_elephant.arena_cli import run as run_arena
 from pink_elephant.artifacts import DEFAULT_RUNS_ROOT, RunStore
+from pink_elephant.engine_eval import (
+    DEFAULT_POSITIONS_PER_EPOCH,
+    DEFAULT_VALIDATION_POSITIONS,
+    ENGINE_EVAL_DATASET_FORMAT,
+    EngineValueConfig,
+)
 from pink_elephant.experiment import (
     ExperimentConfig,
     fork_experiment,
@@ -55,10 +61,23 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RUN_ID[@latest]",
         help="start a new run from another run's latest weights",
     )
+    source.add_argument(
+        "--from-checkpoint",
+        type=Path,
+        help="start a fresh optimizer from a compatible checkpoint file",
+    )
     train.add_argument("--name", help="human name for a new or forked run")
-    train.add_argument("--dataset", type=Path, help="processed dataset directory")
+    train.add_argument(
+        "--dataset", type=Path, help="processed dataset directory or raw source file"
+    )
+    train.add_argument(
+        "--dataset-format",
+        choices=("processed", ENGINE_EVAL_DATASET_FORMAT),
+        help="dataset format (inferred from .jsonl when omitted)",
+    )
     train.add_argument("--to-epochs", type=int, required=True, help="target total epoch")
     train.add_argument("--backend", choices=("local", "modal"), default="local")
+    train.add_argument("--gpu", help="Modal GPU type, for example L4 or A100-40GB")
     train.add_argument("--batch-size", type=int)
     train.add_argument("--checkpoint-interval", type=int)
     train.add_argument("--learning-rate", type=float)
@@ -71,6 +90,15 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--residual-blocks", type=int)
     train.add_argument("--policy-channels", type=int)
     train.add_argument("--value-hidden-channels", type=int)
+    train.add_argument("--positions-per-epoch", type=int, default=None)
+    train.add_argument("--validation-positions", type=int, default=None)
+    train.add_argument("--cp-scale", type=float, default=None)
+    train.add_argument("--min-depth", type=int, default=None)
+    train.add_argument(
+        "--reuse-uploaded-dataset",
+        action="store_true",
+        help="reuse an engine JSONL source already present in the Modal Volume",
+    )
     _add_runs_root(train)
     train.set_defaults(handler=_train)
 
@@ -146,14 +174,19 @@ def _list_models(_args: argparse.Namespace) -> int:
 def _train(args: argparse.Namespace) -> int:
     if args.backend == "modal":
         if args.from_run is not None:
-            raise ValueError("Modal weight forks are not supported yet; start a new named run")
+            raise ValueError(
+                "Modal training uses --from-checkpoint for fresh weight initialization"
+            )
         if args.resume is None and (args.name is None or args.dataset is None):
             raise ValueError("new Modal training requires --name and --dataset")
-        from pink_elephant.modal_training import launch_modal_training
+        if args.resume is not None and args.from_checkpoint is not None:
+            raise ValueError("--from-checkpoint cannot be combined with --resume")
+        from pink_elephant.modal_training import MODAL_GPU, launch_modal_training
 
+        dataset_format = args.dataset_format or _infer_dataset_format(args.dataset)
         result = launch_modal_training(
             dataset_dir=args.dataset,
-            dataset_name=args.dataset.name if args.dataset is not None else None,
+            dataset_name=_dataset_name(args.dataset, dataset_format),
             run_name=args.resume or args.name,
             epochs=args.to_epochs,
             batch_size=args.batch_size or 1_024,
@@ -165,10 +198,24 @@ def _train(args: argparse.Namespace) -> int:
             residual_blocks=args.residual_blocks or 12,
             policy_channels=args.policy_channels or 2,
             value_hidden_channels=args.value_hidden_channels or 256,
+            dataset_format=dataset_format,
+            positions_per_epoch=args.positions_per_epoch or DEFAULT_POSITIONS_PER_EPOCH,
+            validation_positions=args.validation_positions or DEFAULT_VALIDATION_POSITIONS,
+            cp_scale=args.cp_scale or 400.0,
+            min_depth=args.min_depth or 0,
+            initial_checkpoint=args.from_checkpoint,
+            gpu=args.gpu or MODAL_GPU,
+            reuse_uploaded_dataset=args.reuse_uploaded_dataset,
             resume=args.resume is not None,
         )
         print(json.dumps(asdict(result), indent=2))
         return 0
+    if args.gpu is not None:
+        raise ValueError("--gpu requires --backend modal")
+    if args.resume is not None and args.from_checkpoint is not None:
+        raise ValueError("--from-checkpoint cannot be combined with --resume")
+    if args.from_run is not None and args.from_checkpoint is not None:
+        raise ValueError("--from and --from-checkpoint are mutually exclusive")
     store = RunStore(args.runs_root)
     if args.resume is not None:
         if args.name is not None or args.dataset is not None:
@@ -197,6 +244,7 @@ def _train(args: argparse.Namespace) -> int:
             args.name,
             _experiment_config(args),
             target_epochs=args.to_epochs,
+            weights_checkpoint=args.from_checkpoint,
         )
     print(
         json.dumps(
@@ -218,32 +266,83 @@ def _experiment_config(
     dataset_path = args.dataset.resolve() if args.dataset is not None else None
     if dataset_path is None and fallback is None:
         raise ValueError("dataset is required")
+    dataset_format = args.dataset_format or (
+        fallback.dataset_format if fallback is not None else _infer_dataset_format(dataset_path)
+    )
+    is_engine_dataset = dataset_format == ENGINE_EVAL_DATASET_FORMAT
     fallback_model = fallback.model.parameter_values() if fallback is not None else {}
     model = chess_resnet_spec(
         ResNetConfig(
-            channels=args.channels or _model_int(fallback_model, "channels", 64),
+            channels=args.channels
+            or _model_int(fallback_model, "channels", 192 if is_engine_dataset else 64),
             residual_blocks=(
-                args.residual_blocks or _model_int(fallback_model, "residual_blocks", 4)
+                args.residual_blocks
+                or _model_int(fallback_model, "residual_blocks", 12 if is_engine_dataset else 4)
             ),
             policy_channels=(
                 args.policy_channels or _model_int(fallback_model, "policy_channels", 2)
             ),
             value_hidden_channels=(
                 args.value_hidden_channels
-                or _model_int(fallback_model, "value_hidden_channels", 64)
+                or _model_int(
+                    fallback_model,
+                    "value_hidden_channels",
+                    256 if is_engine_dataset else 64,
+                )
             ),
         )
     )
+    default_engine_value = EngineValueConfig()
+    fallback_engine_value = fallback.engine_value if fallback is not None else default_engine_value
     return ExperimentConfig(
         model=model,
         dataset_path=dataset_path or fallback.dataset_path,
-        dataset_name=None if fallback is None else fallback.dataset_name,
-        batch_size=args.batch_size or (fallback.batch_size if fallback is not None else 256),
+        dataset_name=(
+            (args.dataset.stem if is_engine_dataset else args.dataset.name)
+            if args.dataset is not None
+            else (None if fallback is None else fallback.dataset_name)
+        ),
+        dataset_format=dataset_format,
+        positions_per_epoch=(
+            args.positions_per_epoch
+            if args.positions_per_epoch is not None
+            else (
+                fallback.positions_per_epoch
+                if fallback is not None
+                else DEFAULT_POSITIONS_PER_EPOCH
+            )
+        ),
+        validation_positions=(
+            args.validation_positions
+            if args.validation_positions is not None
+            else (
+                fallback.validation_positions
+                if fallback is not None
+                else DEFAULT_VALIDATION_POSITIONS
+            )
+        ),
+        engine_value=EngineValueConfig(
+            cp_scale=(
+                args.cp_scale if args.cp_scale is not None else fallback_engine_value.cp_scale
+            ),
+            min_depth=(
+                args.min_depth if args.min_depth is not None else fallback_engine_value.min_depth
+            ),
+            validation_fraction=fallback_engine_value.validation_fraction,
+            ignore_fen_history=fallback_engine_value.ignore_fen_history,
+            shuffle_buffer_size=fallback_engine_value.shuffle_buffer_size,
+        ),
+        batch_size=args.batch_size
+        or (fallback.batch_size if fallback is not None else (1_024 if is_engine_dataset else 256)),
         checkpoint_interval=args.checkpoint_interval
         or (fallback.checkpoint_interval if fallback is not None else 1),
         trainer=TrainerConfig(
             learning_rate=args.learning_rate
-            or (fallback.trainer.learning_rate if fallback is not None else 1e-3),
+            or (
+                fallback.trainer.learning_rate
+                if fallback is not None
+                else (1e-4 if is_engine_dataset else 1e-3)
+            ),
             weight_decay=(
                 args.weight_decay
                 if args.weight_decay is not None
@@ -252,18 +351,42 @@ def _experiment_config(
             value_weight=(
                 args.value_weight
                 if args.value_weight is not None
-                else (fallback.trainer.value_weight if fallback is not None else 0.01)
+                else (
+                    fallback.trainer.value_weight
+                    if fallback is not None
+                    else (1.0 if is_engine_dataset else 0.01)
+                )
             ),
             device=args.device or (fallback.trainer.device if fallback is not None else "cpu"),
             seed=args.seed if args.seed is not None else (fallback.trainer.seed if fallback else 0),
             grad_clip_norm=(
                 args.grad_clip_norm
                 if args.grad_clip_norm is not None
-                else (fallback.trainer.grad_clip_norm if fallback is not None else None)
+                else (
+                    fallback.trainer.grad_clip_norm
+                    if fallback is not None
+                    else (1.0 if is_engine_dataset else None)
+                )
             ),
         ),
         backend="local",
     )
+
+
+def _infer_dataset_format(dataset_path: Path | None) -> str:
+    """Infer the raw streaming format only for an explicitly JSONL source."""
+
+    if dataset_path is not None and dataset_path.suffix.casefold() == ".jsonl":
+        return ENGINE_EVAL_DATASET_FORMAT
+    return "processed"
+
+
+def _dataset_name(dataset_path: Path | None, dataset_format: str) -> str | None:
+    """Derive a stable upload name from a processed directory or JSONL file."""
+
+    if dataset_path is None:
+        return None
+    return dataset_path.stem if dataset_format == ENGINE_EVAL_DATASET_FORMAT else dataset_path.name
 
 
 def _latest_run_reference(reference: str) -> str:
