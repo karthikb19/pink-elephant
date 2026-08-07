@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Protocol
 
 import chess
 import chess.engine
 import chess.pgn
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from pink_elephant.encoding import encode_board
 from pink_elephant.mcts import (
@@ -20,22 +20,17 @@ from pink_elephant.mcts import (
     PolicyValuePrediction,
     run_mcts,
 )
-from pink_elephant.model import ChessResNet, ResNetConfig
-from pink_elephant.training import CHECKPOINT_FORMAT_VERSION
-
-_STATE_TENSOR_KEYS: Final[tuple[str, ...]] = (
-    "stem.0.weight",
-    "policy_head.0.weight",
-    "value_head.3.weight",
-)
+from pink_elephant.model import ModelOutput
+from pink_elephant.model_adapter import ModelSpec, build_model, infer_legacy_model_spec
+from pink_elephant.training import CHECKPOINT_FORMAT_VERSION, LEGACY_CHECKPOINT_FORMAT_VERSION
 
 
 @dataclass(frozen=True, slots=True)
 class LoadedCheckpoint:
     """A model restored from a checkpoint plus its training position."""
 
-    model: ChessResNet
-    config: ResNetConfig
+    model: nn.Module
+    model_spec: ModelSpec
     epoch: int
     step: int
 
@@ -85,7 +80,7 @@ class ModelPlayer:
 class CheckpointEvaluator:
     """Adapt a loaded network to the policy/value evaluator expected by MCTS."""
 
-    def __init__(self, model: ChessResNet, device: torch.device) -> None:
+    def __init__(self, model: nn.Module, device: torch.device) -> None:
         self.model = model
         self.device = device
 
@@ -93,30 +88,43 @@ class CheckpointEvaluator:
         position = torch.from_numpy(encode_board(board)).to(self.device, dtype=torch.float32)
         with torch.inference_mode():
             output = self.model(position.unsqueeze(0))
+        if not isinstance(output, ModelOutput):
+            raise TypeError("model adapter must construct a model returning ModelOutput")
         return PolicyValuePrediction(
             policy_logits=tuple(float(logit) for logit in output.policy_logits[0].cpu()),
             value=float(output.value[0, 0].item()),
         )
 
 
-def load_checkpoint_model(path: Path, device: str = "cpu") -> LoadedCheckpoint:
-    """Load a checkpoint and infer the saved :class:`ResNetConfig`."""
+def load_checkpoint_model(
+    path: Path,
+    device: str = "cpu",
+) -> LoadedCheckpoint:
+    """Load a self-described model, inferring old checkpoints as a fallback."""
 
     target_device = torch.device(device)
     if target_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     loaded = torch.load(path, map_location=target_device, weights_only=False)
     payload = _mapping_payload(loaded)
-    if payload.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+    if payload.get("format_version") not in (
+        CHECKPOINT_FORMAT_VERSION,
+        LEGACY_CHECKPOINT_FORMAT_VERSION,
+    ):
         raise ValueError("unsupported training checkpoint format")
     state = _model_state(payload.get("model_state"))
-    config = _infer_model_config(state)
-    model = ChessResNet(config).to(target_device)
+    raw_model_spec = payload.get("model")
+    model_spec = (
+        infer_legacy_model_spec(state)
+        if raw_model_spec is None
+        else ModelSpec.from_payload(raw_model_spec)
+    )
+    model = build_model(model_spec).to(target_device)
     model.load_state_dict(state)
     model.eval()
     return LoadedCheckpoint(
         model=model,
-        config=config,
+        model_spec=model_spec,
         epoch=_non_negative_int(payload.get("epoch"), "epoch"),
         step=_non_negative_int(payload.get("step"), "step"),
     )
@@ -182,34 +190,6 @@ def _model_state(raw_state: object) -> dict[str, Tensor]:
             raise ValueError("checkpoint model_state must map string names to tensors")
         state[key] = value
     return state
-
-
-def _infer_model_config(state: Mapping[str, Tensor]) -> ResNetConfig:
-    for key in _STATE_TENSOR_KEYS:
-        if key not in state:
-            raise ValueError(f"checkpoint model_state is missing {key}")
-    stem_weight = state["stem.0.weight"]
-    policy_weight = state["policy_head.0.weight"]
-    value_weight = state["value_head.3.weight"]
-    if stem_weight.ndim != 4 or policy_weight.ndim != 4 or value_weight.ndim != 2:
-        raise ValueError("checkpoint model_state has invalid network tensor ranks")
-    block_indices = {
-        int(parts[1])
-        for name in state
-        if (parts := name.split("."))[:1] == ["residual_blocks"]
-        and len(parts) > 2
-        and parts[2] == "conv_one"
-        and len(parts) > 3
-        and parts[3] == "weight"
-    }
-    if not block_indices or block_indices != set(range(max(block_indices) + 1)):
-        raise ValueError("checkpoint model_state has non-contiguous residual blocks")
-    return ResNetConfig(
-        channels=int(stem_weight.shape[0]),
-        residual_blocks=max(block_indices) + 1,
-        policy_channels=int(policy_weight.shape[0]),
-        value_hidden_channels=int(value_weight.shape[0]),
-    )
 
 
 def _non_negative_int(value: object, name: str) -> int:

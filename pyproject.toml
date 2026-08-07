@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
+pink-elephant = "pink_elephant.cli:main"
 play-stockfish = "pink_elephant.arena_cli:main"
 
 [dependency-groups]
