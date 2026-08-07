@@ -296,23 +296,29 @@ def fine_tune_engine_a100(
         run_name=run_name,
     )
 
+    train_epochs = train_loader.iter_epochs(
+        positions_per_epoch=positions_per_epoch,
+        start_epoch=trainer.epoch,
+    )
     while trainer.epoch < epochs:
         target_epoch = trainer.epoch + 1
         epoch_start = time.perf_counter()
         _log_event("epoch_started", epoch=target_epoch, step=trainer.step, total_epochs=epochs)
-        train_stats = EngineValueStats()
+        train_epoch = next(train_epochs)
+        if train_epoch.epoch != trainer.epoch:
+            raise RuntimeError(
+                f"continuous training stream is at epoch {train_epoch.epoch}, "
+                f"but trainer is at epoch {trainer.epoch}"
+            )
         training = trainer.train_epoch(
             _log_batch_progress(
-                train_loader.iter_batches(
-                    epoch=trainer.epoch,
-                    positions_per_epoch=positions_per_epoch,
-                    stats=train_stats,
-                ),
+                train_epoch.batches,
                 phase="train",
                 epoch=target_epoch,
                 total_batches=_total_batches(positions_per_epoch, batch_size),
             )
         )
+        train_stats = train_epoch.stats
         validation_stats = EngineValueStats()
         validation = trainer.validate(
             _log_batch_progress(

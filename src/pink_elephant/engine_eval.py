@@ -7,7 +7,7 @@ import itertools
 import json
 import math
 import random
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -87,6 +87,15 @@ class EngineValueStats:
     records_skipped: int = 0
     cp_records: int = 0
     mate_records: int = 0
+
+
+@dataclass
+class EngineValueEpoch:
+    """One lazily collated epoch from a continuous engine-evaluation stream."""
+
+    epoch: int
+    batches: Iterator[TrainingBatch]
+    stats: EngineValueStats
 
 
 def cp_to_value(cp: int, *, scale: float = DEFAULT_CP_SCALE) -> float:
@@ -198,6 +207,62 @@ class EngineValueLoader:
             )
         yield from _batch_engine_examples(examples, batch_size=self.batch_size)
 
+    def iter_epochs(
+        self,
+        *,
+        positions_per_epoch: int,
+        start_epoch: int = 0,
+    ) -> Iterator[EngineValueEpoch]:
+        """Yield successive epochs while opening and parsing the source only once.
+
+        A nonzero ``start_epoch`` skips prior positions once so callers can resume
+        at a known source offset without replaying that prefix between epochs.
+        """
+
+        if positions_per_epoch < 1:
+            raise ValueError("positions_per_epoch must be positive")
+        if start_epoch < 0:
+            raise ValueError("start_epoch must be non-negative")
+
+        current_stats: EngineValueStats | None = None
+
+        def stats_provider() -> EngineValueStats:
+            if current_stats is None:
+                raise RuntimeError("engine evaluation stats are not initialized")
+            return current_stats
+
+        with self.source_path.open("r", encoding="utf-8") as source:
+            examples = _iter_engine_value_examples(
+                source,
+                split=self.split,
+                config=self.config,
+                stats_provider=stats_provider,
+            )
+            if start_epoch:
+                current_stats = EngineValueStats()
+                for _ in itertools.islice(examples, start_epoch * positions_per_epoch):
+                    pass
+
+            for epoch in itertools.count(start_epoch):
+                current_stats = EngineValueStats()
+                examples_for_epoch: Iterable[EngineValueExample] = itertools.islice(
+                    examples, positions_per_epoch
+                )
+                if self.shuffle:
+                    examples_for_epoch = _buffer_shuffle(
+                        examples_for_epoch,
+                        seed=self.seed + epoch,
+                        buffer_size=self.config.shuffle_buffer_size,
+                    )
+                yield EngineValueEpoch(
+                    epoch=epoch,
+                    batches=_batch_engine_examples(
+                        examples_for_epoch,
+                        batch_size=self.batch_size,
+                    ),
+                    stats=current_stats,
+                )
+
 
 def iter_engine_value_examples(
     source_path: Path,
@@ -209,39 +274,55 @@ def iter_engine_value_examples(
     """Stream valid engine-value examples, skipping unusable source records."""
 
     selected_config = config or EngineValueConfig()
-    counters = stats or EngineValueStats()
+    counters = stats if stats is not None else EngineValueStats()
     with source_path.open("r", encoding="utf-8") as source:
-        for line in source:
-            if not line.strip():
+        yield from _iter_engine_value_examples(
+            source,
+            split=split,
+            config=selected_config,
+            stats_provider=lambda: counters,
+        )
+
+
+def _iter_engine_value_examples(
+    source: Iterable[str],
+    *,
+    split: DataSplit | None,
+    config: EngineValueConfig,
+    stats_provider: Callable[[], EngineValueStats],
+) -> Iterator[EngineValueExample]:
+    """Parse one source stream, allowing a continuous reader to rotate stats."""
+
+    for line in source:
+        if not line.strip():
+            continue
+        counters = stats_provider()
+        counters.records_seen += 1
+        try:
+            payload = json.loads(line)
+            fen, target, depth, first_move, score_kind = _parse_engine_record(payload, config)
+            if split is not None and _fen_split(fen, config) != split:
                 continue
-            counters.records_seen += 1
-            try:
-                payload = json.loads(line)
-                fen, target, depth, first_move, score_kind = _parse_engine_record(
-                    payload, selected_config
-                )
-                if split is not None and _fen_split(fen, selected_config) != split:
-                    continue
-                board = _board_from_fen(fen, ignore_history=selected_config.ignore_fen_history)
-                move = chess.Move.from_uci(first_move)
-                legal_actions = legal_policy_indices(board)
-                played_action = move_to_policy_index(board, move)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                counters.records_skipped += 1
-                continue
-            counters.records_emitted += 1
-            if score_kind == "cp":
-                counters.cp_records += 1
-            else:
-                counters.mate_records += 1
-            yield EngineValueExample(
-                board=encode_board(board),
-                legal_actions=legal_actions,
-                played_action=played_action,
-                target=target,
-                fen=fen,
-                depth=depth,
-            )
+            board = _board_from_fen(fen, ignore_history=config.ignore_fen_history)
+            move = board.parse_uci(first_move)
+            legal_actions = legal_policy_indices(board)
+            played_action = move_to_policy_index(board, move)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            counters.records_skipped += 1
+            continue
+        counters.records_emitted += 1
+        if score_kind == "cp":
+            counters.cp_records += 1
+        else:
+            counters.mate_records += 1
+        yield EngineValueExample(
+            board=encode_board(board),
+            legal_actions=legal_actions,
+            played_action=played_action,
+            target=target,
+            fen=fen,
+            depth=depth,
+        )
 
 
 def _parse_engine_record(
