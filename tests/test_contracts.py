@@ -43,7 +43,7 @@ def test_dataset_schema_defaults_to_current_versions() -> None:
     schema = DatasetSchema()
 
     assert schema.dataset_version == EXPERT_DATASET_VERSION
-    assert schema.encoder_version == "v1"
+    assert schema.encoder_version == "v2"
     assert schema.action_schema_version == "v1"
 
 

@@ -10,20 +10,23 @@ from numpy.typing import NDArray
 
 BOARD_SIZE: Final = 8
 PLANE_COUNT: Final = 21
-ENCODER_VERSION: Final = "v1"
+ENCODER_VERSION: Final = "v2"
 
 
 def _tensor_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
     """Return ``(row, column)`` for a square in the canonical orientation.
 
     Rows run from the current player's home rank toward the opponent's home
-    rank.  Files always run from a-file to h-file.  Mirroring ranks for Black
-    means that both sides' pawns advance toward increasing row numbers.
+    rank, and files run from the current player's left to right. Black
+    positions are therefore rotated 180 degrees so both sides share one
+    orientation.
     """
 
     rank = chess.square_rank(square)
     file = chess.square_file(square)
-    return (rank if turn == chess.WHITE else BOARD_SIZE - 1 - rank, file)
+    if turn == chess.WHITE:
+        return rank, file
+    return BOARD_SIZE - 1 - rank, BOARD_SIZE - 1 - file
 
 
 def _set_piece_planes(encoded: NDArray[np.uint8], board: chess.Board, turn: chess.Color) -> None:

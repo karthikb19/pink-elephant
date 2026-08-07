@@ -1,7 +1,7 @@
 # Canonical board encoding
 
 **Date:** 2026-07-26  
-**Status:** Accepted
+**Status:** Superseded by [full 180-degree board and move orientation](2026-08-06-full-180-board-move-orientation.md)
 
 ## Context
 
@@ -10,11 +10,11 @@ have a side to move and rule state beyond piece placement.
 
 ## Decision
 
-Encode each `python-chess` board as the versioned `v1` `uint8` tensor of shape
-`(21, 8, 8)`, rank-mirrored for Black so the active player always moves toward
-increasing tensor rows. Include current/opponent pieces, emptiness, castling,
-en-passant, clipped halfmove clock, and repetition thresholds; retain
-`python-chess` and its move stack as the rules authority.
+Encode each `python-chess` board as the versioned `uint8` tensor of shape
+`(21, 8, 8)`, with the active player canonicalized to the same orientation as
+White. Include current/opponent pieces, emptiness, castling, en-passant,
+clipped halfmove clock, and repetition thresholds; retain `python-chess` and
+its move stack as the rules authority.
 
 ## Alternatives
 

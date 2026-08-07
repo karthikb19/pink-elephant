@@ -5,7 +5,7 @@
 
 ## Context
 
-Pink Elephant now has a canonical `v1` board tensor of shape `(21, 8, 8)`.
+Pink Elephant now has a canonical `v2` board tensor of shape `(21, 8, 8)`.
 The first local training and MCTS vertical slice needs a model that can learn
 spatial chess features while remaining practical to run, test, and iterate on
 on a MacBook Air with 16 GiB of unified memory. The model must also preserve
