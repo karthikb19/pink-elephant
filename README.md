@@ -92,6 +92,7 @@ The same top-level command can launch a new Modal run:
 ```sh
 ./pe train \
   --backend modal \
+  --gpu A100-40GB \
   --name full-data \
   --dataset data/processed/expert/v1-full \
   --to-epochs 10 \
@@ -103,7 +104,7 @@ For a standardized Modal run, resume only needs its run ID and new target epoch;
 the remote `run.json` restores the dataset and model/trainer parameters:
 
 ```sh
-./pe train --backend modal --resume <run-id> --to-epochs 20
+./pe train --backend modal --gpu A100-40GB --resume <run-id> --to-epochs 20
 ```
 
 The original `modal run` entrypoint and its explicit legacy checkpoint resume
@@ -159,8 +160,8 @@ Afterward, retrieve metrics or checkpoints from the Modal Volume with
 
 ## Lichess engine policy/value fine-tuning
 
-Fine-tune checkpoint 10 on the 10M-position JSONL export using one Modal
-A100-40GB GPU. The job uses the
+Fine-tune checkpoint 10 on the 10M-position JSONL export using a selected Modal
+GPU (`A100-40GB` by default). The job uses the
 deepest PV’s first move for the policy target, calibrated `[-1, 1]` engine
 values for the value target, a deterministic 10% validation split, and a
 900,000-position training window. Start with this one-epoch smoke test; it
@@ -178,6 +179,7 @@ Then launch training while reusing that Volume file:
 
 ~~~sh
 uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.py \
+  --gpu A100-40GB \
   --engine-eval-path lichess-eval-10m.jsonl \
   --initial-checkpoint epoch-000010-step-000021900.pt \
   --dataset-name lichess-eval-10m \
@@ -196,7 +198,7 @@ uv run modal run --detach --timestamps src/pink_elephant/modal_engine_finetune.p
 `--initial-checkpoint` can point to any compatible local checkpoint, including
 the newest checkpoint from another run. The launcher uploads it to the
 Modal Volume at `runs/<run-name>/initial-checkpoint.pt`; it is not baked into
-the container image. The A100 function mounts that Volume at `/data` and loads
+the container image. The GPU function mounts that Volume at `/data` and loads
 the checkpoint from there before creating a fresh optimizer.
 
 Metrics download to `data/modal-engine-runs/<run-name>/`. The fine-tuned

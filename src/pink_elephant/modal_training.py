@@ -180,6 +180,7 @@ def launch_modal_training(
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     policy_channels: int = MODAL_POLICY_CHANNELS,
     value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
+    gpu: str = MODAL_GPU,
     resume: bool = False,
 ) -> ModalTrainingResult:
     """Upload when needed and dispatch the same run/resume request to Modal."""
@@ -194,23 +195,30 @@ def launch_modal_training(
         selected_run_name = RunIdentity.create(run_name).run_id
         remote_dataset = upload_dataset(dataset_dir, dataset_name=dataset_name)
         resume_checkpoint = None
+    if not gpu.strip():
+        raise ValueError("gpu must not be empty")
     with app.run():
-        return train_l4.spawn(
-            remote_dataset.removeprefix(f"/{DATASET_VOLUME_ROOT}/"),
-            selected_run_name,
-            epochs=epochs,
-            batch_size=batch_size,
-            checkpoint_interval=checkpoint_interval,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            grad_clip_norm=grad_clip_norm,
-            channels=channels,
-            residual_blocks=residual_blocks,
-            policy_channels=policy_channels,
-            value_hidden_channels=value_hidden_channels,
-            resume_checkpoint=resume_checkpoint,
-            git_revision=_git_revision(),
-        ).get()
+        return (
+            train_l4.with_options(gpu=gpu)
+            .spawn(
+                remote_dataset.removeprefix(f"/{DATASET_VOLUME_ROOT}/"),
+                selected_run_name,
+                epochs=epochs,
+                batch_size=batch_size,
+                checkpoint_interval=checkpoint_interval,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                grad_clip_norm=grad_clip_norm,
+                channels=channels,
+                residual_blocks=residual_blocks,
+                policy_channels=policy_channels,
+                value_hidden_channels=value_hidden_channels,
+                gpu_name=gpu,
+                resume_checkpoint=resume_checkpoint,
+                git_revision=_git_revision(),
+            )
+            .get()
+        )
 
 
 @app.function(
@@ -233,6 +241,7 @@ def train_l4(
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     policy_channels: int = MODAL_POLICY_CHANNELS,
     value_hidden_channels: int = MODAL_VALUE_HIDDEN_CHANNELS,
+    gpu_name: str = MODAL_GPU,
     resume_checkpoint: str | None = None,
     git_revision: str | None = None,
 ) -> ModalTrainingResult:
@@ -318,7 +327,7 @@ def train_l4(
             RunParameter("device", "cuda"),
             RunParameter("epochs", epochs),
             RunParameter("git_revision", git_revision),
-            RunParameter("gpu", MODAL_GPU),
+            RunParameter("gpu", gpu_name),
             RunParameter("grad_clip_norm", grad_clip_norm),
             RunParameter("learning_rate", learning_rate),
             RunParameter("value_weight", MODAL_VALUE_WEIGHT),
@@ -342,7 +351,7 @@ def train_l4(
         batch_size=batch_size,
         dataset_name=dataset_name,
         epochs=epochs,
-        gpu=MODAL_GPU,
+        gpu=gpu_name,
         model={
             "channels": channels,
             "policy_channels": policy_channels,
@@ -432,7 +441,7 @@ def train_l4(
     assert final_validation is not None
     result = ModalTrainingResult(
         run_name=run_name,
-        gpu=MODAL_GPU,
+        gpu=gpu_name,
         epochs_completed=trainer.epoch,
         optimizer_steps=trainer.step,
         train_examples=train_loader.example_count,
@@ -464,6 +473,7 @@ def main(
     checkpoint_interval: int = MODAL_CHECKPOINT_INTERVAL,
     channels: int = MODAL_CHANNELS,
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
+    gpu: str = MODAL_GPU,
     resume_checkpoint: str | None = None,
 ) -> None:
     """Upload data, launch L4 training, and download metrics."""
@@ -492,17 +502,24 @@ def main(
         channels=channels,
         residual_blocks=residual_blocks,
     )
-    result = train_l4.spawn(
-        dataset_name,
-        selected_run_name,
-        epochs=epochs,
-        batch_size=batch_size,
-        checkpoint_interval=checkpoint_interval,
-        channels=channels,
-        residual_blocks=residual_blocks,
-        resume_checkpoint=resume_checkpoint,
-        git_revision=_git_revision(),
-    ).get()
+    if not gpu.strip():
+        raise ValueError("gpu must not be empty")
+    result = (
+        train_l4.with_options(gpu=gpu)
+        .spawn(
+            dataset_name,
+            selected_run_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            checkpoint_interval=checkpoint_interval,
+            channels=channels,
+            residual_blocks=residual_blocks,
+            gpu_name=gpu,
+            resume_checkpoint=resume_checkpoint,
+            git_revision=_git_revision(),
+        )
+        .get()
+    )
     _log_event("training_call_returned", run_name=selected_run_name)
     local_run_dir = Path(output_dir) / selected_run_name
     metrics_path = download_run_metrics(

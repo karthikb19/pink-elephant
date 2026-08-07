@@ -191,6 +191,7 @@ def fine_tune_engine_a100(
     residual_blocks: int = ENGINE_RESIDUAL_BLOCKS,
     policy_channels: int = ENGINE_POLICY_CHANNELS,
     value_hidden_channels: int = ENGINE_VALUE_HIDDEN_CHANNELS,
+    gpu_name: str = ENGINE_GPU,
     git_revision: str | None = None,
 ) -> EngineFineTuneResult:
     """Run a bounded policy/value fine-tune initialized from checkpoint 10."""
@@ -224,7 +225,7 @@ def fine_tune_engine_a100(
     run_path.mkdir(parents=True, exist_ok=True)
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Modal A100-40GB fine-tuning requires CUDA, but CUDA is unavailable")
+        raise RuntimeError(f"Modal {gpu_name} fine-tuning requires CUDA, but CUDA is unavailable")
     torch.set_float32_matmul_precision("high")
 
     model_config = ResNetConfig(
@@ -273,7 +274,7 @@ def fine_tune_engine_a100(
         batch_size=batch_size,
         dataset=engine_eval_remote_path,
         epochs=epochs,
-        gpu=ENGINE_GPU,
+        gpu=gpu_name,
         initial_checkpoint=initial_checkpoint_remote_path,
         initial_checkpoint_epoch=initial_metadata.epoch,
         initial_checkpoint_step=initial_metadata.step,
@@ -380,7 +381,7 @@ def fine_tune_engine_a100(
     assert final_validation is not None
     result = EngineFineTuneResult(
         run_name=run_name,
-        gpu=ENGINE_GPU,
+        gpu=gpu_name,
         epochs_completed=trainer.epoch,
         optimizer_steps=trainer.step,
         train_examples=total_train_examples,
@@ -423,6 +424,7 @@ def main(
     value_weight: float = ENGINE_VALUE_WEIGHT,
     channels: int = ENGINE_CHANNELS,
     residual_blocks: int = ENGINE_RESIDUAL_BLOCKS,
+    gpu: str = ENGINE_GPU,
 ) -> None:
     """Upload source artifacts, submit the detached-capable Modal job, and fetch metrics."""
 
@@ -448,23 +450,30 @@ def main(
         initial_checkpoint=remote_checkpoint_path,
         run_name=selected_run_name,
     )
-    result = fine_tune_engine_a100.spawn(
-        remote_engine_path,
-        remote_checkpoint_path,
-        selected_run_name,
-        epochs=epochs,
-        batch_size=batch_size,
-        positions_per_epoch=positions_per_epoch,
-        validation_positions=validation_positions,
-        checkpoint_interval=checkpoint_interval,
-        cp_scale=cp_scale,
-        min_depth=min_depth,
-        learning_rate=learning_rate,
-        value_weight=value_weight,
-        channels=channels,
-        residual_blocks=residual_blocks,
-        git_revision=_git_revision(),
-    ).get()
+    if not gpu.strip():
+        raise ValueError("gpu must not be empty")
+    result = (
+        fine_tune_engine_a100.with_options(gpu=gpu)
+        .spawn(
+            remote_engine_path,
+            remote_checkpoint_path,
+            selected_run_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            positions_per_epoch=positions_per_epoch,
+            validation_positions=validation_positions,
+            checkpoint_interval=checkpoint_interval,
+            cp_scale=cp_scale,
+            min_depth=min_depth,
+            learning_rate=learning_rate,
+            value_weight=value_weight,
+            channels=channels,
+            residual_blocks=residual_blocks,
+            gpu_name=gpu,
+            git_revision=_git_revision(),
+        )
+        .get()
+    )
     local_run_dir = Path(output_dir) / selected_run_name
     metrics_path = download_run_metrics(local_run_dir, run_name=selected_run_name)
     metrics_history_path = download_run_metrics(
