@@ -1,0 +1,19 @@
+[Event "Overfit fixture"]
+[Site "local"]
+[LichessURL "https://lichess.org/overfit-128"]
+[Result "1-0"]
+[Variant "Standard"]
+
+1. d4 g5 2. b4 d6 3. Nc3 Bg4 4. Nh3 d5 5. e3 Bf3 6. Nxd5 Nf6
+7. Kd2 h6 8. e4 Ng4 9. a4 h5 10. Qe2 b6 11. Nhf4 Bg7 12. Nxh5 Nc6
+13. Ne3 O-O 14. c4 Bh6 15. Ra3 Qd6 16. Nf5 Qf4+ 17. Ne3 Rfb8
+18. Ke1 Bxe2 19. e5 b5 20. Nf5 Qf3 21. a5 Qxf5 22. Nf6+ Qxf6
+23. Bxe2 Kg7 24. Be3 Re8 25. f4 gxf4 26. Bxg4 Rh8 27. Kf1 Kh7
+28. Be2 a6 29. Rd3 Kg6 30. Kg1 Qd6 31. Bf2 Kh7 32. Rf3 Bg7
+33. Rb3 bxc4 34. g3 Nxa5 35. Kf1 Nxb3 36. Bg4 Bf8 37. b5 Qb6
+38. Be1 Qc6 39. Bh3 Qd5 40. Bf5+ Kh6 41. Bf2 Qxe5 42. Bb1 Rg8
+43. Bg1 Qf5 44. Be3 Qg4 45. Kg1 Nd2 46. Bf2 Kg5 47. Bg6 Qh5
+48. Bxh5 c6 49. h3 Rh8 50. h4+ Kf6 51. bxc6 Nf3+ 52. Bxf3 a5
+53. Kg2 Bg7 54. Kh3 Rh5 55. Bd5 Rxh4+ 56. Kxh4 Rb8 57. Be6 Kg6
+58. Kh3 Kh7 59. g4 Rb4 60. Bxf7 Bf6 61. Be1 Kh6 62. Rh2 Bxd4
+63. Bf2 Bxf2 64. Kg2+ Kg7 1-0
