@@ -82,6 +82,28 @@ def test_parser_selects_deepest_pv_and_skips_unusable_records(tmp_path: Path) ->
     assert stats.mate_records == 1
 
 
+def test_parser_reports_progress_for_every_source_line(tmp_path: Path) -> None:
+    fen = chess.Board().fen()
+    source = tmp_path / "engine.jsonl"
+    source.write_text(
+        "\n".join(
+            (
+                json.dumps(_record(fen=fen, cp=30)),
+                "",
+                "not-json",
+                json.dumps(_record(fen=fen, cp=-45)),
+            )
+        ),
+        encoding="utf-8",
+    )
+    updates: list[int] = []
+
+    examples = list(iter_engine_value_examples(source, progress_update=updates.append))
+
+    assert len(examples) == 2
+    assert updates == [1, 1, 1, 1]
+
+
 def test_engine_jsonl_is_sharded_into_the_existing_training_adapter_format(
     tmp_path: Path,
 ) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -163,6 +163,7 @@ def iter_engine_value_examples(
     *,
     config: EngineValueConfig | None = None,
     stats: EngineValueStats | None = None,
+    progress_update: Callable[[int], None] | None = None,
 ) -> Iterator[EngineValueExample]:
     """Read valid JSONL records one at a time for the shard writer."""
 
@@ -170,6 +171,8 @@ def iter_engine_value_examples(
     counters = stats if stats is not None else EngineValueStats()
     with source_path.open("r", encoding="utf-8") as source:
         for record_index, line in enumerate(source):
+            if progress_update is not None:
+                progress_update(1)
             if not line.strip():
                 continue
             counters.records_seen += 1
