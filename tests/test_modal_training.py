@@ -17,7 +17,7 @@ from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.pgn import PgnParserConfig
 from pink_elephant.shards import write_pgn_dataset
-from pink_elephant.training import Trainer, TrainerConfig
+from pink_elephant.training import Trainer, TrainerConfig, TrainingPhaseTimings
 
 FIXTURE = Path(__file__).parent / "fixtures" / "real_pilot_sample.pgn"
 
@@ -146,6 +146,7 @@ def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
     assert function.args[0] == "expert-v1"
     assert str(function.args[1]).endswith("-trial")
     assert function.kwargs["resume_checkpoint"] is None
+    assert function.kwargs["phase_timing_batches"] == 0
 
 
 def test_initial_checkpoint_upload_uses_stable_volume_path(
@@ -311,6 +312,28 @@ def test_batch_progress_logs_periodic_json_events(capsys: pytest.CaptureFixture[
     assert all(record["timestamp"].endswith("+00:00") for record in records)
     assert all(record["phase"] == "train" for record in records)
     assert records[-1]["examples_seen"] == 6
+
+
+def test_phase_timing_logger_emits_samples_and_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    logger = modal_training._PhaseTimingLogger(epoch=3, expected_samples=2)
+    timings = TrainingPhaseTimings(1.0, 2.0, 3.0, 4.0, 5.0)
+
+    logger(1, timings)
+    logger(2, timings)
+    logger.log_summary()
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [record["event"] for record in records] == [
+        "training_phase_timing",
+        "training_phase_timing",
+        "training_phase_timing_summary",
+    ]
+    assert records[0]["total_seconds"] == 15.0
+    assert records[-1]["sample_count"] == 2
+    assert records[-1]["mean_seconds"]["loader_wait_seconds"] == 1.0
+    assert records[-1]["total_mean_seconds"] == 15.0
 
 
 def test_local_dataset_validation_rejects_a_missing_manifest_shard(tmp_path: Path) -> None:

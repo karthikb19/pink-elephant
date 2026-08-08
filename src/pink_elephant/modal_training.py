@@ -6,7 +6,7 @@ import json
 import subprocess
 import time
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Final
@@ -23,6 +23,7 @@ from pink_elephant.shards import MANIFEST_FILENAME, load_dataset_manifest
 from pink_elephant.training import (
     Trainer,
     TrainerConfig,
+    TrainingPhaseTimings,
 )
 
 MODAL_GPU: Final[str] = "L4"
@@ -91,6 +92,52 @@ class ModalTrainingResult:
     metrics_path: str
     metrics_history_path: str
     latest_checkpoint: str | None
+
+
+@dataclass(slots=True)
+class _PhaseTimingLogger:
+    """Emit live Modal events and retain samples for an epoch aggregate."""
+
+    epoch: int
+    expected_samples: int
+    samples: list[TrainingPhaseTimings] = field(default_factory=list)
+    summary_logged: bool = field(default=False, init=False)
+
+    def __call__(self, batch: int, timings: TrainingPhaseTimings) -> None:
+        self.samples.append(timings)
+        _log_event(
+            "training_phase_timing",
+            batch=batch,
+            epoch=self.epoch,
+            timings=asdict(timings),
+            total_seconds=timings.total_seconds,
+        )
+        if len(self.samples) == self.expected_samples:
+            self.log_summary()
+
+    def log_summary(self) -> None:
+        if not self.samples or self.summary_logged:
+            return
+        sample_count = len(self.samples)
+        phase_names = (
+            "loader_wait_seconds",
+            "transfer_seconds",
+            "forward_seconds",
+            "backward_seconds",
+            "optimizer_seconds",
+        )
+        means = {
+            name: sum(getattr(sample, name) for sample in self.samples) / sample_count
+            for name in phase_names
+        }
+        _log_event(
+            "training_phase_timing_summary",
+            epoch=self.epoch,
+            mean_seconds=means,
+            sample_count=sample_count,
+            total_mean_seconds=sum(means.values()),
+        )
+        self.summary_logged = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +251,7 @@ def launch_modal_training(
     initial_checkpoint: Path | None = None,
     gpu: str = MODAL_GPU,
     resume: bool = False,
+    phase_timing_batches: int = 0,
 ) -> ModalTrainingResult:
     """Upload when needed and dispatch the same run/resume request to Modal."""
 
@@ -248,6 +296,7 @@ def launch_modal_training(
             initial_checkpoint_remote_path=initial_checkpoint_remote,
             resume_checkpoint=resume_checkpoint,
             git_revision=_git_revision(),
+            phase_timing_batches=phase_timing_batches,
         ).get()
 
 
@@ -275,6 +324,7 @@ def train_l4(
     initial_checkpoint_remote_path: str | None = None,
     resume_checkpoint: str | None = None,
     git_revision: str | None = None,
+    phase_timing_batches: int = 0,
 ) -> ModalTrainingResult:
     """Train one versioned dataset on a single Modal L4 GPU."""
 
@@ -307,6 +357,7 @@ def train_l4(
         residual_blocks=residual_blocks,
         policy_channels=policy_channels,
         value_hidden_channels=value_hidden_channels,
+        phase_timing_batches=phase_timing_batches,
     )
     dataset_path = _mounted_volume_path(DATASET_VOLUME_ROOT, dataset_name)
     manifest_path = dataset_path / MANIFEST_FILENAME
@@ -408,6 +459,7 @@ def train_l4(
         },
         resume_checkpoint=resume_checkpoint,
         run_name=run_name,
+        phase_timing_batches=phase_timing_batches,
         start_epoch=trainer.epoch,
         train_batches=_total_batches(expected_train_examples, batch_size),
         train_examples=expected_train_examples,
@@ -425,14 +477,18 @@ def train_l4(
         )
         train_batches = train_loader.iter_batches(epoch=trainer.epoch)
         validation_batches = validation_loader
+        phase_timing_logger = _PhaseTimingLogger(target_epoch, phase_timing_batches)
         training = trainer.train_epoch(
             _log_batch_progress(
                 train_batches,
                 phase="train",
                 epoch=target_epoch,
                 total_batches=_total_batches(expected_train_examples, batch_size),
-            )
+            ),
+            phase_timing_batches=phase_timing_batches,
+            phase_timing_observer=phase_timing_logger if phase_timing_batches else None,
         )
+        phase_timing_logger.log_summary()
         validation = trainer.validate(
             _log_batch_progress(
                 validation_batches,
@@ -677,6 +733,7 @@ def _validate_training_arguments(
     residual_blocks: int,
     policy_channels: int,
     value_hidden_channels: int,
+    phase_timing_batches: int,
 ) -> None:
     if epochs < 1:
         raise ValueError("epochs must be positive")
@@ -684,6 +741,8 @@ def _validate_training_arguments(
         raise ValueError("batch_size must be positive")
     if checkpoint_interval < 1:
         raise ValueError("checkpoint_interval must be positive")
+    if phase_timing_batches < 0:
+        raise ValueError("phase_timing_batches must be non-negative")
     if learning_rate <= 0:
         raise ValueError("learning_rate must be positive")
     if weight_decay < 0:

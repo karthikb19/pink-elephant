@@ -90,6 +90,8 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
             "20260806T010203Z-full-data",
             "--to-epochs",
             "20",
+            "--phase-timing-batches",
+            "12",
         ]
     )
 
@@ -98,6 +100,7 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
     assert calls[0]["dataset_dir"] is None
     assert calls[0]["resume"] is True
     assert calls[0]["epochs"] == 20
+    assert calls[0]["phase_timing_batches"] == 12
 
 
 def test_cli_builds_a_processed_training_config(

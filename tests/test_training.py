@@ -1,5 +1,6 @@
 import math
 from collections.abc import Iterable
+from dataclasses import asdict
 from pathlib import Path
 
 import chess
@@ -17,6 +18,7 @@ from pink_elephant.training import (
     EXPERT_PRETRAINING_VALUE_WEIGHT,
     Trainer,
     TrainerConfig,
+    TrainingPhaseTimings,
     aggregate_validation_metrics,
     compute_joint_loss,
     compute_validation_metrics,
@@ -219,6 +221,35 @@ def test_trainer_updates_parameters_and_tracks_progress() -> None:
     assert trainer.step == 1
     assert not torch.equal(model.policy_bias.detach(), before_policy)
     assert not torch.equal(model.value_bias.detach(), before_value)
+
+
+def test_trainer_reports_phase_timings_for_requested_batches() -> None:
+    trainer = Trainer(TinyPolicyValueModel(), TrainerConfig(weight_decay=0.0))
+    observed: list[tuple[int, TrainingPhaseTimings]] = []
+
+    trainer.train_epoch(
+        [_batch(), _batch()],
+        phase_timing_batches=1,
+        phase_timing_observer=lambda batch, timings: observed.append((batch, timings)),
+    )
+
+    assert [batch for batch, _ in observed] == [1]
+    timings = observed[0][1]
+    assert timings.total_seconds == pytest.approx(
+        timings.loader_wait_seconds
+        + timings.transfer_seconds
+        + timings.forward_seconds
+        + timings.backward_seconds
+        + timings.optimizer_seconds
+    )
+    assert all(value >= 0 for value in asdict(timings).values())
+
+
+def test_trainer_phase_timing_requires_an_observer() -> None:
+    trainer = Trainer(TinyPolicyValueModel())
+
+    with pytest.raises(ValueError, match="requires an observer"):
+        trainer.train_epoch([_batch()], phase_timing_batches=1)
 
 
 def test_trainer_validation_aggregates_multiple_batches() -> None:

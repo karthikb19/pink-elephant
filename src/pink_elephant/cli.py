@@ -77,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--residual-blocks", type=int)
     train.add_argument("--policy-channels", type=int)
     train.add_argument("--value-hidden-channels", type=int)
+    train.add_argument(
+        "--phase-timing-batches",
+        type=int,
+        default=0,
+        help="synchronize and log phase timings for the first N Modal batches per epoch",
+    )
     _add_runs_root(train)
     train.set_defaults(handler=_train)
 
@@ -178,11 +184,14 @@ def _train(args: argparse.Namespace) -> int:
             initial_checkpoint=args.from_checkpoint,
             gpu=args.gpu or MODAL_GPU,
             resume=args.resume is not None,
+            phase_timing_batches=args.phase_timing_batches,
         )
         print(json.dumps(asdict(result), indent=2))
         return 0
     if args.gpu is not None:
         raise ValueError("--gpu requires --backend modal")
+    if args.phase_timing_batches:
+        raise ValueError("--phase-timing-batches requires --backend modal")
     if args.resume is not None and args.from_checkpoint is not None:
         raise ValueError("--from-checkpoint cannot be combined with --resume")
     if args.from_run is not None and args.from_checkpoint is not None:
