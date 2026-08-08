@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO, cast
@@ -291,6 +291,7 @@ def write_engine_eval_dataset(
     config: object | None = None,
     max_examples_per_shard: int = 50_000,
     compression: str = "zstd",
+    progress_update: Callable[[int], None] | None = None,
 ) -> DatasetManifest:
     """Convert Lichess engine JSONL into the standard processed shard layout."""
 
@@ -311,7 +312,12 @@ def write_engine_eval_dataset(
         max_examples_per_shard=max_examples_per_shard,
         compression=compression,
     )
-    for example in iter_engine_value_examples(source_path, stats=stats, config=selected_config):
+    for example in iter_engine_value_examples(
+        source_path,
+        stats=stats,
+        config=selected_config,
+        progress_update=progress_update,
+    ):
         writer.add(example.to_expert_example())
     return writer.finish(stats.snapshot())
 
