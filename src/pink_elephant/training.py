@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,6 +143,32 @@ class TrainingSummary:
     total_loss: float
     policy_loss: float
     value_loss: float
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingPhaseTimings:
+    """Synchronized wall-clock timings for one diagnostic training batch."""
+
+    loader_wait_seconds: float
+    transfer_seconds: float
+    forward_seconds: float
+    backward_seconds: float
+    optimizer_seconds: float
+
+    @property
+    def total_seconds(self) -> float:
+        """Return the time covered by the measured training phases."""
+
+        return (
+            self.loader_wait_seconds
+            + self.transfer_seconds
+            + self.forward_seconds
+            + self.backward_seconds
+            + self.optimizer_seconds
+        )
+
+
+TrainingPhaseObserver = Callable[[int, TrainingPhaseTimings], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,24 +397,77 @@ class Trainer:
         self.step = 0
         self.last_validation_metrics: ValidationMetrics | None = None
 
-    def train_epoch(self, batches: Iterable[TrainingBatch]) -> TrainingSummary:
+    def train_epoch(
+        self,
+        batches: Iterable[TrainingBatch],
+        *,
+        phase_timing_batches: int = 0,
+        phase_timing_observer: TrainingPhaseObserver | None = None,
+    ) -> TrainingSummary:
         """Run optimizer updates over one iterable of already-collated batches."""
 
+        if phase_timing_batches < 0:
+            raise ValueError("phase_timing_batches must be non-negative")
+        if phase_timing_batches > 0 and phase_timing_observer is None:
+            raise ValueError("phase timing requires an observer")
         self.model.train()
         total_examples = 0
         loss_totals: Tensor | None = None
         batch_count = 0
+        batch_iterator = iter(batches)
 
-        for source_batch in batches:
+        while True:
+            measure_phases = phase_timing_observer is not None and (
+                batch_count < phase_timing_batches
+            )
+            if measure_phases:
+                self._synchronize_device()
+                phase_started = time.perf_counter()
+            try:
+                source_batch = next(batch_iterator)
+            except StopIteration:
+                break
+            loader_wait_seconds = time.perf_counter() - phase_started if measure_phases else 0.0
+
+            if measure_phases:
+                phase_started = time.perf_counter()
             batch = self._on_device(source_batch)
+            if measure_phases:
+                self._synchronize_device()
+                transfer_seconds = time.perf_counter() - phase_started
+
             self.optimizer.zero_grad(set_to_none=True)
+            if measure_phases:
+                self._synchronize_device()
+                phase_started = time.perf_counter()
             losses = compute_joint_loss(
                 self._model_output(batch), batch, value_weight=self.config.value_weight
             )
+            if measure_phases:
+                self._synchronize_device()
+                forward_seconds = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
             losses.total.backward()
+            if measure_phases:
+                self._synchronize_device()
+                backward_seconds = time.perf_counter() - phase_started
+                phase_started = time.perf_counter()
             if self.config.grad_clip_norm is not None:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
             self.optimizer.step()
+            if measure_phases:
+                self._synchronize_device()
+                optimizer_seconds = time.perf_counter() - phase_started
+                phase_timing_observer(
+                    batch_count + 1,
+                    TrainingPhaseTimings(
+                        loader_wait_seconds=loader_wait_seconds,
+                        transfer_seconds=transfer_seconds,
+                        forward_seconds=forward_seconds,
+                        backward_seconds=backward_seconds,
+                        optimizer_seconds=optimizer_seconds,
+                    ),
+                )
             batch_size = batch.positions.shape[0]
             total_examples += batch_size
             if loss_totals is None:
@@ -598,6 +678,10 @@ class Trainer:
             played_actions=batch.played_actions.to(self.device),
             outcomes=batch.outcomes.to(self.device),
         )
+
+    def _synchronize_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def _move_optimizer_state_to_device(self) -> None:
         for state in self.optimizer.state.values():
