@@ -33,10 +33,3 @@ contains initialization overhead.
 The 4,096 timing sample includes one transfer-time outlier, so its result
 should be treated as an early steady-state estimate until a later
 `batch_progress` interval is available.
-
-## Recommendation
-
-Use batch size 2,048 for this configuration. It captures nearly all observed
-throughput improvement while requiring substantially less GPU memory than
-4,096. Revisit 4,096 only if a longer interval demonstrates a consistent
-improvement or if optimization targets memory bandwidth/transfer overhead.
