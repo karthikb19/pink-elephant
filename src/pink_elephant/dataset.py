@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import queue
 import random
+import threading
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 
 import numpy as np
 import torch
@@ -30,6 +33,8 @@ HALFMOVE_PLANE = 18
 HALFMOVE_SCALE = 150.0
 DEFAULT_READER_BATCH_SIZE = 8_192
 DEFAULT_SHUFFLE_BUFFER_SIZE = 8_192
+PREFETCH_POLL_SECONDS = 0.05
+PREFETCH_JOIN_SECONDS = 1.0
 
 
 def collate_expert_examples(examples: Sequence[ExpertExample]) -> TrainingBatch:
@@ -145,11 +150,13 @@ class ExpertBatchLoader:
 
         return self.iter_batches(epoch=0)
 
-    def iter_batches(self, *, epoch: int = 0) -> Iterator[TrainingBatch]:
+    def iter_batches(self, *, epoch: int = 0, prefetch_batches: int = 0) -> Iterator[TrainingBatch]:
         """Stream batches for an explicit non-negative training epoch."""
 
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
+        if prefetch_batches < 0:
+            raise ValueError("prefetch_batches must be non-negative")
         rows: Iterable[_RowReference] = self._iter_rows(epoch=epoch)
         if self.shuffle:
             rows = _buffer_shuffle(
@@ -157,7 +164,10 @@ class ExpertBatchLoader:
                 seed=self.seed + epoch,
                 buffer_size=self.shuffle_buffer_size,
             )
-        yield from _batch_rows(rows, batch_size=self.batch_size)
+        batches = _batch_rows(rows, batch_size=self.batch_size)
+        if prefetch_batches == 0:
+            return batches
+        return PrefetchIterator(batches, capacity=prefetch_batches)
 
     def _iter_rows(self, *, epoch: int) -> Iterator[_RowReference]:
         """Yield references into validated bulk row batches."""
@@ -194,6 +204,112 @@ class _RowReference:
 
     rows: ProcessedRowBatch
     index: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProducerError:
+    """Carry a producer exception and its original traceback to the consumer."""
+
+    error: BaseException
+    traceback: TracebackType | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProducerEnd:
+    """Mark normal producer exhaustion."""
+
+
+_QueueItem = TrainingBatch | _ProducerError | _ProducerEnd
+
+
+class PrefetchIterator(Iterator[TrainingBatch]):
+    """Prepare batches on one producer thread into a bounded FIFO queue."""
+
+    def __init__(self, batches: Iterable[TrainingBatch], *, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("capacity must be positive")
+        self._source = iter(batches)
+        self._queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=capacity)
+        self._stop = threading.Event()
+        self._closed = False
+        self._worker = threading.Thread(
+            target=self._produce,
+            name="expert-batch-prefetch",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def buffered_batches(self) -> int:
+        """Return the current bounded queue size for diagnostics and tests."""
+
+        return self._queue.qsize()
+
+    @property
+    def worker_alive(self) -> bool:
+        """Return whether the producer is still active."""
+
+        return self._worker.is_alive()
+
+    def __iter__(self) -> PrefetchIterator:
+        return self
+
+    def __next__(self) -> TrainingBatch:
+        if self._closed:
+            raise StopIteration
+        item = self._queue.get()
+        if isinstance(item, TrainingBatch):
+            return item
+        self.close()
+        if isinstance(item, _ProducerError):
+            raise item.error.with_traceback(item.traceback)
+        raise StopIteration
+
+    def close(self) -> None:
+        """Stop production and wait briefly for cooperative worker cleanup."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        self._worker.join(timeout=PREFETCH_JOIN_SECONDS)
+
+    def __enter__(self) -> PrefetchIterator:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _produce(self) -> None:
+        terminal: _QueueItem = _ProducerEnd()
+        try:
+            for batch in self._source:
+                if not self._put(batch):
+                    return
+        except BaseException as error:
+            terminal = _ProducerError(error=error, traceback=error.__traceback__)
+        finally:
+            close = getattr(self._source, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except BaseException as error:
+                    terminal = _ProducerError(error=error, traceback=error.__traceback__)
+        self._put(terminal)
+
+    def _put(self, item: _QueueItem) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=PREFETCH_POLL_SECONDS)
+            except queue.Full:
+                continue
+            return True
+        return False
 
 
 def _batch_rows(rows: Iterable[_RowReference], *, batch_size: int) -> Iterator[TrainingBatch]:

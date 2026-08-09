@@ -78,6 +78,11 @@ class _FakeModalFunction:
         self.result = result
         self.args: tuple[object, ...] = ()
         self.kwargs: dict[str, object] = {}
+        self.options: dict[str, object] = {}
+
+    def with_options(self, **options: object) -> _FakeModalFunction:
+        self.options = options
+        return self
 
     def spawn(self, *args: object, **kwargs: object) -> _FakeFunctionCall:
         self.args = args
@@ -102,6 +107,9 @@ def test_modal_defaults_target_an_l4_with_equal_policy_and_value_weight() -> Non
     assert modal_training.MODAL_CHANNELS == 192
     assert modal_training.MODAL_RESIDUAL_BLOCKS == 12
     assert pytest.approx(1.0) == modal_training.MODAL_VALUE_WEIGHT
+    assert modal_training.MODAL_CPU == 2.0
+    assert modal_training.MODAL_LOADER_WORKERS == 0
+    assert modal_training.MODAL_PREFETCH_BATCHES == 4
 
 
 def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
@@ -147,6 +155,47 @@ def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
     assert str(function.args[1]).endswith("-trial")
     assert function.kwargs["resume_checkpoint"] is None
     assert function.kwargs["phase_timing_batches"] == 0
+    assert function.kwargs["loader_workers"] == 0
+    assert function.kwargs["prefetch_batches"] == 4
+    assert function.kwargs["cpu_request"] == 2.0
+    assert function.options == {"cpu": 2.0, "gpu": "L4"}
+
+
+@pytest.mark.parametrize(
+    ("loader_workers", "prefetch_batches", "message"),
+    [
+        (-1, 4, "loader_workers must be 0 or 1"),
+        (2, 4, "loader_workers must be 0 or 1"),
+        (1, 0, "prefetch_batches must be positive"),
+    ],
+)
+def test_modal_launch_rejects_invalid_prefetch_configuration(
+    loader_workers: int,
+    prefetch_batches: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        modal_training.launch_modal_training(
+            dataset_dir=None,
+            dataset_name=None,
+            run_name="existing-run",
+            epochs=2,
+            resume=True,
+            loader_workers=loader_workers,
+            prefetch_batches=prefetch_batches,
+        )
+
+
+def test_modal_launch_rejects_a_non_positive_cpu_request() -> None:
+    with pytest.raises(ValueError, match="modal_cpu must be positive"):
+        modal_training.launch_modal_training(
+            dataset_dir=None,
+            dataset_name=None,
+            run_name="existing-run",
+            epochs=2,
+            resume=True,
+            modal_cpu=0,
+        )
 
 
 def test_initial_checkpoint_upload_uses_stable_volume_path(
