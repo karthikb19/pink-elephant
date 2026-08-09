@@ -2,6 +2,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -78,6 +80,58 @@ def test_loader_reads_manifest_shards_and_preserves_example_count(tmp_path: Path
     assert [batch.positions.shape[0] for batch in batches] == [64, 64, 64, 64, 51]
     assert sum(batch.positions.shape[0] for batch in batches) == loader.example_count
     assert all(batch.legal_mask.sum(dim=1).min().item() > 0 for batch in batches)
+
+
+def test_bulk_loader_matches_example_collation_and_final_partial_batch(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_dataset(dataset_dir)
+    expected = collate_expert_examples(_read_fixture_examples())
+
+    actual_batches = list(
+        ExpertBatchLoader(
+            dataset_dir,
+            split="validation",
+            batch_size=128,
+            shuffle=False,
+            reader_batch_size=17,
+        )
+    )
+
+    assert [batch.positions.shape[0] for batch in actual_batches] == [128, 128, 51]
+    assert torch.equal(torch.cat([batch.positions for batch in actual_batches]), expected.positions)
+    assert torch.equal(
+        torch.cat([batch.legal_mask for batch in actual_batches]), expected.legal_mask
+    )
+    assert torch.equal(
+        torch.cat([batch.played_actions for batch in actual_batches]), expected.played_actions
+    )
+    assert torch.equal(torch.cat([batch.outcomes for batch in actual_batches]), expected.outcomes)
+
+
+def test_bulk_loader_rejects_a_played_action_outside_legal_actions(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_dataset(dataset_dir)
+    shard_path = next((dataset_dir / "validation").glob("*.parquet"))
+    table = pq.read_table(shard_path)
+    legal_actions = set(table["legal_actions"][0].as_py())
+    invalid_action = next(action for action in range(4_672) if action not in legal_actions)
+    invalid_actions = pa.array(
+        [invalid_action, *table["played_action"].to_pylist()[1:]], type=pa.uint16()
+    )
+    played_action_field = table.schema.field("played_action")
+    table = table.set_column(
+        table.schema.get_field_index("played_action"), played_action_field, invalid_actions
+    )
+    pq.write_table(table, shard_path)
+
+    loader = ExpertBatchLoader(
+        dataset_dir,
+        split="validation",
+        batch_size=8,
+        shuffle=False,
+    )
+    with pytest.raises(ValueError, match="played_action must be one of legal_actions"):
+        next(iter(loader))
 
 
 def test_loader_epoch_shuffle_is_deterministic_and_epoch_scoped(tmp_path: Path) -> None:
