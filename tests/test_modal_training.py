@@ -110,6 +110,7 @@ def test_modal_defaults_target_an_l4_with_equal_policy_and_value_weight() -> Non
     assert modal_training.MODAL_CPU == 2.0
     assert modal_training.MODAL_LOADER_WORKERS == 0
     assert modal_training.MODAL_PREFETCH_BATCHES == 4
+    assert modal_training.MODAL_BF16_AUTOCAST
 
 
 def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(

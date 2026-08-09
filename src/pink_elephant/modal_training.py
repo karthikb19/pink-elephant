@@ -49,6 +49,7 @@ MODAL_VALUE_HIDDEN_CHANNELS: Final[int] = 256
 MODAL_FUNCTION_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
 MODAL_LOADER_WORKERS: Final[int] = 0
 MODAL_PREFETCH_BATCHES: Final[int] = 4
+MODAL_BF16_AUTOCAST: Final[bool] = True
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -400,6 +401,7 @@ def train_l4(
         device="cuda",
         seed=0,
         grad_clip_norm=grad_clip_norm,
+        bf16_autocast=MODAL_BF16_AUTOCAST,
     )
     if not torch.cuda.is_available():
         raise RuntimeError("Modal L4 training requires CUDA, but CUDA is unavailable")
@@ -435,6 +437,7 @@ def train_l4(
         model_spec=trainer.model_spec,
         run_parameters=(
             RunParameter("batch_size", batch_size),
+            RunParameter("bf16_autocast", MODAL_BF16_AUTOCAST),
             RunParameter("checkpoint_interval", checkpoint_interval),
             RunParameter("dataset_name", dataset_name),
             RunParameter("device", "cuda"),
@@ -486,6 +489,7 @@ def train_l4(
         loader_workers=loader_workers,
         prefetch_batches=prefetch_batches,
         cpu_request=cpu_request,
+        bf16_autocast=MODAL_BF16_AUTOCAST,
         start_epoch=trainer.epoch,
         train_batches=_total_batches(expected_train_examples, batch_size),
         train_examples=expected_train_examples,
