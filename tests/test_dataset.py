@@ -8,10 +8,17 @@ import pytest
 import torch
 
 from pink_elephant.contracts import DatasetSchema, ExpertExample, TrainingBatch
-from pink_elephant.dataset import ExpertBatchLoader, collate_expert_examples
+from pink_elephant.dataset import (
+    ExpertBatchLoader,
+    _collate_row_references,
+    _RowReference,
+    _scatter_legal_mask,
+    collate_expert_examples,
+)
+from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.pgn import PgnParserConfig, iter_expert_examples
-from pink_elephant.shards import write_pgn_dataset
+from pink_elephant.shards import ProcessedRowBatch, write_pgn_dataset
 from pink_elephant.training import Trainer, TrainerConfig
 
 FIXTURE = Path(__file__).parent / "fixtures" / "real_pilot_sample.pgn"
@@ -60,6 +67,49 @@ def test_collator_builds_normalized_positions_and_dense_legal_masks() -> None:
 def test_collator_rejects_an_empty_example_sequence() -> None:
     with pytest.raises(ValueError, match="at least one expert example"):
         collate_expert_examples([])
+
+
+def test_indexed_scatter_is_idempotent_for_duplicate_indices() -> None:
+    mask = _scatter_legal_mask(
+        row_count=2,
+        linear_indices=np.array([3, 3, 4_672 + 7], dtype=np.int64),
+    )
+
+    assert mask.dtype == torch.bool
+    assert mask.shape == (2, 4_672)
+    assert torch.nonzero(mask[0]).flatten().tolist() == [3]
+    assert torch.nonzero(mask[1]).flatten().tolist() == [7]
+
+
+def test_bulk_collator_scatters_varied_actions_across_shuffled_backing_batches() -> None:
+    first = _processed_rows(
+        board_values=(10, 11),
+        legal_actions=((7,), (11, 12, 13)),
+        played_actions=(7, 12),
+    )
+    second = _processed_rows(
+        board_values=(20, 21),
+        legal_actions=((21, 22), (31, 32, 33, 34)),
+        played_actions=(22, 33),
+    )
+
+    batch = _collate_row_references(
+        [
+            _RowReference(second, 1),
+            _RowReference(first, 1),
+            _RowReference(second, 0),
+            _RowReference(first, 0),
+        ]
+    )
+
+    assert batch.positions[:, 0, 0, 0].tolist() == [21.0, 11.0, 20.0, 10.0]
+    assert batch.played_actions.tolist() == [33, 12, 22, 7]
+    assert [torch.nonzero(row).flatten().tolist() for row in batch.legal_mask] == [
+        [31, 32, 33, 34],
+        [11, 12, 13],
+        [21, 22],
+        [7],
+    ]
 
 
 def test_loader_reads_manifest_shards_and_preserves_example_count(tmp_path: Path) -> None:
@@ -134,6 +184,41 @@ def test_bulk_loader_rejects_a_played_action_outside_legal_actions(tmp_path: Pat
         next(iter(loader))
 
 
+@pytest.mark.parametrize(
+    ("malformation", "message"),
+    [
+        ("duplicate", "legal_actions must not contain duplicates"),
+        ("out-of-range", r"legal_actions must be in \[0, 4672\)"),
+    ],
+)
+def test_bulk_loader_rejects_malformed_legal_actions(
+    tmp_path: Path, malformation: str, message: str
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_dataset(dataset_dir)
+    shard_path = next((dataset_dir / "validation").glob("*.parquet"))
+    table = pq.read_table(shard_path)
+    legal_actions = table["legal_actions"].to_pylist()
+    first_action = legal_actions[0][0]
+    legal_actions[0] = [first_action, first_action] if malformation == "duplicate" else [4_672]
+    field = table.schema.field("legal_actions")
+    table = table.set_column(
+        table.schema.get_field_index("legal_actions"),
+        field,
+        pa.array(legal_actions, type=pa.list_(pa.uint16())),
+    )
+    pq.write_table(table, shard_path)
+
+    loader = ExpertBatchLoader(
+        dataset_dir,
+        split="validation",
+        batch_size=8,
+        shuffle=False,
+    )
+    with pytest.raises(ValueError, match=message):
+        next(iter(loader))
+
+
 def test_loader_epoch_shuffle_is_deterministic_and_epoch_scoped(tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
     _write_dataset(dataset_dir)
@@ -205,3 +290,36 @@ def test_loader_batches_flow_into_training_and_checkpointing(tmp_path: Path) -> 
     assert np.isfinite(validation_metrics.policy_loss)
     assert np.isfinite(validation_metrics.value_mse)
     assert len(list((tmp_path / "checkpoints").glob("*.pt"))) == 1
+
+
+def _processed_rows(
+    *,
+    board_values: tuple[int, ...],
+    legal_actions: tuple[tuple[int, ...], ...],
+    played_actions: tuple[int, ...],
+) -> ProcessedRowBatch:
+    """Build a small validated-equivalent row batch for collation tests."""
+
+    offsets = np.zeros(len(legal_actions) + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum([len(actions) for actions in legal_actions])
+    return ProcessedRowBatch(
+        boards=np.stack(
+            [
+                np.full(
+                    (PLANE_COUNT, BOARD_SIZE, BOARD_SIZE),
+                    value,
+                    dtype=np.uint8,
+                )
+                for value in board_values
+            ]
+        ),
+        legal_offsets=offsets,
+        legal_actions=np.asarray(
+            [action for actions in legal_actions for action in actions],
+            dtype=np.uint16,
+        ),
+        played_actions=np.asarray(played_actions, dtype=np.uint16),
+        outcomes=np.zeros(len(board_values), dtype=np.float32),
+        ply_indices=np.arange(len(board_values), dtype=np.uint32),
+        split="validation",
+    )

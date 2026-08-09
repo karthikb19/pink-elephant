@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
 from pink_elephant.action_mapping import POLICY_SIZE
 from pink_elephant.contracts import (
@@ -42,9 +43,21 @@ def collate_expert_examples(examples: Sequence[ExpertExample]) -> TrainingBatch:
     )
     positions[:, HALFMOVE_PLANE] /= HALFMOVE_SCALE
 
-    legal_mask = torch.zeros((len(examples), POLICY_SIZE), dtype=torch.bool)
-    for row, example in enumerate(examples):
-        legal_mask[row, list(example.legal_actions)] = True
+    legal_lengths = np.fromiter(
+        (len(example.legal_actions) for example in examples),
+        dtype=np.int64,
+        count=len(examples),
+    )
+    legal_rows = np.repeat(np.arange(len(examples), dtype=np.int64), legal_lengths)
+    legal_actions = np.fromiter(
+        (action for example in examples for action in example.legal_actions),
+        dtype=np.int64,
+        count=int(legal_lengths.sum()),
+    )
+    legal_mask = _scatter_legal_mask(
+        row_count=len(examples),
+        linear_indices=legal_rows * POLICY_SIZE + legal_actions,
+    )
 
     return TrainingBatch(
         positions=positions,
@@ -203,7 +216,7 @@ def _collate_row_references(references: Sequence[_RowReference]) -> TrainingBatc
     boards = np.empty((row_count, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE), dtype=np.uint8)
     played_actions = np.empty(row_count, dtype=np.int64)
     outcomes = np.empty(row_count, dtype=np.float32)
-    legal_mask = np.zeros((row_count, POLICY_SIZE), dtype=np.bool_)
+    legal_linear_indices: list[NDArray[np.int64]] = []
 
     groups: dict[int, tuple[ProcessedRowBatch, list[int], list[int]]] = {}
     for output_index, reference in enumerate(references):
@@ -229,16 +242,34 @@ def _collate_row_references(references: Sequence[_RowReference]) -> TrainingBatc
         segment_starts = np.repeat(np.cumsum(lengths) - lengths, lengths)
         value_indices = repeated_starts + np.arange(action_count) - segment_starts
         mask_rows = np.repeat(output_indices, lengths)
-        legal_mask[mask_rows, rows.legal_actions[value_indices]] = True
+        legal_linear_indices.append(mask_rows * POLICY_SIZE + rows.legal_actions[value_indices])
+
+    combined_legal_indices = (
+        legal_linear_indices[0]
+        if len(legal_linear_indices) == 1
+        else np.concatenate(legal_linear_indices)
+    )
+    legal_mask = _scatter_legal_mask(
+        row_count=row_count,
+        linear_indices=combined_legal_indices,
+    )
 
     positions = torch.from_numpy(boards).to(dtype=torch.float32)
     positions[:, HALFMOVE_PLANE] /= HALFMOVE_SCALE
     return TrainingBatch(
         positions=positions,
-        legal_mask=torch.from_numpy(legal_mask),
+        legal_mask=legal_mask,
         played_actions=torch.from_numpy(played_actions),
         outcomes=torch.from_numpy(outcomes),
     )
+
+
+def _scatter_legal_mask(*, row_count: int, linear_indices: NDArray[np.int64]) -> torch.Tensor:
+    """Scatter flattened legal-action indices into one dense boolean tensor."""
+
+    mask = torch.zeros((row_count, POLICY_SIZE), dtype=torch.bool)
+    mask.view(-1).scatter_(0, torch.from_numpy(linear_indices), True)
+    return mask
 
 
 def _buffer_shuffle(
