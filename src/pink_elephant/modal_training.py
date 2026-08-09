@@ -349,6 +349,7 @@ def train_l4(
     """Train one versioned dataset on a single Modal L4 GPU."""
 
     existing_layout = _standardized_resume_layout(run_name, resume_checkpoint)
+    bf16_autocast = MODAL_BF16_AUTOCAST if resume_checkpoint is None else False
     if existing_layout is not None:
         parameters = {
             parameter.name: parameter.value for parameter in existing_layout.manifest.parameters
@@ -365,6 +366,7 @@ def train_l4(
         policy_channels = _manifest_int(model_parameters, "policy_channels")
         value_hidden_channels = _manifest_int(model_parameters, "value_hidden_channels")
         gpu_name = _manifest_string_or_default(parameters, "gpu", MODAL_GPU)
+        bf16_autocast = _manifest_bool_or_default(parameters, "bf16_autocast", False)
 
     _validate_training_arguments(
         epochs=epochs,
@@ -401,7 +403,7 @@ def train_l4(
         device="cuda",
         seed=0,
         grad_clip_norm=grad_clip_norm,
-        bf16_autocast=MODAL_BF16_AUTOCAST,
+        bf16_autocast=bf16_autocast,
     )
     if not torch.cuda.is_available():
         raise RuntimeError("Modal L4 training requires CUDA, but CUDA is unavailable")
@@ -437,7 +439,7 @@ def train_l4(
         model_spec=trainer.model_spec,
         run_parameters=(
             RunParameter("batch_size", batch_size),
-            RunParameter("bf16_autocast", MODAL_BF16_AUTOCAST),
+            RunParameter("bf16_autocast", bf16_autocast),
             RunParameter("checkpoint_interval", checkpoint_interval),
             RunParameter("dataset_name", dataset_name),
             RunParameter("device", "cuda"),
@@ -489,7 +491,7 @@ def train_l4(
         loader_workers=loader_workers,
         prefetch_batches=prefetch_batches,
         cpu_request=cpu_request,
-        bf16_autocast=MODAL_BF16_AUTOCAST,
+        bf16_autocast=bf16_autocast,
         start_epoch=trainer.epoch,
         train_batches=_total_batches(expected_train_examples, batch_size),
         train_examples=expected_train_examples,
@@ -890,6 +892,13 @@ def _manifest_string_or_default(parameters: Mapping[str, object], name: str, def
     value = parameters.get(name, default)
     if not isinstance(value, str):
         raise ValueError(f"run manifest parameter {name!r} must be a string")
+    return value
+
+
+def _manifest_bool_or_default(parameters: Mapping[str, object], name: str, default: bool) -> bool:
+    value = parameters.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"run manifest parameter {name!r} must be a boolean")
     return value
 
 

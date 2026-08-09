@@ -113,6 +113,24 @@ def test_modal_defaults_target_an_l4_with_equal_policy_and_value_weight() -> Non
     assert modal_training.MODAL_BF16_AUTOCAST
 
 
+@pytest.mark.parametrize(
+    ("parameters", "expected"),
+    [
+        ({}, False),
+        ({"bf16_autocast": True}, True),
+    ],
+)
+def test_manifest_bf16_autocast_defaults_to_fp32_for_existing_runs(
+    parameters: dict[str, object], expected: bool
+) -> None:
+    assert modal_training._manifest_bool_or_default(parameters, "bf16_autocast", False) is expected
+
+
+def test_manifest_bf16_autocast_rejects_a_non_boolean_value() -> None:
+    with pytest.raises(ValueError, match="must be a boolean"):
+        modal_training._manifest_bool_or_default({"bf16_autocast": "true"}, "bf16_autocast", False)
+
+
 def test_normal_cli_launch_hydrates_the_modal_app_and_dispatches_dataset_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
