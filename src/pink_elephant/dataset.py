@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -16,9 +17,11 @@ from pink_elephant.contracts import (
     ExpertExample,
     TrainingBatch,
 )
+from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 from pink_elephant.shards import (
     MANIFEST_FILENAME,
-    iter_processed_shard,
+    ProcessedRowBatch,
+    iter_processed_row_batches,
     load_dataset_manifest,
 )
 
@@ -134,27 +137,29 @@ class ExpertBatchLoader:
 
         if epoch < 0:
             raise ValueError("epoch must be non-negative")
-        examples: Iterable[ExpertExample] = self._iter_examples(epoch=epoch)
+        rows: Iterable[_RowReference] = self._iter_rows(epoch=epoch)
         if self.shuffle:
-            examples = _buffer_shuffle(
-                examples,
+            rows = _buffer_shuffle(
+                rows,
                 seed=self.seed + epoch,
                 buffer_size=self.shuffle_buffer_size,
             )
-        yield from _batch_examples(examples, batch_size=self.batch_size)
+        yield from _batch_rows(rows, batch_size=self.batch_size)
 
-    def _iter_examples(self, *, epoch: int) -> Iterator[ExpertExample]:
-        """Yield validated examples from the manifest-listed split shards."""
+    def _iter_rows(self, *, epoch: int) -> Iterator[_RowReference]:
+        """Yield references into validated bulk row batches."""
 
         shards = list(self._shards)
         if self.shuffle:
             random.Random(self.seed + epoch).shuffle(shards)
         for shard in shards:
-            yield from iter_processed_shard(
+            for rows in iter_processed_row_batches(
                 self._shard_path(shard.relative_path),
                 expected_schema=self.schema,
                 batch_size=self.reader_batch_size,
-            )
+            ):
+                for index in range(rows.row_count):
+                    yield _RowReference(rows=rows, index=index)
 
     def _shard_path(self, relative_path: str) -> Path:
         """Resolve a manifest path without allowing it to escape the dataset."""
@@ -170,28 +175,79 @@ class ExpertBatchLoader:
         return path
 
 
-def _batch_examples(
-    examples: Iterable[ExpertExample], *, batch_size: int
-) -> Iterator[TrainingBatch]:
-    """Group an example stream into full and final partial batches."""
+@dataclass(frozen=True, slots=True)
+class _RowReference:
+    """Identify one row while retaining its Arrow-backed NumPy batch."""
 
-    pending: list[ExpertExample] = []
-    for example in examples:
-        pending.append(example)
+    rows: ProcessedRowBatch
+    index: int
+
+
+def _batch_rows(rows: Iterable[_RowReference], *, batch_size: int) -> Iterator[TrainingBatch]:
+    """Group bulk row references into full and final partial batches."""
+
+    pending: list[_RowReference] = []
+    for row in rows:
+        pending.append(row)
         if len(pending) == batch_size:
-            yield collate_expert_examples(pending)
+            yield _collate_row_references(pending)
             pending = []
     if pending:
-        yield collate_expert_examples(pending)
+        yield _collate_row_references(pending)
+
+
+def _collate_row_references(references: Sequence[_RowReference]) -> TrainingBatch:
+    """Gather rows in bulk from their source batches into training tensors."""
+
+    row_count = len(references)
+    boards = np.empty((row_count, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE), dtype=np.uint8)
+    played_actions = np.empty(row_count, dtype=np.int64)
+    outcomes = np.empty(row_count, dtype=np.float32)
+    legal_mask = np.zeros((row_count, POLICY_SIZE), dtype=np.bool_)
+
+    groups: dict[int, tuple[ProcessedRowBatch, list[int], list[int]]] = {}
+    for output_index, reference in enumerate(references):
+        key = id(reference.rows)
+        group = groups.get(key)
+        if group is None:
+            group = (reference.rows, [], [])
+            groups[key] = group
+        group[1].append(output_index)
+        group[2].append(reference.index)
+
+    for rows, output_indices_list, source_indices_list in groups.values():
+        output_indices = np.asarray(output_indices_list, dtype=np.int64)
+        source_indices = np.asarray(source_indices_list, dtype=np.int64)
+        boards[output_indices] = rows.boards[source_indices]
+        played_actions[output_indices] = rows.played_actions[source_indices]
+        outcomes[output_indices] = rows.outcomes[source_indices]
+
+        starts = rows.legal_offsets[source_indices]
+        lengths = rows.legal_offsets[source_indices + 1] - starts
+        action_count = int(lengths.sum())
+        repeated_starts = np.repeat(starts, lengths)
+        segment_starts = np.repeat(np.cumsum(lengths) - lengths, lengths)
+        value_indices = repeated_starts + np.arange(action_count) - segment_starts
+        mask_rows = np.repeat(output_indices, lengths)
+        legal_mask[mask_rows, rows.legal_actions[value_indices]] = True
+
+    positions = torch.from_numpy(boards).to(dtype=torch.float32)
+    positions[:, HALFMOVE_PLANE] /= HALFMOVE_SCALE
+    return TrainingBatch(
+        positions=positions,
+        legal_mask=torch.from_numpy(legal_mask),
+        played_actions=torch.from_numpy(played_actions),
+        outcomes=torch.from_numpy(outcomes),
+    )
 
 
 def _buffer_shuffle(
-    examples: Iterable[ExpertExample], *, seed: int, buffer_size: int
-) -> Iterator[ExpertExample]:
+    examples: Iterable[_RowReference], *, seed: int, buffer_size: int
+) -> Iterator[_RowReference]:
     """Shuffle a stream with bounded memory and a deterministic seed."""
 
     generator = random.Random(seed)
-    buffer: list[ExpertExample] = []
+    buffer: list[_RowReference] = []
     for example in examples:
         if len(buffer) < buffer_size:
             buffer.append(example)

@@ -11,10 +11,11 @@ from typing import Protocol, TextIO, cast
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
-from pink_elephant.action_mapping import ACTION_SCHEMA_VERSION
+from pink_elephant.action_mapping import ACTION_SCHEMA_VERSION, POLICY_SIZE
 from pink_elephant.contracts import EXPERT_DATASET_VERSION, DatasetSchema, DataSplit, ExpertExample
 from pink_elephant.encoding import BOARD_SIZE, ENCODER_VERSION, PLANE_COUNT
 from pink_elephant.pgn import (
@@ -93,6 +94,25 @@ class _StoredRow:
     game_id: str
     ply_index: int
     split: DataSplit
+
+
+@dataclass(frozen=True)
+class ProcessedRowBatch:
+    """Bulk NumPy representation of one validated Arrow record batch."""
+
+    boards: NDArray[np.uint8]
+    legal_offsets: NDArray[np.int64]
+    legal_actions: NDArray[np.uint16]
+    played_actions: NDArray[np.uint16]
+    outcomes: NDArray[np.float32]
+    ply_indices: NDArray[np.uint32]
+    split: DataSplit
+
+    @property
+    def row_count(self) -> int:
+        """Return the number of examples in the batch."""
+
+        return self.boards.shape[0]
 
 
 def processed_arrow_schema() -> pa.Schema:
@@ -354,8 +374,104 @@ def iter_processed_shard(
 
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
-    parquet_file = pq.ParquetFile(path)
+    for rows, game_ids in _iter_processed_row_batches(
+        path,
+        expected_schema=expected_schema,
+        batch_size=batch_size,
+        include_game_ids=True,
+    ):
+        if game_ids is None:
+            raise RuntimeError("processed example reader requires game identifiers")
+        for index in range(rows.row_count):
+            start = rows.legal_offsets[index]
+            stop = rows.legal_offsets[index + 1]
+            yield ExpertExample(
+                board=rows.boards[index].copy(),
+                legal_actions=tuple(int(action) for action in rows.legal_actions[start:stop]),
+                played_action=int(rows.played_actions[index]),
+                outcome=float(rows.outcomes[index]),
+                game_id=game_ids[index],
+                ply_index=int(rows.ply_indices[index]),
+                split=rows.split,
+            )
+
+
+def iter_processed_row_batches(
+    path: Path,
+    *,
+    expected_schema: DatasetSchema | None = None,
+    batch_size: int = 8_192,
+) -> Iterator[ProcessedRowBatch]:
+    """Read one shard as validated bulk NumPy batches for model training."""
+
+    for rows, _ in _iter_processed_row_batches(
+        path,
+        expected_schema=expected_schema,
+        batch_size=batch_size,
+        include_game_ids=False,
+    ):
+        yield rows
+
+
+def _iter_processed_row_batches(
+    path: Path,
+    *,
+    expected_schema: DatasetSchema | None,
+    batch_size: int,
+    include_game_ids: bool,
+) -> Iterator[tuple[ProcessedRowBatch, tuple[str, ...] | None]]:
+    """Convert Arrow record batches to NumPy arrays without row scalar access."""
+
+    parquet_file, split = _validated_parquet_file(path, expected_schema, batch_size)
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        columns = {name: batch.column(name) for name in batch.schema.names}
+        if any(column.null_count for column in columns.values()):
+            raise ValueError(f"null value in non-nullable column in {path}")
+        boards = _boards_to_numpy(columns["board"], batch.num_rows)
+        legal_offsets, legal_actions = _legal_actions_to_numpy(columns["legal_actions"])
+        played_actions = cast(
+            NDArray[np.uint16], columns["played_action"].to_numpy(zero_copy_only=False)
+        )
+        outcomes = cast(
+            NDArray[np.float32],
+            columns["outcome"].cast(pa.float32()).to_numpy(zero_copy_only=False),
+        )
+        ply_indices = cast(NDArray[np.uint32], columns["ply_index"].to_numpy(zero_copy_only=False))
+        _validate_bulk_rows(
+            path=path,
+            columns=columns,
+            legal_offsets=legal_offsets,
+            legal_actions=legal_actions,
+            played_actions=played_actions,
+            outcomes=outcomes,
+            split=split,
+        )
+        game_ids = None
+        if include_game_ids:
+            game_ids = tuple(cast(list[str], columns["game_id"].to_pylist()))
+        yield (
+            ProcessedRowBatch(
+                boards=boards,
+                legal_offsets=legal_offsets,
+                legal_actions=legal_actions,
+                played_actions=played_actions,
+                outcomes=outcomes,
+                ply_indices=ply_indices,
+                split=split,
+            ),
+            game_ids,
+        )
+
+
+def _validated_parquet_file(
+    path: Path, expected_schema: DatasetSchema | None, batch_size: int
+) -> tuple[pq.ParquetFile, DataSplit]:
+    """Validate shard-level schema and metadata before reading rows."""
+
     schema = expected_schema if expected_schema is not None else _DEFAULT_SCHEMA
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    parquet_file = pq.ParquetFile(path)
     actual_schema = parquet_file.schema_arrow
     if not (
         actual_schema.equals(processed_arrow_schema(), check_metadata=False)
@@ -375,32 +491,74 @@ def iter_processed_shard(
             f"metadata row count disagrees with Parquet file in {path}: "
             f"{expected_row_count} != {actual_row_count}"
         )
-    for batch in parquet_file.iter_batches(batch_size=batch_size):
-        columns = {name: batch.column(name) for name in batch.schema.names}
-        for index in range(batch.num_rows):
-            board_bytes = columns["board"][index].as_py()
-            legal_actions = columns["legal_actions"][index].as_py()
-            if not isinstance(board_bytes, bytes) or len(board_bytes) != BOARD_BYTE_COUNT:
-                raise ValueError(f"invalid board payload in {path} row {index}")
-            if legal_actions is None:
-                raise ValueError(f"missing legal actions in {path} row {index}")
-            board = (
-                np.frombuffer(board_bytes, dtype=np.uint8)
-                .copy()
-                .reshape((PLANE_COUNT, BOARD_SIZE, BOARD_SIZE))
-            )
-            example = ExpertExample(
-                board=cast(NDArray[np.uint8], board),
-                legal_actions=tuple(int(action) for action in legal_actions),
-                played_action=int(columns["played_action"][index].as_py()),
-                outcome=float(columns["outcome"][index].as_py()),
-                game_id=str(columns["game_id"][index].as_py()),
-                ply_index=int(columns["ply_index"][index].as_py()),
-                split=cast(DataSplit, str(columns["split"][index].as_py())),
-            )
-            if example.split != split:
-                raise ValueError(f"row split disagrees with shard metadata in {path} row {index}")
-            yield example
+    return parquet_file, cast(DataSplit, split)
+
+
+def _boards_to_numpy(column: pa.Array, row_count: int) -> NDArray[np.uint8]:
+    """View fixed-size board payloads as a dense NumPy array."""
+
+    data_buffer = column.buffers()[1]
+    if data_buffer is None:
+        raise ValueError("board column has no data buffer")
+    values = np.frombuffer(
+        data_buffer,
+        dtype=np.uint8,
+        count=row_count * BOARD_BYTE_COUNT,
+        offset=column.offset * BOARD_BYTE_COUNT,
+    )
+    return cast(NDArray[np.uint8], values.reshape((row_count, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE)))
+
+
+def _legal_actions_to_numpy(
+    column: pa.Array,
+) -> tuple[NDArray[np.int64], NDArray[np.uint16]]:
+    """Return normalized list offsets and the referenced action values."""
+
+    list_column = cast(pa.ListArray, column)
+    offsets = cast(NDArray[np.int64], list_column.offsets.to_numpy(zero_copy_only=False)).astype(
+        np.int64, copy=False
+    )
+    first = int(offsets[0])
+    normalized_offsets = offsets - first
+    values = cast(
+        NDArray[np.uint16], list_column.values.to_numpy(zero_copy_only=False)[first : offsets[-1]]
+    )
+    return cast(NDArray[np.int64], normalized_offsets), values
+
+
+def _validate_bulk_rows(
+    *,
+    path: Path,
+    columns: dict[str, pa.Array],
+    legal_offsets: NDArray[np.int64],
+    legal_actions: NDArray[np.uint16],
+    played_actions: NDArray[np.uint16],
+    outcomes: NDArray[np.float32],
+    split: DataSplit,
+) -> None:
+    """Apply example contract checks to an entire record batch."""
+
+    lengths = np.diff(legal_offsets)
+    if np.any(lengths == 0):
+        raise ValueError(f"legal_actions must not be empty in {path}")
+    if np.any(legal_actions >= POLICY_SIZE):
+        raise ValueError(f"legal_actions must be in [0, {POLICY_SIZE}) in {path}")
+    row_ids = np.repeat(np.arange(len(lengths), dtype=np.int64), lengths)
+    order = np.lexsort((legal_actions, row_ids))
+    sorted_rows = row_ids[order]
+    sorted_actions = legal_actions[order]
+    if np.any((sorted_rows[1:] == sorted_rows[:-1]) & (sorted_actions[1:] == sorted_actions[:-1])):
+        raise ValueError(f"legal_actions must not contain duplicates in {path}")
+    played_is_legal = np.zeros(len(lengths), dtype=np.bool_)
+    np.logical_or.at(played_is_legal, row_ids, legal_actions == played_actions[row_ids])
+    if not np.all(played_is_legal):
+        raise ValueError(f"played_action must be one of legal_actions in {path}")
+    if not np.all(np.isfinite(outcomes)) or np.any((outcomes < -1) | (outcomes > 1)):
+        raise ValueError(f"outcomes must be finite and in [-1, 1] in {path}")
+    if bool(pc.any(pc.equal(pc.utf8_length(columns["game_id"]), 0)).as_py()):
+        raise ValueError(f"game_id must not be empty in {path}")
+    if not bool(pc.all(pc.equal(columns["split"], split)).as_py()):
+        raise ValueError(f"row split disagrees with shard metadata in {path}")
 
 
 def load_dataset_manifest(path: Path) -> DatasetManifest:
