@@ -21,7 +21,7 @@ from pink_elephant.contracts import (
     ExpertExample,
     TrainingBatch,
 )
-from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
+from pink_elephant.encoding import BOARD_SIZE, HALFMOVE_PLANE, HALFMOVE_SCALE, PLANE_COUNT
 from pink_elephant.shards import (
     MANIFEST_FILENAME,
     ProcessedRowBatch,
@@ -29,8 +29,6 @@ from pink_elephant.shards import (
     load_dataset_manifest,
 )
 
-HALFMOVE_PLANE = 18
-HALFMOVE_SCALE = 150.0
 DEFAULT_READER_BATCH_SIZE = 8_192
 DEFAULT_SHUFFLE_BUFFER_SIZE = 8_192
 PREFETCH_POLL_SECONDS = 0.05

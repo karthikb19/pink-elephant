@@ -4,11 +4,12 @@ from pathlib import Path
 
 import chess
 import torch
+from torch import nn
 
 from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game
 from pink_elephant.arena_cli import ArenaGame, ArenaSummary, _persist_evaluation, build_parser
 from pink_elephant.artifacts import RunStore
-from pink_elephant.model import ChessResNet, ResNetConfig
+from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
 from pink_elephant.model_adapter import chess_resnet_spec
 from pink_elephant.training import CHECKPOINT_FORMAT_VERSION
 
@@ -49,6 +50,28 @@ def test_checkpoint_evaluator_returns_mcts_prediction(tmp_path: Path) -> None:
 
     assert len(prediction.policy_logits) == 4_672
     assert -1 <= prediction.value <= 1
+
+
+def test_checkpoint_evaluator_normalizes_halfmove_clock_before_inference() -> None:
+    class CapturingModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inputs: torch.Tensor | None = None
+
+        def forward(self, inputs: torch.Tensor) -> ModelOutput:
+            self.inputs = inputs
+            return ModelOutput(
+                policy_logits=torch.zeros((1, 4_672)),
+                value=torch.zeros((1, 1)),
+            )
+
+    board = chess.Board("4k3/8/8/8/8/8/4K3/8 w - - 75 1")
+    model = CapturingModel()
+
+    CheckpointEvaluator(model, torch.device("cpu"))(board)
+
+    assert model.inputs is not None
+    assert model.inputs[0, 18, 0, 0].item() == 0.5
 
 
 def test_play_game_stops_at_move_limit_and_emits_pgn() -> None:
