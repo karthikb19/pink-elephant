@@ -13,7 +13,7 @@ import chess.pgn
 import torch
 from torch import Tensor, nn
 
-from pink_elephant.encoding import encode_board
+from pink_elephant.encoding import encode_model_input
 from pink_elephant.mcts import (
     MCTSConfig,
     PolicyValueEvaluator,
@@ -85,7 +85,7 @@ class CheckpointEvaluator:
         self.device = device
 
     def __call__(self, board: chess.Board) -> PolicyValuePrediction:
-        position = torch.from_numpy(encode_board(board)).to(self.device, dtype=torch.float32)
+        position = torch.from_numpy(encode_model_input(board)).to(self.device)
         with torch.inference_mode():
             output = self.model(position.unsqueeze(0))
         if not isinstance(output, ModelOutput):

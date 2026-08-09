@@ -82,6 +82,32 @@ def test_parser_selects_deepest_pv_and_skips_unusable_records(tmp_path: Path) ->
     assert stats.mate_records == 1
 
 
+def test_parser_converts_white_perspective_scores_for_black_to_move(tmp_path: Path) -> None:
+    source = tmp_path / "engine.jsonl"
+    black_to_move = chess.Board()
+    black_to_move.push_uci("e2e4")
+    _write_records(
+        source,
+        [
+            _record(fen=black_to_move.fen(), move="e7e5", cp=100),
+            {
+                "fen": "6k1/6p1/6N1/4K3/4N3/8/8/8 b - -",
+                "evals": [
+                    {
+                        "pvs": [{"mate": 23, "line": "g8f7 e5f5"}],
+                        "depth": 90,
+                    }
+                ],
+            },
+        ],
+    )
+
+    examples = list(iter_engine_value_examples(source))
+
+    assert examples[0].target == pytest.approx(-cp_to_value(100))
+    assert examples[1].target == -1.0
+
+
 def test_parser_reports_progress_for_every_source_line(tmp_path: Path) -> None:
     fen = chess.Board().fen()
     source = tmp_path / "engine.jsonl"

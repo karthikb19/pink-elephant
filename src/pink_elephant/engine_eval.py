@@ -139,7 +139,7 @@ class EngineValueStats:
 
 
 def cp_to_value(cp: int, *, scale: float = DEFAULT_CP_SCALE) -> float:
-    """Map a side-to-move centipawn score to the model's bounded value range."""
+    """Map a White-perspective centipawn score to the bounded value range."""
 
     if not isinstance(cp, int) or isinstance(cp, bool):
         raise TypeError("cp must be an integer")
@@ -149,7 +149,7 @@ def cp_to_value(cp: int, *, scale: float = DEFAULT_CP_SCALE) -> float:
 
 
 def mate_to_value(mate: int) -> float:
-    """Map a signed mate distance to a certain win or loss."""
+    """Map a White-perspective signed mate distance to a certain win or loss."""
 
     if not isinstance(mate, int) or isinstance(mate, bool):
         raise TypeError("mate must be an integer")
@@ -178,10 +178,11 @@ def iter_engine_value_examples(
             counters.records_seen += 1
             try:
                 payload = json.loads(line)
-                fen, target, depth, first_move, score_kind = _parse_engine_record(
+                fen, white_target, depth, first_move, score_kind = _parse_engine_record(
                     payload, selected_config
                 )
                 board = _board_from_fen(fen, ignore_history=selected_config.ignore_fen_history)
+                target = white_target if board.turn == chess.WHITE else -white_target
                 move = board.parse_uci(first_move)
                 legal_actions = legal_policy_indices(board)
                 played_action = move_to_policy_index(board, move)

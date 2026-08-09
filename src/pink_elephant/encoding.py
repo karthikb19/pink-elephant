@@ -11,6 +11,8 @@ from numpy.typing import NDArray
 BOARD_SIZE: Final = 8
 PLANE_COUNT: Final = 21
 ENCODER_VERSION: Final = "v2"
+HALFMOVE_PLANE: Final = 18
+HALFMOVE_SCALE: Final = 150.0
 
 
 def _tensor_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
@@ -83,4 +85,12 @@ def encode_board(board: chess.Board) -> NDArray[np.uint8]:
     _set_broadcast_plane(encoded, 18, min(board.halfmove_clock, 150))
     _set_broadcast_plane(encoded, 19, int(board.is_repetition(2)))
     _set_broadcast_plane(encoded, 20, int(board.is_repetition(3)))
+    return encoded
+
+
+def encode_model_input(board: chess.Board) -> NDArray[np.float32]:
+    """Encode a board and apply the feature normalization used in training."""
+
+    encoded = encode_board(board).astype(np.float32)
+    encoded[HALFMOVE_PLANE] /= HALFMOVE_SCALE
     return encoded
