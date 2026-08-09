@@ -92,6 +92,12 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
             "20",
             "--phase-timing-batches",
             "12",
+            "--loader-workers",
+            "1",
+            "--prefetch-batches",
+            "3",
+            "--modal-cpu",
+            "4",
         ]
     )
 
@@ -101,6 +107,30 @@ def test_modal_resume_cli_only_needs_run_id_and_target_epoch(
     assert calls[0]["resume"] is True
     assert calls[0]["epochs"] == 20
     assert calls[0]["phase_timing_batches"] == 12
+    assert calls[0]["loader_workers"] == 1
+    assert calls[0]["prefetch_batches"] == 3
+    assert calls[0]["modal_cpu"] == 4.0
+
+
+def test_local_training_rejects_modal_prefetch_workers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = main(
+        [
+            "train",
+            "--name",
+            "local",
+            "--dataset",
+            str(tmp_path),
+            "--to-epochs",
+            "1",
+            "--loader-workers",
+            "1",
+        ]
+    )
+
+    assert result == 2
+    assert "--loader-workers requires --backend modal" in capsys.readouterr().err
 
 
 def test_cli_builds_a_processed_training_config(

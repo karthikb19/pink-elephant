@@ -83,6 +83,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="synchronize and log phase timings for the first N Modal batches per epoch",
     )
+    train.add_argument(
+        "--loader-workers",
+        type=int,
+        default=0,
+        help="Modal batch producer workers; 0 disables prefetch and 1 preserves order",
+    )
+    train.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=4,
+        help="maximum prepared Modal batches buffered per active split (default: 4)",
+    )
+    train.add_argument(
+        "--modal-cpu",
+        type=float,
+        help="physical CPU cores requested for the Modal trainer (default: 2)",
+    )
     _add_runs_root(train)
     train.set_defaults(handler=_train)
 
@@ -165,7 +182,7 @@ def _train(args: argparse.Namespace) -> int:
             raise ValueError("new Modal training requires --name and --dataset")
         if args.resume is not None and args.from_checkpoint is not None:
             raise ValueError("--from-checkpoint cannot be combined with --resume")
-        from pink_elephant.modal_training import MODAL_GPU, launch_modal_training
+        from pink_elephant.modal_training import MODAL_CPU, MODAL_GPU, launch_modal_training
 
         result = launch_modal_training(
             dataset_dir=args.dataset,
@@ -185,6 +202,9 @@ def _train(args: argparse.Namespace) -> int:
             gpu=args.gpu or MODAL_GPU,
             resume=args.resume is not None,
             phase_timing_batches=args.phase_timing_batches,
+            loader_workers=args.loader_workers,
+            prefetch_batches=args.prefetch_batches,
+            modal_cpu=MODAL_CPU if args.modal_cpu is None else args.modal_cpu,
         )
         print(json.dumps(asdict(result), indent=2))
         return 0
@@ -192,6 +212,10 @@ def _train(args: argparse.Namespace) -> int:
         raise ValueError("--gpu requires --backend modal")
     if args.phase_timing_batches:
         raise ValueError("--phase-timing-batches requires --backend modal")
+    if args.loader_workers:
+        raise ValueError("--loader-workers requires --backend modal")
+    if args.modal_cpu is not None:
+        raise ValueError("--modal-cpu requires --backend modal")
     if args.resume is not None and args.from_checkpoint is not None:
         raise ValueError("--from-checkpoint cannot be combined with --resume")
     if args.from_run is not None and args.from_checkpoint is not None:

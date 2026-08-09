@@ -27,6 +27,7 @@ from pink_elephant.training import (
 )
 
 MODAL_GPU: Final[str] = "L4"
+MODAL_CPU: Final[float] = 2.0
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 DATASET_VOLUME_ROOT: Final[str] = "datasets"
@@ -46,6 +47,8 @@ MODAL_RESIDUAL_BLOCKS: Final[int] = 12
 MODAL_POLICY_CHANNELS: Final[int] = 2
 MODAL_VALUE_HIDDEN_CHANNELS: Final[int] = 256
 MODAL_FUNCTION_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
+MODAL_LOADER_WORKERS: Final[int] = 0
+MODAL_PREFETCH_BATCHES: Final[int] = 4
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -252,6 +255,9 @@ def launch_modal_training(
     gpu: str = MODAL_GPU,
     resume: bool = False,
     phase_timing_batches: int = 0,
+    loader_workers: int = MODAL_LOADER_WORKERS,
+    prefetch_batches: int = MODAL_PREFETCH_BATCHES,
+    modal_cpu: float = MODAL_CPU,
 ) -> ModalTrainingResult:
     """Upload when needed and dispatch the same run/resume request to Modal."""
 
@@ -275,10 +281,16 @@ def launch_modal_training(
         resume_checkpoint = None
     if not gpu.strip():
         raise ValueError("gpu must not be empty")
+    _validate_prefetch_arguments(
+        loader_workers=loader_workers,
+        prefetch_batches=prefetch_batches,
+    )
+    if modal_cpu <= 0:
+        raise ValueError("modal_cpu must be positive")
     with app.run():
         dispatch = train_l4
         if hasattr(dispatch, "with_options"):
-            dispatch = dispatch.with_options(gpu=gpu)
+            dispatch = dispatch.with_options(gpu=gpu, cpu=modal_cpu)
         return dispatch.spawn(
             selected_dataset_name,
             selected_run_name,
@@ -297,11 +309,15 @@ def launch_modal_training(
             resume_checkpoint=resume_checkpoint,
             git_revision=_git_revision(),
             phase_timing_batches=phase_timing_batches,
+            loader_workers=loader_workers,
+            prefetch_batches=prefetch_batches,
+            cpu_request=modal_cpu,
         ).get()
 
 
 @app.function(
     gpu=MODAL_GPU,
+    cpu=MODAL_CPU,
     volumes={MODAL_VOLUME_MOUNT: training_volume},
     timeout=MODAL_FUNCTION_TIMEOUT_SECONDS,
     retries=0,
@@ -325,6 +341,9 @@ def train_l4(
     resume_checkpoint: str | None = None,
     git_revision: str | None = None,
     phase_timing_batches: int = 0,
+    loader_workers: int = MODAL_LOADER_WORKERS,
+    prefetch_batches: int = MODAL_PREFETCH_BATCHES,
+    cpu_request: float = MODAL_CPU,
 ) -> ModalTrainingResult:
     """Train one versioned dataset on a single Modal L4 GPU."""
 
@@ -358,7 +377,11 @@ def train_l4(
         policy_channels=policy_channels,
         value_hidden_channels=value_hidden_channels,
         phase_timing_batches=phase_timing_batches,
+        loader_workers=loader_workers,
+        prefetch_batches=prefetch_batches,
     )
+    if cpu_request <= 0:
+        raise ValueError("cpu_request must be positive")
     dataset_path = _mounted_volume_path(DATASET_VOLUME_ROOT, dataset_name)
     manifest_path = dataset_path / MANIFEST_FILENAME
     if not manifest_path.is_file():
@@ -460,6 +483,9 @@ def train_l4(
         resume_checkpoint=resume_checkpoint,
         run_name=run_name,
         phase_timing_batches=phase_timing_batches,
+        loader_workers=loader_workers,
+        prefetch_batches=prefetch_batches,
+        cpu_request=cpu_request,
         start_epoch=trainer.epoch,
         train_batches=_total_batches(expected_train_examples, batch_size),
         train_examples=expected_train_examples,
@@ -475,28 +501,38 @@ def train_l4(
             step=trainer.step,
             total_epochs=epochs,
         )
-        train_batches = train_loader.iter_batches(epoch=trainer.epoch)
-        validation_batches = validation_loader
+        queue_depth = prefetch_batches if loader_workers else 0
+        train_batches = train_loader.iter_batches(
+            epoch=trainer.epoch,
+            prefetch_batches=queue_depth,
+        )
         phase_timing_logger = _PhaseTimingLogger(target_epoch, phase_timing_batches)
-        training = trainer.train_epoch(
-            _log_batch_progress(
-                train_batches,
-                phase="train",
-                epoch=target_epoch,
-                total_batches=_total_batches(expected_train_examples, batch_size),
-            ),
-            phase_timing_batches=phase_timing_batches,
-            phase_timing_observer=phase_timing_logger if phase_timing_batches else None,
-        )
-        phase_timing_logger.log_summary()
-        validation = trainer.validate(
-            _log_batch_progress(
-                validation_batches,
-                phase="validation",
-                epoch=target_epoch,
-                total_batches=_total_batches(expected_validation_examples, batch_size),
+        try:
+            training = trainer.train_epoch(
+                _log_batch_progress(
+                    train_batches,
+                    phase="train",
+                    epoch=target_epoch,
+                    total_batches=_total_batches(expected_train_examples, batch_size),
+                ),
+                phase_timing_batches=phase_timing_batches,
+                phase_timing_observer=phase_timing_logger if phase_timing_batches else None,
             )
-        )
+        finally:
+            _close_iterator(train_batches)
+        phase_timing_logger.log_summary()
+        validation_batches = validation_loader.iter_batches(prefetch_batches=queue_depth)
+        try:
+            validation = trainer.validate(
+                _log_batch_progress(
+                    validation_batches,
+                    phase="validation",
+                    epoch=target_epoch,
+                    total_batches=_total_batches(expected_validation_examples, batch_size),
+                )
+            )
+        finally:
+            _close_iterator(validation_batches)
         checkpoint: str | None = None
         if target_epoch % checkpoint_interval == 0 or target_epoch == epochs:
             checkpoint_path = checkpoint_store.path_for(target_epoch, trainer.step)
@@ -576,6 +612,9 @@ def main(
     channels: int = MODAL_CHANNELS,
     residual_blocks: int = MODAL_RESIDUAL_BLOCKS,
     resume_checkpoint: str | None = None,
+    loader_workers: int = MODAL_LOADER_WORKERS,
+    prefetch_batches: int = MODAL_PREFETCH_BATCHES,
+    modal_cpu: float = MODAL_CPU,
 ) -> None:
     """Upload data, launch L4 training, and download metrics."""
 
@@ -602,18 +641,28 @@ def main(
         run_name=selected_run_name,
         channels=channels,
         residual_blocks=residual_blocks,
+        loader_workers=loader_workers,
+        prefetch_batches=prefetch_batches,
+        cpu_request=modal_cpu,
     )
-    result = train_l4.spawn(
-        dataset_name,
-        selected_run_name,
-        epochs=epochs,
-        batch_size=batch_size,
-        checkpoint_interval=checkpoint_interval,
-        channels=channels,
-        residual_blocks=residual_blocks,
-        resume_checkpoint=resume_checkpoint,
-        git_revision=_git_revision(),
-    ).get()
+    result = (
+        train_l4.with_options(cpu=modal_cpu)
+        .spawn(
+            dataset_name,
+            selected_run_name,
+            epochs=epochs,
+            batch_size=batch_size,
+            checkpoint_interval=checkpoint_interval,
+            channels=channels,
+            residual_blocks=residual_blocks,
+            resume_checkpoint=resume_checkpoint,
+            git_revision=_git_revision(),
+            loader_workers=loader_workers,
+            prefetch_batches=prefetch_batches,
+            cpu_request=modal_cpu,
+        )
+        .get()
+    )
     _log_event("training_call_returned", run_name=selected_run_name)
     local_run_dir = Path(output_dir) / selected_run_name
     metrics_path = download_run_metrics(
@@ -666,6 +715,14 @@ def _log_batch_progress(
 
 def _total_batches(example_count: int, batch_size: int) -> int:
     return (example_count + batch_size - 1) // batch_size
+
+
+def _close_iterator(batches: Iterator[TrainingBatch]) -> None:
+    """Close a prefetching iterator without coupling callers to its type."""
+
+    close = getattr(batches, "close", None)
+    if close is not None:
+        close()
 
 
 def _download_run_file(
@@ -734,6 +791,8 @@ def _validate_training_arguments(
     policy_channels: int,
     value_hidden_channels: int,
     phase_timing_batches: int,
+    loader_workers: int,
+    prefetch_batches: int,
 ) -> None:
     if epochs < 1:
         raise ValueError("epochs must be positive")
@@ -743,6 +802,10 @@ def _validate_training_arguments(
         raise ValueError("checkpoint_interval must be positive")
     if phase_timing_batches < 0:
         raise ValueError("phase_timing_batches must be non-negative")
+    _validate_prefetch_arguments(
+        loader_workers=loader_workers,
+        prefetch_batches=prefetch_batches,
+    )
     if learning_rate <= 0:
         raise ValueError("learning_rate must be positive")
     if weight_decay < 0:
@@ -757,6 +820,15 @@ def _validate_training_arguments(
     ):
         if value < 1:
             raise ValueError(f"{name} must be positive")
+
+
+def _validate_prefetch_arguments(*, loader_workers: int, prefetch_batches: int) -> None:
+    """Validate the deterministic producer count and bounded queue depth."""
+
+    if loader_workers not in (0, 1):
+        raise ValueError("loader_workers must be 0 or 1")
+    if prefetch_batches < 1:
+        raise ValueError("prefetch_batches must be positive")
 
 
 def _prepare_run(

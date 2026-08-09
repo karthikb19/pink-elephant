@@ -145,6 +145,25 @@ the remote `run.json` restores the dataset and model/trainer parameters:
 ./pe train --backend modal --resume <run-id> --to-epochs 20
 ```
 
+CPU batch preparation can run ahead of GPU training through one deterministic
+producer and a bounded queue. These are invocation-time performance settings,
+so they can be changed when resuming without changing checkpoint semantics:
+
+```sh
+./pe train \
+  --backend modal \
+  --resume <run-id> \
+  --to-epochs 20 \
+  --loader-workers 1 \
+  --prefetch-batches 4 \
+  --phase-timing-batches 20
+```
+
+Four queued batches use about 39 MiB of host memory at batch size 1024; allow
+about 49 MiB including the producer's in-flight batch. Modal training requests
+two physical CPU cores by default; override that guarantee with `--modal-cpu`
+when benchmarking. Disable prefetch with `--loader-workers 0`.
+
 The original `modal run` entrypoint and its explicit legacy checkpoint resume
 path remain supported.
 
