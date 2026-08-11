@@ -40,6 +40,16 @@ class TinyPolicyValueModel(nn.Module):
         )
 
 
+class AutocastRecordingModel(TinyPolicyValueModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.autocast_enabled: list[bool] = []
+
+    def forward(self, inputs: Tensor) -> ModelOutput:
+        self.autocast_enabled.append(torch.is_autocast_enabled(inputs.device.type))
+        return super().forward(inputs)
+
+
 TINY_MODEL_SPEC = ModelSpec.from_parameters("test-tiny/v1", {})
 
 
@@ -221,6 +231,16 @@ def test_trainer_updates_parameters_and_tracks_progress() -> None:
     assert trainer.step == 1
     assert not torch.equal(model.policy_bias.detach(), before_policy)
     assert not torch.equal(model.value_bias.detach(), before_value)
+
+
+def test_trainer_uses_bf16_autocast_for_training_and_validation() -> None:
+    model = AutocastRecordingModel()
+    trainer = Trainer(model, TrainerConfig(weight_decay=0.0, bf16_autocast=True))
+
+    trainer.train_epoch([_batch()])
+    trainer.validate([_batch()])
+
+    assert model.autocast_enabled == [True, True]
 
 
 def test_trainer_reports_phase_timings_for_requested_batches() -> None:

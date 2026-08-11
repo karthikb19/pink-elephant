@@ -41,6 +41,7 @@ class _ConfigPayload(TypedDict):
     device: str
     seed: int | None
     grad_clip_norm: float | None
+    bf16_autocast: NotRequired[bool]
 
 
 class _SchemaPayload(TypedDict):
@@ -87,6 +88,7 @@ class TrainerConfig:
     device: str = "cpu"
     seed: int | None = None
     grad_clip_norm: float | None = None
+    bf16_autocast: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -119,6 +121,7 @@ class TrainerConfig:
             "device": self.device,
             "seed": self.seed,
             "grad_clip_norm": self.grad_clip_norm,
+            "bf16_autocast": self.bf16_autocast,
         }
 
     @classmethod
@@ -132,6 +135,7 @@ class TrainerConfig:
             device=payload["device"],
             seed=payload["seed"],
             grad_clip_norm=payload["grad_clip_norm"],
+            bf16_autocast=payload.get("bf16_autocast", False),
         )
 
 
@@ -440,9 +444,10 @@ class Trainer:
             if measure_phases:
                 self._synchronize_device()
                 phase_started = time.perf_counter()
-            losses = compute_joint_loss(
-                self._model_output(batch), batch, value_weight=self.config.value_weight
-            )
+            with self._autocast_context():
+                losses = compute_joint_loss(
+                    self._model_output(batch), batch, value_weight=self.config.value_weight
+                )
             if measure_phases:
                 self._synchronize_device()
                 forward_seconds = time.perf_counter() - phase_started
@@ -500,9 +505,10 @@ class Trainer:
             with torch.no_grad():
                 for source_batch in batches:
                     batch = self._on_device(source_batch)
-                    batch_metrics.append(
-                        _compute_validation_metric_tensors(self._model_output(batch), batch)
-                    )
+                    with self._autocast_context():
+                        batch_metrics.append(
+                            _compute_validation_metric_tensors(self._model_output(batch), batch)
+                        )
         finally:
             self.model.train(was_training)
         metrics = _aggregate_validation_metric_tensors(batch_metrics)
@@ -668,6 +674,13 @@ class Trainer:
         if not isinstance(output, ModelOutput):
             raise TypeError("model must return pink_elephant.model.ModelOutput")
         return output
+
+    def _autocast_context(self) -> torch.amp.autocast_mode.autocast:
+        return torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.config.bf16_autocast,
+        )
 
     def _on_device(self, batch: TrainingBatch) -> TrainingBatch:
         if batch.positions.device == self.device:
