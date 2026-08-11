@@ -209,6 +209,9 @@ data/
 /*.jsonl
 /*.pt
 
+# Local Codex agent skills and bundled references
+.agents/
+
 # Ruff stuff:
 .ruff_cache/
 
