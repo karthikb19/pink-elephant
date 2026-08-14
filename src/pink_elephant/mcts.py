@@ -10,7 +10,7 @@ the parent.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -56,6 +56,27 @@ class PolicyValueEvaluator(Protocol):
         """Return policy logits and value for ``board``."""
 
 
+@dataclass(frozen=True, slots=True)
+class BatchEvaluationRequest:
+    """One explicitly identified leaf request in a game-level batch."""
+
+    request_id: str
+    board: chess.Board
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            raise ValueError("batch evaluation request_id must not be empty")
+
+
+class BatchedPolicyValueEvaluator(Protocol):
+    """Evaluate independently selected leaves in one model forward pass."""
+
+    def __call__(
+        self, requests: Sequence[BatchEvaluationRequest]
+    ) -> Mapping[str, PolicyValuePrediction]:
+        """Return exactly one prediction for every request ID."""
+
+
 @dataclass(slots=True)
 class MCTSNode:
     """A chess position and the statistics accumulated by tree search.
@@ -87,16 +108,75 @@ def run_mcts(
     root_board: chess.Board,
     evaluator: PolicyValueEvaluator,
     config: MCTSConfig | None = None,
+    root_prior_modifier: Callable[[MCTSNode], None] | None = None,
 ) -> MCTSNode:
     """Build and return a search tree rooted at a copy of ``root_board``."""
 
     search_config = config or MCTSConfig()
     root_node = MCTSNode(board=root_board.copy(stack=True))
 
-    for _ in range(search_config.num_simulations):
+    for simulation_index in range(search_config.num_simulations):
         _run_simulation(root_node, evaluator, search_config.exploration_constant)
+        if simulation_index == 0 and root_prior_modifier is not None and root_node.expanded:
+            root_prior_modifier(root_node)
 
     return root_node
+
+
+def run_mcts_batch(
+    root_boards: Sequence[chess.Board],
+    evaluator: BatchedPolicyValueEvaluator,
+    config: MCTSConfig | None = None,
+    root_prior_modifiers: Sequence[Callable[[MCTSNode], None] | None] | None = None,
+) -> tuple[MCTSNode, ...]:
+    """Run equal-budget searches for independent boards with batched leaves.
+
+    A search wave selects at most one leaf from each tree, evaluates all
+    non-terminal leaves together, and backs up each prediction in its own
+    tree. Request IDs are validated so result routing never relies on the
+    evaluator preserving incidental container ordering.
+    """
+
+    search_config = config or MCTSConfig()
+    if root_prior_modifiers is not None and len(root_prior_modifiers) != len(root_boards):
+        raise ValueError("root_prior_modifiers must match root_boards")
+    root_nodes = tuple(MCTSNode(board=board.copy(stack=True)) for board in root_boards)
+    modifiers = root_prior_modifiers or (None,) * len(root_nodes)
+
+    for simulation_index in range(search_config.num_simulations):
+        requests: list[BatchEvaluationRequest] = []
+        pending: list[tuple[list[MCTSNode], MCTSNode, str]] = []
+        for tree_index, root_node in enumerate(root_nodes):
+            selected_path, leaf_node = _select_leaf(root_node, search_config.exploration_constant)
+            if leaf_node.board.is_game_over(claim_draw=True):
+                _backup_value(selected_path, _terminal_value(leaf_node.board))
+                continue
+            request_id = f"tree-{tree_index:04d}-simulation-{simulation_index:04d}"
+            requests.append(
+                BatchEvaluationRequest(
+                    request_id=request_id, board=leaf_node.board.copy(stack=True)
+                )
+            )
+            pending.append((selected_path, leaf_node, request_id))
+
+        if requests:
+            predictions = evaluator(tuple(requests))
+            expected_ids = {request.request_id for request in requests}
+            if set(predictions) != expected_ids:
+                raise ValueError(
+                    "batched evaluator must return exactly the requested IDs; "
+                    f"expected={sorted(expected_ids)}, got={sorted(predictions)}"
+                )
+            for selected_path, leaf_node, request_id in pending:
+                leaf_value = _expand_with_prediction(leaf_node, predictions[request_id])
+                _backup_value(selected_path, leaf_value)
+
+        if simulation_index == 0:
+            for root_node, modifier in zip(root_nodes, modifiers, strict=True):
+                if modifier is not None and root_node.expanded:
+                    modifier(root_node)
+
+    return root_nodes
 
 
 def puct_score(
@@ -187,12 +267,7 @@ def _run_simulation(
 ) -> None:
     """Run selection, expansion or terminal evaluation, and backup once."""
 
-    selected_path = [root_node]
-    leaf_node = root_node
-
-    while leaf_node.expanded and not leaf_node.board.is_game_over(claim_draw=True):
-        leaf_node = select_child_with_puct(leaf_node, exploration_constant)
-        selected_path.append(leaf_node)
+    selected_path, leaf_node = _select_leaf(root_node, exploration_constant)
 
     if leaf_node.board.is_game_over(claim_draw=True):
         leaf_value = _terminal_value(leaf_node.board)
@@ -200,6 +275,19 @@ def _run_simulation(
         leaf_value = _expand_and_evaluate(leaf_node, evaluator)
 
     _backup_value(selected_path, leaf_value)
+
+
+def _select_leaf(
+    root_node: MCTSNode, exploration_constant: float
+) -> tuple[list[MCTSNode], MCTSNode]:
+    """Select one leaf and retain the path needed for independent backup."""
+
+    selected_path = [root_node]
+    leaf_node = root_node
+    while leaf_node.expanded and not leaf_node.board.is_game_over(claim_draw=True):
+        leaf_node = select_child_with_puct(leaf_node, exploration_constant)
+        selected_path.append(leaf_node)
+    return selected_path, leaf_node
 
 
 def _expand_and_evaluate(node: MCTSNode, evaluator: PolicyValueEvaluator) -> float:
@@ -210,7 +298,16 @@ def _expand_and_evaluate(node: MCTSNode, evaluator: PolicyValueEvaluator) -> flo
     if node.board.is_game_over(claim_draw=True):
         raise ValueError("terminal nodes must be evaluated with the exact game outcome")
 
-    prediction = evaluator(node.board.copy(stack=True))
+    return _expand_with_prediction(node, evaluator(node.board.copy(stack=True)))
+
+
+def _expand_with_prediction(node: MCTSNode, prediction: PolicyValuePrediction) -> float:
+    """Expand a leaf from a prediction that was already batched."""
+
+    if node.expanded:
+        raise ValueError("cannot expand an already expanded node")
+    if node.board.is_game_over(claim_draw=True):
+        raise ValueError("terminal nodes must be evaluated with the exact game outcome")
     policy_logits = _validated_policy_logits(prediction.policy_logits)
     value_prediction = _validated_value(prediction.value)
     child_priors = _masked_softmax_prior_probabilities(node.board, policy_logits)
