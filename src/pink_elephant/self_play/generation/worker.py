@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import Counter
 from collections.abc import Mapping
@@ -40,11 +41,14 @@ from pink_elephant.self_play.generation.game import (
     make_root_dirichlet_modifier,
     select_action_from_root,
 )
+from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.shards import (
     ReplayShardBuilder,
     sha256_file,
     write_games_table,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
@@ -89,6 +93,16 @@ def load_generation_evaluator(checkpoint_path: Path, worker: WorkerSpec) -> Mode
     loaded = load_checkpoint_model(checkpoint_path, device="cpu")
     if loaded.model_spec != worker.generation.model_spec:
         raise ValueError("checkpoint model specification does not match the generation contract")
+    log_event(
+        logger,
+        "checkpoint_validated",
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "generation_id": worker.generation.generation_id,
+            "round_id": worker.round.round_id,
+            "worker_id": worker.worker_id,
+        },
+    )
     return ModelBatchEvaluator(loaded.model, device="cpu")
 
 
@@ -111,7 +125,20 @@ def run_worker(
 ) -> WorkerResult:
     """Generate complete games, publish validated shards, then write the result last."""
 
+    configure_logging()
     started = time.perf_counter()
+    log_event(
+        logger,
+        "worker_started",
+        {
+            "active_games": worker.round.active_games_per_worker,
+            "generation_id": worker.generation.generation_id,
+            "invocation_id": worker.invocation_id,
+            "position_lower_bound": worker.position_lower_bound,
+            "round_id": worker.round.round_id,
+            "worker_id": worker.worker_id,
+        },
+    )
     invocation_root = _invocation_root(output_root, worker)
     if invocation_root.exists() and any(invocation_root.iterdir()):
         raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
@@ -124,6 +151,8 @@ def run_worker(
     termination_counts: Counter[str] = Counter()
     failed_game_count = 0
     completed_position_count = 0
+    progress_interval = max(1, min(100, worker.position_lower_bound // 10))
+    next_progress_log = progress_interval
     attempts = 0
     active: list[_ActiveGame] = []
     mcts_config = MCTSConfig(
@@ -170,6 +199,18 @@ def run_worker(
             else:
                 searchable.append(game)
         failed_game_count += len(truncated)
+        if truncated:
+            log_event(
+                logger,
+                "worker_games_truncated",
+                {
+                    "attempts": attempts,
+                    "count": len(truncated),
+                    "failed_game_count": failed_game_count,
+                    "round_id": worker.round.round_id,
+                    "worker_id": worker.worker_id,
+                },
+            )
         active = searchable
         if not active:
             start_games_if_needed()
@@ -240,6 +281,22 @@ def run_worker(
             completed_games.append(completed.record)
             completed_position_count += len(completed.rows)
             termination_counts[completed.record.termination] += 1
+            if completed_position_count >= next_progress_log:
+                log_event(
+                    logger,
+                    "worker_progress",
+                    {
+                        "attempts": attempts,
+                        "completed_game_count": len(completed_games),
+                        "failed_game_count": failed_game_count,
+                        "position_count": completed_position_count,
+                        "position_lower_bound": worker.position_lower_bound,
+                        "round_id": worker.round.round_id,
+                        "worker_id": worker.worker_id,
+                    },
+                )
+                while next_progress_log <= completed_position_count:
+                    next_progress_log += progress_interval
         start_games_if_needed()
 
     if completed_position_count < worker.position_lower_bound or not completed_games:
@@ -275,6 +332,19 @@ def run_worker(
     )
     result_path.write_text(
         json.dumps(result.to_payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    log_event(
+        logger,
+        "worker_completed",
+        {
+            "completed_game_count": result.completed_game_count,
+            "elapsed_seconds": result.elapsed_seconds,
+            "failed_game_count": result.failed_game_count,
+            "position_count": result.position_count,
+            "result_path": result.result_path,
+            "round_id": result.round_id,
+            "worker_id": result.worker_id,
+        },
     )
     return result
 

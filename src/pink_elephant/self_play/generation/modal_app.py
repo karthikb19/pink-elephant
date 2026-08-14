@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -22,8 +23,11 @@ from pink_elephant.self_play.generation.manifests import (
     latest_snapshot,
     seal_round,
 )
+from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.shards import sha256_file
 from pink_elephant.self_play.generation.worker import load_generation_evaluator, run_worker
+
+logger = logging.getLogger(__name__)
 
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
@@ -53,11 +57,32 @@ self_play_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=T
 def generate_worker_modal(worker: WorkerSpec) -> WorkerResult:
     """Generate one independently retryable worker invocation on CPU."""
 
+    configure_logging()
+    log_event(
+        logger,
+        "modal_worker_started",
+        {
+            "generation_id": worker.generation.generation_id,
+            "position_lower_bound": worker.position_lower_bound,
+            "round_id": worker.round.round_id,
+            "worker_id": worker.worker_id,
+        },
+    )
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     checkpoint_path = _mounted_checkpoint_path(worker.generation.checkpoint_volume_path)
     evaluator = load_generation_evaluator(checkpoint_path, worker)
     result = run_worker(worker, evaluator, output_root)
     self_play_volume.commit()
+    log_event(
+        logger,
+        "modal_worker_committed",
+        {
+            "position_count": result.position_count,
+            "result_path": result.result_path,
+            "round_id": result.round_id,
+            "worker_id": result.worker_id,
+        },
+    )
     return result
 
 
@@ -83,11 +108,21 @@ def plan_generation_round(
 ) -> ModalRoundPlan:
     """Read the latest Volume snapshot and allocate stable worker inputs."""
 
+    configure_logging()
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
+    log_event(
+        logger,
+        "modal_round_planning_started",
+        {
+            "generation_id": generation.generation_id,
+            "requested_position_milestone": round_spec.requested_cumulative_positions,
+            "round_id": round_spec.round_id,
+        },
+    )
     ensure_generation_manifest(output_root, generation)
     previous = latest_snapshot(output_root, generation.generation_id)
     previous_actual = 0 if previous is None else previous.actual_position_count
-    return ModalRoundPlan(
+    plan = ModalRoundPlan(
         workers=plan_worker_specs(
             generation,
             round_spec,
@@ -96,6 +131,17 @@ def plan_generation_round(
         ),
         previous_snapshot=previous,
     )
+    log_event(
+        logger,
+        "modal_round_planned",
+        {
+            "generation_id": generation.generation_id,
+            "previous_actual_position_count": previous_actual,
+            "round_id": round_spec.round_id,
+            "worker_count": len(plan.workers),
+        },
+    )
+    return plan
 
 
 @app.function(
@@ -113,16 +159,45 @@ def seal_generation_round(
 ) -> RoundCompletion:
     """Validate committed worker artifacts and seal the cumulative snapshot."""
 
+    configure_logging()
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
+    log_event(
+        logger,
+        "modal_round_sealing_started",
+        {
+            "generation_id": generation.generation_id,
+            "round_id": round_spec.round_id,
+            "worker_result_count": len(worker_results),
+        },
+    )
     if not worker_results:
         if previous_snapshot is None:
             raise RuntimeError("round was already satisfied without an existing snapshot")
         completion = _already_satisfied_completion(output_root, round_spec, previous_snapshot)
         print(json.dumps(completion.to_payload(), sort_keys=True), flush=True)
+        log_event(
+            logger,
+            "modal_round_already_satisfied",
+            {
+                "actual_position_count": completion.actual_position_count,
+                "generation_id": completion.generation_id,
+                "round_id": completion.round_id,
+            },
+        )
         return completion
     sealed = seal_round(output_root, generation, round_spec, previous_snapshot, worker_results)
     self_play_volume.commit()
     print(json.dumps(sealed.completion.to_payload(), sort_keys=True), flush=True)
+    log_event(
+        logger,
+        "modal_round_completed",
+        {
+            "actual_position_count": sealed.completion.actual_position_count,
+            "generation_id": sealed.completion.generation_id,
+            "round_id": sealed.completion.round_id,
+            "snapshot_path": sealed.completion.snapshot_path,
+        },
+    )
     return sealed.completion
 
 
@@ -134,15 +209,35 @@ def launch_modal_generation_round(
 ) -> RoundCompletion:
     """Submit one coordinated CPU round and wait for its durable completion."""
 
+    configure_logging()
+    log_event(
+        logger,
+        "modal_round_submitted",
+        {
+            "generation_id": generation.generation_id,
+            "requested_position_milestone": round_spec.requested_cumulative_positions,
+            "round_id": round_spec.round_id,
+        },
+    )
     with app.run():
         plan = plan_generation_round.remote(generation, round_spec, invocation_id)
         results = tuple(generate_worker_modal.map(plan.workers))
-        return seal_generation_round.remote(
+        completion = seal_generation_round.remote(
             generation,
             round_spec,
             plan.previous_snapshot,
             results,
         )
+    log_event(
+        logger,
+        "modal_round_finished",
+        {
+            "actual_position_count": completion.actual_position_count,
+            "generation_id": completion.generation_id,
+            "round_id": completion.round_id,
+        },
+    )
+    return completion
 
 
 def _already_satisfied_completion(

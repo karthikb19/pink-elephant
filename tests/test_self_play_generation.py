@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -265,6 +266,28 @@ def test_worker_writes_validated_game_and_replay_artifacts(tmp_path: Path) -> No
     assert validated_games.size_bytes == result.games.size_bytes
     assert validated_shard.sha256 == result.shards[0].sha256
     assert validated_shard.size_bytes == result.shards[0].size_bytes
+
+
+def test_worker_emits_structured_progress_events(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pink_elephant.self_play")
+    generation = _smoke_generation()
+    worker = _smoke_worker(generation, _smoke_round(generation, "worker-logging"))
+
+    _run_fools_mate_worker(tmp_path, worker)
+
+    events = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "pink_elephant.self_play.generation.worker"
+    ]
+    event_names = [event["event"] for event in events]
+    progress_events = [event for event in events if event["event"] == "worker_progress"]
+
+    assert event_names[0] == "worker_started"
+    assert progress_events[-1]["position_count"] == 4
+    assert event_names[-1] == "worker_completed"
 
 
 def test_worker_retries_truncated_games_and_records_failure_count(tmp_path: Path) -> None:
