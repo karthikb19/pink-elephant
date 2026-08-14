@@ -7,8 +7,7 @@
 
 This specification covers only Initiative A: producing immutable MCTS self-play
 data from one fixed model checkpoint. Candidate training, replay-window mixing,
-arena evaluation, and promotion belong to Initiative B and are deliberately out
-of scope.
+arena evaluation, and promotion are deliberately out of scope.
 
 The two initiatives share versioned artifact contracts:
 
@@ -20,9 +19,9 @@ Initiative B: model improvement
 sealed snapshot manifest -> training -> candidate -> evaluation -> promotion
 ```
 
-This separation lets both initiatives be implemented independently. Initiative
-A never invokes training. Initiative B never scans partially written worker
-directories or generates games.
+This separation lets generation be implemented independently. Initiative A
+never invokes training. Its public output is one sealed snapshot manifest; this
+specification does not design how a future consumer trains from it.
 
 ## Preserve the existing package
 
@@ -50,8 +49,8 @@ src/pink_elephant/self_play/
         # Initiative B; not implemented as part of Generation 1
 ```
 
-- `self_play.contracts` owns the narrow, versioned handoff between generation
-  and learning.
+- `self_play.contracts` owns the narrow, versioned public replay and snapshot
+  formats produced by generation.
 - `self_play.generation` owns all Initiative A behavior.
 - `self_play.learning` is the future Initiative B boundary, not a reason to put
   training behavior into generation code now.
@@ -64,14 +63,17 @@ search, but existing scalar search behavior must not change.
 
 ## Generation 1 source model
 
-Generation 1 uses this immutable local checkpoint as its source:
+Generation 1 uses the latest checkpoint in this authoritative Modal Volume path:
 
 ```text
-data/checkpoints/20260810T041411Z-lichess-eval-v2-25m-from-10m-epoch10/
-20260810T041411Z-lichess-eval-v2-25m-from-10m-epoch10-epoch-000005-step-000092335.pt
+volume: pink-elephant-training
+path: runs/20260810T041411Z-lichess-eval-v2-25m-from-10m-epoch10/checkpoints/
+      20260810T041411Z-lichess-eval-v2-25m-from-10m-epoch10-epoch-000006-step-000110802.pt
+sha256: 9e1f7bb15cc042357e1e4a0afea18c89f01e25aada7497be83c91f29f62a0229
 ```
 
-The checkpoint is `chess-resnet/v1`, epoch 5, step 92,335, with:
+The checkpoint was verified directly from the Volume on 2026-08-13. It is
+`chess-resnet/v1`, epoch 6, step 110,802, with:
 
 ```text
 channels: 192
@@ -82,9 +84,8 @@ model state entries: 8,638,301
 floating checkpoint dtype: float32
 ```
 
-Upload the checkpoint once to an immutable content-addressed path on the Modal
-Volume. The generation specification records its SHA-256 digest, not a mutable
-`latest` name. Every worker validates that digest before loading it.
+The generation specification records this exact path and SHA-256 digest, not a
+mutable `latest` name. Every worker validates that digest before loading it.
 
 Generation 1 uses CPU inference. Modal self-play Functions do not request a
 GPU. Load the FP32 checkpoint on CPU, put the model in evaluation mode, and use
@@ -102,7 +103,9 @@ Examples:
 round 1: extend Generation 1 to at least 10,000 positions
 round 2: extend Generation 1 to at least 50,000 cumulative positions
 round 3: extend Generation 1 to at least 100,000 cumulative positions
-round 4: optionally extend it farther
+round 4: extend Generation 1 to at least 200,000 cumulative positions
+round 5: extend Generation 1 to at least 500,000 cumulative positions
+later rounds: optionally extend it farther
 ```
 
 Changing the source checkpoint starts Generation 2. Changing a semantic search
@@ -155,8 +158,8 @@ position snapshot onward. All settings are explicit in manifests; defaults
 never reinterpret an existing artifact.
 
 The downstream training batch size is 1,024, but it does not belong in either
-generation specification. Training batch size is an Initiative B setting. The
-Generation 1 replay schema is independent of how a consumer batches rows.
+generation specification. The Generation 1 replay schema is independent of how
+a future consumer batches rows.
 
 ## Worker fan-out
 
@@ -167,9 +170,16 @@ permanent platform limit.
 The coordinator computes the additional positions needed:
 
 ```text
-additional = requested cumulative milestone - already sealed positions
+additional = max(0, requested cumulative milestone - actual sealed positions)
 per-worker lower bound = ceil(additional / worker count)
 ```
+
+Each round generates only the missing positions. For example, if round 1 asks
+for 10,000 positions and finishes complete games at an actual count of 10,384,
+then round 2's 50,000-position milestone requests 39,616 additional positions,
+not another 50,000. If an existing snapshot already satisfies the requested
+milestone, the coordinator dispatches no workers and reports it as already
+satisfied.
 
 Each worker receives a stable worker ID, seed range, round ID, and position
 lower bound. A worker:
@@ -181,7 +191,7 @@ lower bound. A worker:
 5. stops starting replacement games after reaching its position lower bound;
 6. drains every active game to a rules-defined terminal result;
 7. assigns outcome `z` to every recorded position;
-8. writes immutable replay shards under its unique worker/attempt path;
+8. writes immutable replay shards under its unique worker invocation path;
 9. validates the shards and writes `worker-result.json` last.
 
 Games are never cut off merely because the worker reached its quota. A game
@@ -216,6 +226,12 @@ The model already accepts a batch dimension. This amortizes Python and PyTorch
 overhead and may improve CPU vectorization. It does not reuse an evaluation for
 an identical position, and Generation 1 does not add a transposition cache.
 
+Every selected leaf becomes an explicit request carrying a generation, round,
+worker, game, and request ID plus a copied board with its complete move stack
+and the selected tree path. Batch row `i` is routed by request ID to exactly that
+request; the implementation must not depend only on incidental container
+ordering. Terminal leaves bypass the model and use exact chess outcomes.
+
 Start with eight active games per worker and benchmark scalar versus batched CPU
 inference. If batching is slower at this model size or CPU allocation, retain
 the same scheduler interface and use smaller batches. The artifact contract is
@@ -224,6 +240,35 @@ independent of that optimization.
 This is game-level batching. Generation 1 does not implement multiple parallel
 leaves inside one MCTS tree, virtual loss, a central inference service, or GPU
 inference.
+
+## Existing MCTS audit
+
+A read-only audit of the current scalar MCTS found no correctness bug. The
+Generation 1 scheduler must preserve these confirmed contracts:
+
+- board encoding and action indices use the same 180-degree side-to-move
+  orientation;
+- model outputs are raw 4,672-action logits plus a value from the current
+  player-to-move perspective;
+- logits are masked to `python-chess` legal actions before softmax;
+- node values are stored from the node's player-to-move perspective, PUCT
+  negates child values for parent comparison, and backup alternates sign once
+  per edge;
+- terminal wins, losses, and draws use the exact terminal board perspective and
+  bypass neural evaluation;
+- root policy targets are normalized child visit counts keyed by policy action
+  index;
+- full move stacks remain attached to copied boards because repetition planes
+  and claimable draws depend on history.
+
+With 128 simulations, the root visit count is 128 and the total child visits
+are 127 because the first simulation expands the root. Generation 1 retains
+that existing, tested meaning of `simulations_per_move=128`.
+
+Cross-game batching therefore separates selection from expansion and backup;
+wrapping the existing synchronous evaluator alone is insufficient. Each tree
+is expanded and backed up independently with the prediction row belonging to
+its request.
 
 ## Self-play exploration
 
@@ -260,8 +305,8 @@ One replay row represents the position before one self-play move:
 
 ```text
 board: uint8[21, 8, 8]
-policy_action_indices: list[uint16]
-policy_probabilities: list[float32]
+fen: string
+policy: list[struct<action_index: uint16, probability: float32>]
 outcome: int8
 game_id: string
 ply_index: int32
@@ -269,17 +314,26 @@ ply_index: int32
 
 Requirements:
 
-- policy actions are unique and legal for the position;
-- probabilities correspond one-to-one with actions;
+- `action_index` is the fixed neural-policy output index in `[0, 4672)` returned
+  by `move_to_policy_index(board, legal_move)`;
+- the generator derives the complete valid set from
+  `legal_policy_indices(board)`, which maps every `python-chess` legal move and
+  rejects collisions;
+- decoding an index with `policy_index_to_move(board, index)` must reconstruct a
+  legal move for the stored FEN;
+- policy entries are sorted by ascending action index before serialization;
+- action indices are unique, so ordering is deterministic but has no chess
+  preference meaning;
+- storing action and probability in one struct prevents two parallel lists from
+  becoming misaligned;
 - probabilities are finite, non-negative, and sum to one within tolerance;
 - outcome is `+1`, `0`, or `-1` from the recorded player-to-move perspective;
 - every game ID is globally unique within the generation;
-- adjacent positions from one game remain identifiable so Initiative B can
-  split and shuffle by game rather than leaking adjacent rows across splits.
+- adjacent positions from one game remain identifiable by game ID and ply.
 
 Store the sparse MCTS policy in Parquet. Do not store one dense 4,672-element
-vector per position. Initiative B may densify policies when collating its
-1,024-row training batches.
+vector per position. A future consumer may densify policies when collating its
+1,024-row training batches by scattering each probability to its action index.
 
 ## Artifacts and completion semantics
 
@@ -292,15 +346,18 @@ self-play/generation-000001/
         round-000001/
             workers/
                 worker-0000/
-                    attempt-0001/
-                        shard-00000.parquet
-                        worker-result.json
+                    invocations/
+                        invocation-0001/
+                            shard-00000.parquet
+                            worker-result.json
                 worker-0001/
-                    attempt-0001/
-                        shard-00000.parquet
-                        worker-result.json
+                    invocations/
+                        invocation-0001/
+                            shard-00000.parquet
+                            worker-result.json
                 ...
             round-manifest.json
+            round-completion.json
         round-000002/
             ...
     snapshots/
@@ -323,16 +380,28 @@ After every expected worker result exists, the coordinator reloads the Volume,
 validates all referenced shards, and writes one immutable `round-manifest.json`.
 It then writes a `snapshot-manifest.json` containing all sealed rounds included
 in that cumulative snapshot. The existence of a valid snapshot manifest is the
-Initiative A completion barrier and Initiative B handoff.
+Initiative A completion barrier.
 
 Only the coordinator writes round and snapshot manifests. Workers never append
-to a shared file. Attempts use unique paths, and a retry cannot overwrite a
-previous attempt. The coordinator selects exactly one valid attempt for each
-worker ID.
+to a shared file. Invocations use unique paths, and a retry cannot overwrite a
+previous invocation. The coordinator selects exactly one valid invocation for
+each worker ID.
 
-## Initiative B handoff
+Every successfully completed round produces exactly one cumulative snapshot:
 
-Initiative B accepts a `SnapshotManifest`, not a directory:
+```text
+snapshot-000001 = round 1
+snapshot-000002 = rounds 1 + 2
+snapshot-000003 = rounds 1 + 2 + 3
+```
+
+A snapshot is per round, not per worker. The round manifest identifies new data
+from that round; the snapshot manifest identifies all sealed Generation 1 data
+available after that round.
+
+## Public snapshot contract
+
+The public output of Initiative A is a `SnapshotManifest`, not a directory:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -349,17 +418,44 @@ class SnapshotManifest:
     shards: tuple[ReplayShardRef, ...]
 ```
 
-The snapshot is immutable and self-contained. Initiative B verifies its hashes
-and schema versions, then chooses its own replay mixing, batch size, precision,
-optimizer, candidate, evaluation, and promotion behavior.
+The snapshot is immutable and self-contained. Later snapshots may extend the
+same checkpoint-defined Generation 1 to 50,000, 100,000, 200,000, 500,000, or
+more positions without mutating earlier snapshots.
 
-For example, Initiative B may train from the first valid 10,000-position
-snapshot while Initiative A later extends the same checkpoint-defined
-Generation 1 to 50,000 or 100,000 positions. Those later snapshots do not
-mutate the earlier one.
+## Round completion and notification
 
-If Initiative B promotes a different checkpoint, future self-play from that
-checkpoint is Generation 2 even if Generation 1 continues to exist unchanged.
+A worker completion is not a user notification, and the coordinator must never
+announce a round merely because all remote calls returned. The round completes
+in this order:
+
+1. every expected worker has one selected valid invocation;
+2. every referenced shard passes schema, count, and hash validation;
+3. the coordinator writes and commits `round-manifest.json`;
+4. the coordinator writes and commits the cumulative `snapshot-manifest.json`;
+5. it writes and commits the durable `round-completion.json` record;
+6. only then does it return and emit one structured `round_completed` event.
+
+The event and returned `RoundCompletion` contain:
+
+```text
+generation ID
+round ID
+requested cumulative milestone
+previous actual positions
+new positions generated
+new cumulative actual positions
+game count
+snapshot path and digest
+completion timestamp
+```
+
+The normal `pe-self-play generation extend` command waits for the coordinator
+and prints this event once, so a connected invocation visibly notifies the
+operator only after the durable snapshot exists. Detached Modal execution also
+writes `round-completion.json` and logs the same event, so completion can be
+recovered after disconnection. This is a durable completion signal, not an
+external desktop, email, or Slack push notification; such delivery would be a
+separate notifier consuming `RoundCompletion`.
 
 ## Modal boundary
 
@@ -379,7 +475,7 @@ def generate_worker(spec: WorkerSpec) -> WorkerResult: ...
 Dispatch worker specs through Modal batch mapping with a concurrency target of
 16. Each input is independently retryable and stores its result externally.
 
-Workers write only unique attempt paths. They close shard files before
+Workers write only unique invocation paths. They close shard files before
 committing. The coordinator waits for worker calls, reloads the Volume before
 validation, and is the only writer of sealed manifests. Keep shard counts
 bounded and commit in coarse units rather than once per game.
@@ -395,16 +491,19 @@ Generation 1 is developed and operated incrementally:
 | 10,000 Modal positions | 128 simulations | First Generation 1 snapshot and CPU pilot |
 | 50,000 Modal positions | 128 simulations | Measure representative throughput and cost |
 | 100,000 Modal positions | 128 simulations | First substantial sealed snapshot |
+| 200,000 Modal positions | 128 simulations | Round 4 cumulative snapshot |
+| 500,000 Modal positions | 128 simulations | Round 5 cumulative snapshot |
 | Later extension | explicit | No built-in generation upper bound |
 
 Every milestone finishes active games and may overshoot its requested position
-count. Advancing to the next milestone is an explicit new round, not a mutation
-of an already sealed snapshot.
+count. Advancing to the next milestone is an explicit new round that generates
+only the remaining difference from the previous actual count. It creates a new
+cumulative snapshot rather than mutating an already sealed snapshot.
 
 ## Required tests
 
 - Existing Pink Elephant tests and public APIs remain compatible.
-- The local checkpoint digest and model specification are validated.
+- The Volume checkpoint digest and model specification are validated.
 - Root noise is legal, normalized, seeded, and applied only at the root.
 - Temperature sampling is seeded and does not change the stored raw-visit
   target.
@@ -416,11 +515,14 @@ of an already sealed snapshot.
   evaluators.
 - Sparse replay policies reject illegal, duplicate, negative, non-finite, and
   incorrectly normalized values.
-- Worker attempts never write the same artifact path.
+- Worker invocations never write the same artifact path.
 - A worker result cannot reference a missing or hash-mismatched shard.
 - A round cannot seal until every expected worker has one selected valid result.
 - A snapshot contains only sealed rounds from one generation and one checkpoint.
 - Extending Generation 1 does not alter earlier snapshot manifests.
+- Round 2 requests only the difference between 50,000 and snapshot 1's actual
+  position count.
+- `round_completed` cannot be emitted before the snapshot manifest is committed.
 
 ## Acceptance criterion
 
@@ -428,5 +530,5 @@ Using the supplied FP32 checkpoint and no GPU, one command creates Generation 1,
 dispatches 16 CPU Modal worker inputs toward a 10,000-position lower bound,
 finishes all active games, writes independently validated replay shards and
 worker results, seals a cumulative snapshot manifest, and can load every replay
-row locally through the shared Initiative A/B contract. Existing Pink Elephant
+row locally through the public Initiative A contract. Existing Pink Elephant
 commands and behavior remain unchanged.

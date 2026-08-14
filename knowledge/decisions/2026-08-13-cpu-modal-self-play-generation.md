@@ -10,8 +10,8 @@ correct scalar MCTS implementation. The next priority is producing trustworthy
 self-play replay data, not simultaneously implementing training, promotion, GPU
 inference, or tree-internal parallelism. Generation must scale across workers,
 finish games, tolerate retries, support useful snapshots at 10,000, 50,000,
-100,000, or later position milestones, and hand immutable data to a separately
-owned learning initiative.
+100,000, 200,000, 500,000, or later position milestones, and expose immutable
+public generation data.
 
 ## Decision
 
@@ -20,18 +20,22 @@ Elephant behavior. Put Initiative A under `self_play.generation`, reserve
 `self_play.learning` for Initiative B, and define their only required handoff in
 `self_play.contracts`.
 
-Generation 1 is defined by the existing 25-million-position checkpoint and one
-semantic MCTS configuration. Dispatch approximately 16 Modal CPU worker inputs.
+Generation 1 is defined by the epoch-6, step-110,802 checkpoint in the
+`pink-elephant-training` Volume, verified by SHA-256 digest, and one semantic
+MCTS configuration. Dispatch approximately 16 Modal CPU worker inputs.
 Each worker loads the FP32 checkpoint once, advances several independent games,
 may batch neural evaluations across games, finishes every active game, and
-writes immutable shards plus a typed worker result to its own attempt path.
+writes immutable shards plus a typed worker result to its own invocation path.
 
 Build Generation 1 through append-only rounds and seal immutable cumulative
 snapshot manifests at requested lower-bound position milestones. Do not impose
 a generation-wide upper bound. Do not use a generation-level `_SUCCESS` marker;
-a validated snapshot manifest is the completion barrier consumed by Initiative
-B. The initial downstream training batch size is 1,024, but it is not part of
-the generation contract.
+a validated snapshot manifest is the completion barrier. Each round generates
+only the difference between its requested cumulative milestone and the prior
+snapshot's actual count, then seals exactly one new cumulative snapshot. The
+coordinator emits `round_completed` only after committing that snapshot. The
+initial downstream training batch size is 1,024, but it is not part of the
+generation contract.
 
 ## Alternatives
 
@@ -53,11 +57,10 @@ the generation contract.
 
 ## Consequences
 
-Initiative A can be built and tested independently, and Initiative B can begin
-against synthetic or early sealed manifests. Every replay sample has exact
-checkpoint and search provenance. Worker retries cannot overwrite each other,
-and earlier 10,000- or 50,000-position snapshots remain unchanged as Generation
-1 grows.
+Initiative A can be built and tested independently. Every replay sample has
+exact checkpoint and search provenance. Worker retries cannot overwrite each
+other, and earlier 10,000- or 50,000-position snapshots remain unchanged as
+Generation 1 grows.
 
 Finishing all active games causes predictable milestone overshoot. CPU inference
 may be too slow for large 128-simulation generations; the 10,000- and
