@@ -25,6 +25,7 @@ from pink_elephant.self_play.contracts import (
 )
 from pink_elephant.self_play.generation import cli
 from pink_elephant.self_play.generation.config import (
+    GENERATION_1_CHECKPOINT_SHA256,
     GenerationRoundSpec,
     WorkerSpec,
     generation_1_spec,
@@ -569,3 +570,9 @@ def test_worker_planning_distributes_quota_and_keeps_worker_identity_stable() ->
     assert tuple(worker.position_lower_bound for worker in workers) == (3, 3, 3)
     assert len({worker.seed_start for worker in workers}) == 3
     assert plan_worker_specs(generation, round_spec, previous_actual_positions=10) == ()
+
+
+def test_generation_1_checkpoint_digest_matches_the_pinned_volume_artifact() -> None:
+    assert GENERATION_1_CHECKPOINT_SHA256 == (
+        "9e1f7bb15cc042357e1e4a0afea18c89f01e25aada7497be83c91f29f62a0229"
+    )
