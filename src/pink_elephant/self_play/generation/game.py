@@ -1,0 +1,247 @@
+"""Deterministic self-play games, exploration, and replay-position lifecycle."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from random import Random
+
+import chess
+import numpy as np
+
+from pink_elephant.action_mapping import policy_index_to_move
+from pink_elephant.encoding import encode_board
+from pink_elephant.mcts import (
+    BatchedPolicyValueEvaluator,
+    MCTSConfig,
+    MCTSNode,
+    root_visit_distribution,
+    run_mcts_batch,
+)
+from pink_elephant.self_play.contracts import GameRecord, ReplayRow, SparsePolicyEntry
+from pink_elephant.self_play.generation.config import GenerationSpec
+
+
+class GameTruncatedError(RuntimeError):
+    """Raised when an operational guard prevents a rules-defined game ending."""
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPosition:
+    """A position retained until the game result makes its outcome known."""
+
+    board: np.ndarray
+    fen: str
+    policy: tuple[SparsePolicyEntry, ...]
+    selected_action_index: int
+    side_to_move: chess.Color
+    game_id: str
+    ply_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSelfPlayGame:
+    """Validated replay rows and reconstructable game metadata."""
+
+    rows: tuple[ReplayRow, ...]
+    record: GameRecord
+
+
+def make_root_dirichlet_modifier(
+    rng: np.random.Generator,
+    *,
+    alpha: float,
+    fraction: float,
+) -> Callable[[MCTSNode], None]:
+    """Create a root-only seeded Dirichlet-prior modifier."""
+
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("Dirichlet alpha must be finite and positive")
+    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+        raise ValueError("Dirichlet fraction must be finite and in [0, 1]")
+
+    def apply(root_node: MCTSNode) -> None:
+        if not root_node.children_by_action_index:
+            return
+        action_indices = tuple(sorted(root_node.children_by_action_index))
+        noise = rng.dirichlet(np.full(len(action_indices), alpha, dtype=np.float64))
+        for action_index, noise_probability in zip(action_indices, noise, strict=True):
+            child = root_node.children_by_action_index[action_index]
+            child.prior_probability = float(
+                (1 - fraction) * child.prior_probability + fraction * noise_probability
+            )
+
+    return apply
+
+
+def select_action_from_root(
+    root_node: MCTSNode,
+    *,
+    temperature: float,
+    rng: Random,
+    greedy: bool = False,
+) -> int:
+    """Select an action from visits while retaining raw visits as the target."""
+
+    if not root_node.children_by_action_index:
+        raise ValueError("cannot select an action from an unexpanded root")
+    if not greedy and (not math.isfinite(temperature) or temperature <= 0):
+        raise ValueError("temperature must be finite and positive")
+    action_indices = tuple(sorted(root_node.children_by_action_index))
+    if greedy:
+        return max(
+            action_indices,
+            key=lambda action_index: (
+                root_node.children_by_action_index[action_index].visit_count,
+                root_node.children_by_action_index[action_index].prior_probability,
+                -action_index,
+            ),
+        )
+    visits = tuple(
+        root_node.children_by_action_index[index].visit_count for index in action_indices
+    )
+    if temperature == 1.0:
+        weights = tuple(float(visit) for visit in visits)
+    else:
+        weights = tuple(float(visit) ** (1.0 / temperature) for visit in visits)
+    total = sum(weights)
+    if total <= 0 or not math.isfinite(total):
+        weights = tuple(
+            root_node.children_by_action_index[index].prior_probability for index in action_indices
+        )
+        total = sum(weights)
+    if total <= 0 or not math.isfinite(total):
+        raise ValueError("root selection weights must have a finite positive total")
+    threshold = rng.random() * total
+    cumulative = 0.0
+    for action_index, weight in zip(action_indices, weights, strict=True):
+        cumulative += weight
+        if threshold < cumulative:
+            return action_index
+    return action_indices[-1]
+
+
+def complete_game(
+    *,
+    game_id: str,
+    seed: int,
+    initial_fen: str,
+    moves_uci: Sequence[str],
+    final_board: chess.Board,
+    pending_positions: Sequence[PendingPosition],
+) -> CompletedSelfPlayGame:
+    """Assign terminal outcomes and validate one atomic game before admission."""
+
+    outcome = final_board.outcome(claim_draw=True)
+    if outcome is None:
+        raise ValueError("cannot complete a game before a rules-defined terminal result")
+    result = outcome.result()
+    termination = outcome.termination.name.lower()
+    rows: list[ReplayRow] = []
+    for pending in pending_positions:
+        position_outcome = (
+            0 if outcome.winner is None else 1 if outcome.winner == pending.side_to_move else -1
+        )
+        rows.append(
+            ReplayRow(
+                board=pending.board,
+                fen=pending.fen,
+                policy=pending.policy,
+                selected_action_index=pending.selected_action_index,
+                outcome=position_outcome,
+                game_id=pending.game_id,
+                ply_index=pending.ply_index,
+            )
+        )
+    record = GameRecord(
+        game_id=game_id,
+        seed=seed,
+        initial_fen=initial_fen,
+        moves_uci=tuple(moves_uci),
+        result=result,
+        termination=termination,
+        ply_count=len(moves_uci),
+        replay_position_count=len(rows),
+    )
+    if tuple(row.game_id for row in rows) != (game_id,) * len(rows):
+        raise ValueError("completed game rows have inconsistent game IDs")
+    return CompletedSelfPlayGame(rows=tuple(rows), record=record)
+
+
+def run_self_play_game(
+    board: chess.Board,
+    *,
+    evaluator: BatchedPolicyValueEvaluator,
+    generation: GenerationSpec,
+    game_id: str,
+    seed: int,
+    max_plies: int = 512,
+) -> CompletedSelfPlayGame:
+    """Run one game through the same batched-search interface as workers."""
+
+    if max_plies < 1:
+        raise ValueError("max_plies must be positive")
+    current_board = board.copy(stack=True)
+    initial_fen = current_board.fen(en_passant="fen")
+    pending_positions: list[PendingPosition] = []
+    moves_uci: list[str] = []
+    temperature_rng = Random(seed)
+    noise_rng = np.random.default_rng(seed)
+    mcts_config = MCTSConfig(
+        num_simulations=generation.simulations_per_move,
+        exploration_constant=generation.exploration_constant,
+    )
+
+    while not current_board.is_game_over(claim_draw=True):
+        if current_board.ply() >= max_plies:
+            raise GameTruncatedError(f"game {game_id} reached max plies without terminating")
+        root_noise = make_root_dirichlet_modifier(
+            noise_rng,
+            alpha=generation.dirichlet_alpha,
+            fraction=generation.dirichlet_fraction,
+        )
+        root = run_mcts_batch(
+            (current_board,),
+            evaluator,
+            mcts_config,
+            root_prior_modifiers=(root_noise,),
+        )[0]
+        policy = tuple(
+            SparsePolicyEntry(action_index=action_index, probability=probability)
+            for action_index, probability in sorted(root_visit_distribution(root).items())
+        )
+        temperature = (
+            generation.opening_temperature
+            if current_board.ply() < generation.temperature_cutoff_ply
+            else 1.0
+        )
+        selected_action_index = select_action_from_root(
+            root,
+            temperature=temperature,
+            rng=temperature_rng,
+            greedy=current_board.ply() >= generation.temperature_cutoff_ply,
+        )
+        selected_move = policy_index_to_move(current_board, selected_action_index)
+        pending_positions.append(
+            PendingPosition(
+                board=encode_board(current_board),
+                fen=current_board.fen(en_passant="fen"),
+                policy=policy,
+                selected_action_index=selected_action_index,
+                side_to_move=current_board.turn,
+                game_id=game_id,
+                ply_index=current_board.ply(),
+            )
+        )
+        moves_uci.append(selected_move.uci())
+        current_board.push(selected_move)
+
+    return complete_game(
+        game_id=game_id,
+        seed=seed,
+        initial_fen=initial_fen,
+        moves_uci=moves_uci,
+        final_board=current_board,
+        pending_positions=pending_positions,
+    )

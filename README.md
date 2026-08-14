@@ -215,6 +215,36 @@ remote training job to continue if this computer or terminal disconnects.
 Afterward, retrieve metrics or checkpoints from the Modal Volume with
 `modal volume get` or inspect the run in the Modal dashboard.
 
+## CPU self-play generation
+
+Initiative A generates immutable replay shards and cumulative snapshot
+manifests from the fixed Generation 1 checkpoint. A Modal round uses sixteen
+retryable CPU workers and waits for the validated snapshot before printing its
+`round_completed` event:
+
+```sh
+uv run pe-self-play generation extend \
+  --backend modal \
+  --round-id round-000001 \
+  --requested-positions 10000
+```
+
+For an offline smoke run, point the same command at a local copy of the exact
+Generation 1 checkpoint and use a small requested milestone:
+
+```sh
+uv run pe-self-play generation extend \
+  --backend local \
+  --checkpoint /path/to/generation-1.pt \
+  --round-id smoke-000001 \
+  --requested-positions 100
+```
+
+Worker artifacts live below `data/self-play/generation-000001/` locally or
+`/data/self-play/generation-000001/` on the training Volume. A snapshot
+manifest is the durable completion barrier; later rounds append new shards and
+never modify earlier snapshots.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The
