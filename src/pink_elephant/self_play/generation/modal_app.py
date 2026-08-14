@@ -176,6 +176,10 @@ def _already_satisfied_completion(
 
 def _mounted_checkpoint_path(volume_path: str) -> Path:
     relative = PurePosixPath(volume_path)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+    if (
+        not relative.parts
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
         raise ValueError("checkpoint volume path must be a safe relative path")
     return MODAL_VOLUME_MOUNT / Path(*relative.parts)

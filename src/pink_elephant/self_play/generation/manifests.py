@@ -298,7 +298,12 @@ def _validate_snapshot_artifacts(snapshot: SnapshotManifest, output_root: Path) 
         raise ValueError("previous snapshot position count does not match its shards")
     for shard in snapshot.shards:
         path = _resolve_artifact(output_root, shard.path)
-        actual = validate_replay_shard(path)
+        try:
+            actual = validate_replay_shard(path)
+        except FileNotFoundError as error:
+            raise ValueError(
+                f"previous snapshot shard is missing or hash-mismatched: {path}"
+            ) from error
         if not _same_artifact(actual, shard):
             raise ValueError(f"previous snapshot shard is missing or hash-mismatched: {path}")
 
