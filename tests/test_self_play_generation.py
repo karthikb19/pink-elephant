@@ -172,6 +172,9 @@ def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> No
     predictions = evaluator(requests)
 
     assert model.batch_sizes == [2]
+    assert evaluator.batch_count == 1
+    assert evaluator.position_count == 2
+    assert evaluator.elapsed_seconds >= 0
     assert tuple(predictions) == ("second", "first")
     assert all(len(prediction.policy_logits) == POLICY_SIZE for prediction in predictions.values())
 
@@ -283,9 +286,12 @@ def test_worker_emits_structured_progress_events(
         if record.name == "pink_elephant.self_play.generation.worker"
     ]
     event_names = [event["event"] for event in events]
+    search_events = [event for event in events if event["event"] == "worker_search_progress"]
     progress_events = [event for event in events if event["event"] == "worker_progress"]
 
     assert event_names[0] == "worker_started"
+    assert search_events[0]["search_batch_count"] == 1
+    assert search_events[0]["maximum_active_ply"] == 0
     assert progress_events[-1]["position_count"] == 4
     assert event_names[-1] == "worker_completed"
 
@@ -362,6 +368,31 @@ def test_coordinator_appends_cumulative_snapshots_and_supports_noop_rounds(
     assert noop.new_position_count == 0
     assert noop.snapshot_path == second.snapshot_path
     assert latest_snapshot(tmp_path, generation.generation_id) == second_snapshot
+
+
+def test_snapshot_preserves_append_order_for_non_lexical_round_ids(tmp_path: Path) -> None:
+    generation = _smoke_generation()
+    coordinator = GenerationCoordinator(tmp_path, generation)
+
+    def run_one(worker: WorkerSpec):
+        return run_worker(
+            replace(worker, max_plies_per_game=8, max_game_attempts=1),
+            FoolsmateEvaluator(),
+            tmp_path,
+        )
+
+    coordinator.extend(_smoke_round(generation, "z-first"), run_one, invocation_id="one")
+    completion = coordinator.extend(
+        _smoke_round(generation, "a-second", requested_positions=8),
+        run_one,
+        invocation_id="two",
+    )
+    snapshot = load_snapshot_manifest(tmp_path / completion.snapshot_path)
+
+    assert tuple(round_ref.round_id for round_ref in snapshot.rounds) == (
+        "z-first",
+        "a-second",
+    )
 
 
 def test_coordinator_rejects_changed_generation_manifest(tmp_path: Path) -> None:
@@ -505,6 +536,49 @@ def test_cli_passes_generation_overrides_to_local_scheduler(
     assert round_spec.shard_position_limit == 2
     assert generation.base_seed == 9
     assert generation.simulations_per_move == 1
+
+
+def test_cli_passes_l4_worker_selection_to_modal_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_launch(generation, round_spec, *, worker_gpu):
+        captured.update(generation=generation, round_spec=round_spec, worker_gpu=worker_gpu)
+        return RoundCompletion(
+            generation_id=generation.generation_id,
+            round_id=round_spec.round_id,
+            requested_position_milestone=round_spec.requested_cumulative_positions,
+            previous_actual_position_count=0,
+            new_position_count=4,
+            actual_position_count=4,
+            game_count=1,
+            snapshot_path="generation-000001/snapshots/snapshot-000001/snapshot-manifest.json",
+            snapshot_sha256="a" * 64,
+            completed_at="2026-01-01T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(cli, "launch_modal_generation_round", fake_launch)
+
+    exit_code = cli.main(
+        [
+            "generation",
+            "extend",
+            "--backend",
+            "modal",
+            "--worker-gpu",
+            "L4",
+            "--round-id",
+            "l4-cli",
+            "--requested-positions",
+            "4",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["worker_gpu"] == "L4"
+    assert json.loads(capsys.readouterr().out)["event"] == "round_completed"
 
 
 @pytest.mark.parametrize(

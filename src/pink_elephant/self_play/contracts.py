@@ -423,10 +423,9 @@ class SnapshotManifest:
             raise ValueError("snapshot actual count must satisfy the requested milestone")
         if self.game_count < 1 or not self.rounds or not self.shards:
             raise ValueError("snapshot must include sealed rounds and replay shards")
-        if tuple(round_ref.round_id for round_ref in self.rounds) != tuple(
-            sorted(round_ref.round_id for round_ref in self.rounds)
-        ):
-            raise ValueError("snapshot rounds must be ordered")
+        round_ids = tuple(round_ref.round_id for round_ref in self.rounds)
+        if len(set(round_ids)) != len(round_ids):
+            raise ValueError("snapshot round IDs must be unique")
         _validate_sha256(self.checkpoint_sha256)
         _validate_sha256(self.search_config_sha256)
 

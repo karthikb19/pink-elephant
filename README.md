@@ -220,13 +220,24 @@ Afterward, retrieve metrics or checkpoints from the Modal Volume with
 Initiative A generates immutable replay shards and cumulative snapshot
 manifests from the fixed Generation 1 checkpoint. A Modal round uses sixteen
 retryable CPU workers and waits for the validated snapshot before printing its
-`round_completed` event:
+`round_completed` event. Use the detached Modal entrypoint for production
+rounds so closing the terminal does not cancel workers before sealing:
 
 ```sh
-uv run pe-self-play generation extend \
-  --backend modal \
+uv run modal run --detach --timestamps \
+  src/pink_elephant/self_play/generation/modal_app.py \
   --round-id round-000001 \
   --requested-positions 10000
+```
+
+Add `--worker-gpu L4` to run model evaluation on one L4 per worker. CPU remains
+the default because sixteen concurrent workers would otherwise request sixteen
+GPUs.
+
+Follow structured search, game, worker, and sealing progress with:
+
+```sh
+uv run modal app logs pink-elephant-self-play -f --timestamps
 ```
 
 For an offline smoke run, point the same command at a local copy of the exact
