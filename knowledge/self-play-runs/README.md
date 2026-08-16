@@ -31,6 +31,7 @@ not directly equivalent to final committed throughput.
 - [Two processes with two trees each, 128 simulations](2026-08-16-ap-M6hs8XcPX6Sy9tV6UO1trf.md)
 - [Two processes with two trees each, 32 simulations](2026-08-16-ap-1b5pcLzHzz0oBoIUgAixsQ.md)
 - [Two processes with child-side leaf encoding, 32 simulations](2026-08-16-ap-2WsEruDiCINO7HoSDgKMP4.md)
+- [PGN examples from child-encoding run](2026-08-16-ap-2WsEruDiCINO7HoSDgKMP4-examples.pgn)
 - [Cross-run conclusions and next experiments](optimization-progress.md)
 
 ## Measurement conventions

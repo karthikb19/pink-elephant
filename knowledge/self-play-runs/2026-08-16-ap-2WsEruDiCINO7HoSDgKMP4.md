@@ -10,6 +10,7 @@
 - Actual positions: 1,208
 - Overshoot: 1.208×
 - Snapshot SHA-256: `a5b3edda35bfe74454cf68b254110efb44c4fcfdebaf82393f74d00b493d1014`
+- PGN examples: [three representative games](2026-08-16-ap-2WsEruDiCINO7HoSDgKMP4-examples.pgn)
 
 ## Configuration
 

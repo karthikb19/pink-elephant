@@ -1,0 +1,56 @@
+[Event "Pink Elephant self-play"]
+[Site "Modal"]
+[Date "2026.08.16"]
+[Round "mcts-2x2-0001"]
+[White "Pink Elephant"]
+[Black "Pink Elephant"]
+[Result "1-0"]
+[Termination "checkmate"]
+[GameId "generation-3-mcts-2x2-benchmark-child-encoding-mcts-2x2-0001-worker-0000-invocation-0001-game-000024"]
+[PlyCount "21"]
+[Simulations "32"]
+
+1. e4 d5 2. exd5 Qxd5 3. Nc3 Qd8 4. d4 a6 5. Nf3 Be6 6. Ng5 Kd7 7. d5 Qe8
+8. dxe6+ Kc6 9. Qd5+ Kb6 10. Be3+ c5 11. Qxc5# 1-0
+
+[Event "Pink Elephant self-play"]
+[Site "Modal"]
+[Date "2026.08.16"]
+[Round "mcts-2x2-0001"]
+[White "Pink Elephant"]
+[Black "Pink Elephant"]
+[Result "1-0"]
+[Termination "checkmate"]
+[GameId "generation-3-mcts-2x2-benchmark-child-encoding-mcts-2x2-0001-worker-0000-invocation-0001-game-000008"]
+[PlyCount "59"]
+[Simulations "32"]
+
+1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. e3 c5 5. Nf3 cxd4 6. exd4 g6 7. c5 h5
+8. Bd3 Bg7 9. Bf4 Qd6 10. Bxd6 Rh6 11. Nb5 Ng8 12. Nc7+ Kd7 13. Nxa8 Nc6
+14. Bb5 g5 15. Ne5+ Ke8 16. Nc7+ Kd8 17. Nxf7+ Kd7 18. Qa4 Rf6 19. Ne5+
+Kd8 20. Nxc6+ bxc6 21. Qxa7 Rf7 22. Qb8 Ne7 23. Nxe6+ Ke8 24. Nxg7+ Rxg7
+25. Bd3 Kf7 26. O-O Bf5 27. Bxf5 Nxf5 28. Rae1 Kf6 29. Qe8 Nxd6 30. Qe6# 1-0
+
+[Event "Pink Elephant self-play"]
+[Site "Modal"]
+[Date "2026.08.16"]
+[Round "mcts-2x2-0001"]
+[White "Pink Elephant"]
+[Black "Pink Elephant"]
+[Result "0-1"]
+[Termination "checkmate"]
+[GameId "generation-3-mcts-2x2-benchmark-child-encoding-mcts-2x2-0001-worker-0000-invocation-0001-game-000018"]
+[PlyCount "120"]
+[Simulations "32"]
+
+1. e4 c5 2. Ke2 d5 3. d3 Nc6 4. Nh3 Nf6 5. Qd2 dxe4 6. Qd1 Bg4+ 7. Kd2 Bxd1
+8. b3 Bxc2 9. Kxc2 Nd4+ 10. Kd2 Qa5+ 11. Nc3 Nxb3+ 12. axb3 Qxa1 13. Nxe4
+Nxe4+ 14. dxe4 Rd8+ 15. Kc2 Qa2+ 16. Kc3 Qa5+ 17. Kc2 Qa2+ 18. Kc3 a6
+19. Bd3 Qa1+ 20. Kc2 Qa2+ 21. Kc3 Qa1+ 22. Kc2 e5 23. Bb2 Qxh1 24. Bc3
+Qxg2 25. Bc4 Qxe4+ 26. Kb2 Rd1 27. Ng5 Qb1+ 28. Ka3 Qa1+ 29. Bxa1 Rxa1+
+30. Kb2 Re1 31. Bxf7+ Ke7 32. Bd5 Re2+ 33. Kc3 Rxf2 34. h3 h6 35. Ne4
+Rh2 36. Nxc5 Rxh3+ 37. Kd2 Rh2+ 38. Kd3 Rh3+ 39. Kd2 Rh2+ 40. Kd3
+Rd2+ 41. Kxd2 Kd6 42. Nxb7+ Kxd5 43. Nd8 h5 44. Nf7 Rg8 45. Ng5 Be7
+46. Nf3 e4 47. Ne1 Bb4+ 48. Ke2 h4 49. Nc2 Bc5 50. b4 h3 51. bxc5 h2
+52. Ne3+ Kxc5 53. Kd2 h1=Q 54. Nc2 Qf3 55. Ne3 Qf2+ 56. Kc1 Qxe3+
+57. Kc2 Qe2+ 58. Kc3 Qd3+ 59. Kb2 Rb8+ 60. Kc1 Rb1# 0-1
