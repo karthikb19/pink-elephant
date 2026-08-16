@@ -3,11 +3,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 import chess
+import numpy as np
 import pytest
 
 from pink_elephant.action_mapping import legal_policy_indices
+from pink_elephant.encoding import encode_model_input
 from pink_elephant.mcts import (
-    BatchEvaluationRequest,
+    EncodedBatchEvaluationRequest,
     MCTSConfig,
     PolicyValuePrediction,
     root_summary_visit_distribution,
@@ -22,15 +24,17 @@ from pink_elephant.self_play.generation.process_search import (
 class RecordingUniformEvaluator:
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []
+        self.requests: list[EncodedBatchEvaluationRequest] = []
 
     def __call__(
-        self, requests: Sequence[BatchEvaluationRequest]
+        self, requests: Sequence[EncodedBatchEvaluationRequest]
     ) -> Mapping[str, PolicyValuePrediction]:
         self.batch_sizes.append(len(requests))
+        self.requests.extend(requests)
         return {
             request.request_id: PolicyValuePrediction(
                 legal_policy_logits={
-                    action_index: 0.0 for action_index in legal_policy_indices(request.board)
+                    action_index: 0.0 for action_index in request.legal_action_indices
                 },
                 value=0.0,
             )
@@ -65,6 +69,30 @@ def test_multiprocess_search_batches_one_leaf_from_each_process() -> None:
     assert len(summaries) == 2
     assert summaries[0] == summaries[1]
     assert sum(root_summary_visit_distribution(summaries[0]).values()) == 1.0
+
+
+def test_multiprocess_search_sends_child_encoded_leaf_payload() -> None:
+    evaluator = RecordingUniformEvaluator()
+    board = chess.Board()
+    for move_uci in ("g1f3", "g8f6", "f3g1", "f6g8"):
+        board.push_uci(move_uci)
+    action_indices = tuple(sorted(legal_policy_indices(board)))
+    request = SearchRequest(
+        board=board,
+        root_noise=RootPriorNoise(
+            probabilities=tuple((index, 1 / len(action_indices)) for index in action_indices),
+            fraction=0.0,
+        ),
+    )
+
+    with MultiprocessMCTSSearch(evaluator, process_count=1) as search:
+        search.search((request,), MCTSConfig(num_simulations=1))
+
+    assert len(evaluator.requests) == 1
+    leaf_request = evaluator.requests[0]
+    assert not hasattr(leaf_request, "board")
+    np.testing.assert_array_equal(leaf_request.encoded_position, encode_model_input(board))
+    assert leaf_request.legal_action_indices == action_indices
 
 
 def test_multiprocess_search_batches_two_trees_per_process() -> None:
@@ -143,7 +171,7 @@ def test_multiprocess_search_rejects_invalid_tree_capacity() -> None:
 
 def test_multiprocess_search_rejects_missing_broker_prediction() -> None:
     def incomplete_evaluator(
-        requests: Sequence[BatchEvaluationRequest],
+        requests: Sequence[EncodedBatchEvaluationRequest],
     ) -> Mapping[str, PolicyValuePrediction]:
         return {}
 

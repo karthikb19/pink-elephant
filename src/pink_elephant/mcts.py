@@ -15,11 +15,15 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import chess
+import numpy as np
+from numpy.typing import NDArray
 
 from pink_elephant.action_mapping import (
+    POLICY_SIZE,
     legal_policy_indices,
     policy_index_to_move,
 )
+from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,11 +87,41 @@ class BatchEvaluationRequest:
             raise ValueError("batch evaluation request_id must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class EncodedBatchEvaluationRequest:
+    """One leaf request with all model preprocessing completed by its child."""
+
+    request_id: str
+    encoded_position: NDArray[np.float32]
+    legal_action_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            raise ValueError("encoded batch evaluation request_id must not be empty")
+        if not isinstance(self.encoded_position, np.ndarray):
+            raise TypeError("encoded_position must be a NumPy array")
+        expected_shape = (PLANE_COUNT, BOARD_SIZE, BOARD_SIZE)
+        if tuple(self.encoded_position.shape) != expected_shape:
+            raise ValueError(
+                f"encoded_position must have shape {expected_shape}, "
+                f"got {tuple(self.encoded_position.shape)}"
+            )
+        if self.encoded_position.dtype != np.float32:
+            raise TypeError("encoded_position must have dtype float32")
+        if not self.legal_action_indices:
+            raise ValueError("legal_action_indices must not be empty")
+        if len(set(self.legal_action_indices)) != len(self.legal_action_indices):
+            raise ValueError("legal_action_indices must not contain duplicates")
+        if any(not 0 <= index < POLICY_SIZE for index in self.legal_action_indices):
+            raise ValueError(f"legal_action_indices must be in [0, {POLICY_SIZE})")
+
+
 class BatchedPolicyValueEvaluator(Protocol):
     """Evaluate independently selected leaves in one model forward pass."""
 
     def __call__(
-        self, requests: Sequence[BatchEvaluationRequest]
+        self,
+        requests: Sequence[BatchEvaluationRequest | EncodedBatchEvaluationRequest],
     ) -> Mapping[str, PolicyValuePrediction]:
         """Return exactly one prediction for every request ID."""
 

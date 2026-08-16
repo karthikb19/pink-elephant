@@ -17,9 +17,12 @@ from types import TracebackType
 
 import chess
 
+from pink_elephant.action_mapping import legal_policy_indices
+from pink_elephant.encoding import encode_model_input
 from pink_elephant.mcts import (
     BatchedPolicyValueEvaluator,
     BatchEvaluationRequest,
+    EncodedBatchEvaluationRequest,
     MCTSConfig,
     MCTSNode,
     MCTSRootSummary,
@@ -63,7 +66,7 @@ class _StopProcess:
 @dataclass(frozen=True, slots=True)
 class _InferenceRequest:
     process_index: int
-    requests: tuple[BatchEvaluationRequest, ...]
+    requests: tuple[EncodedBatchEvaluationRequest, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,12 +105,18 @@ class _BrokerClientEvaluator(BatchedPolicyValueEvaluator):
     def __call__(
         self, requests: Sequence[BatchEvaluationRequest]
     ) -> Mapping[str, PolicyValuePrediction]:
-        broker_requests: list[BatchEvaluationRequest] = []
+        broker_requests: list[EncodedBatchEvaluationRequest] = []
         local_ids_by_broker_id: dict[str, str] = {}
         for request in requests:
             broker_id = f"process-{self._process_index:04d}-request-{self._request_count:08d}"
             self._request_count += 1
-            broker_requests.append(BatchEvaluationRequest(broker_id, request.board))
+            broker_requests.append(
+                EncodedBatchEvaluationRequest(
+                    request_id=broker_id,
+                    encoded_position=encode_model_input(request.board),
+                    legal_action_indices=tuple(sorted(legal_policy_indices(request.board))),
+                )
+            )
             local_ids_by_broker_id[broker_id] = request.request_id
         wait_started = time.perf_counter()
         self._event_queue.put(

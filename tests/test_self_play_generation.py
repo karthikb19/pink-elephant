@@ -13,8 +13,12 @@ import torch
 from torch import Tensor, nn
 
 from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, move_to_policy_index
-from pink_elephant.encoding import encode_board
-from pink_elephant.mcts import BatchEvaluationRequest, PolicyValuePrediction
+from pink_elephant.encoding import encode_board, encode_model_input
+from pink_elephant.mcts import (
+    BatchEvaluationRequest,
+    EncodedBatchEvaluationRequest,
+    PolicyValuePrediction,
+)
 from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
 from pink_elephant.model_adapter import chess_resnet_spec
 from pink_elephant.self_play.contracts import (
@@ -76,13 +80,28 @@ REPETITION_MOVES = ("g1f3", "g8f6", "f3g1", "f6g8") * 2
 
 
 def _predictions_for_sequence(
-    requests: Sequence[BatchEvaluationRequest], moves: Sequence[str]
+    requests: Sequence[BatchEvaluationRequest | EncodedBatchEvaluationRequest],
+    moves: Sequence[str],
 ) -> Mapping[str, PolicyValuePrediction]:
     predictions: dict[str, PolicyValuePrediction] = {}
     for request in reversed(requests):
-        target = chess.Move.from_uci(moves[request.board.ply()])
-        target_index = move_to_policy_index(request.board, target)
-        logits = {index: -1000.0 for index in legal_policy_indices(request.board)}
+        if isinstance(request, BatchEvaluationRequest):
+            board = request.board
+            target = chess.Move.from_uci(moves[board.ply()])
+            target_index = move_to_policy_index(board, target)
+            action_indices = legal_policy_indices(board)
+        else:
+            board = chess.Board()
+            target_index = None
+            action_indices = request.legal_action_indices
+            for move_uci in moves:
+                if np.array_equal(request.encoded_position, encode_model_input(board)):
+                    target_index = move_to_policy_index(board, chess.Move.from_uci(move_uci))
+                    break
+                board.push_uci(move_uci)
+            if target_index is None:
+                raise AssertionError("encoded position was not found in the expected sequence")
+        logits = {index: -1000.0 for index in action_indices}
         logits[target_index] = 1000.0
         predictions[request.request_id] = PolicyValuePrediction(
             legal_policy_logits=logits,
@@ -93,7 +112,7 @@ def _predictions_for_sequence(
 
 class FoolsmateEvaluator:
     def __call__(
-        self, requests: Sequence[BatchEvaluationRequest]
+        self, requests: Sequence[BatchEvaluationRequest | EncodedBatchEvaluationRequest]
     ) -> Mapping[str, PolicyValuePrediction]:
         return _predictions_for_sequence(requests, FOOLS_MATE_MOVES)
 
@@ -103,7 +122,7 @@ class RetryEvaluator(FoolsmateEvaluator):
         self.request_count = 0
 
     def __call__(
-        self, requests: Sequence[BatchEvaluationRequest]
+        self, requests: Sequence[BatchEvaluationRequest | EncodedBatchEvaluationRequest]
     ) -> Mapping[str, PolicyValuePrediction]:
         sequence = ("a2a3", "a7a6", "h2h3", "h7h6") if self.request_count < 4 else FOOLS_MATE_MOVES
         self.request_count += len(requests)
@@ -227,6 +246,24 @@ def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> No
     assert set(predictions["first"].legal_policy_logits) == set(
         legal_policy_indices(requests[1].board)
     )
+
+
+def test_model_batch_evaluator_consumes_preencoded_position_requests() -> None:
+    model = RecordingModel()
+    evaluator = ModelBatchEvaluator(model)
+    board = chess.Board()
+    for move_uci in ("g1f3", "g8f6", "f3g1", "f6g8"):
+        board.push_uci(move_uci)
+    request = EncodedBatchEvaluationRequest(
+        request_id="encoded",
+        encoded_position=encode_model_input(board),
+        legal_action_indices=tuple(sorted(legal_policy_indices(board))),
+    )
+
+    predictions = evaluator((request,))
+
+    assert model.batch_sizes == [1]
+    assert set(predictions["encoded"].legal_policy_logits) == set(request.legal_action_indices)
 
 
 def test_load_generation_evaluator_validates_checkpoint_digest(tmp_path: Path) -> None:
