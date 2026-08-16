@@ -15,6 +15,7 @@ identity remains `(generation_id, round_id)`.
 | 2026-08-16 13:40 | `ap-UiYqGyaunc8h5fgZWR6wmC` | Deliberately stopped | `1 × 8` | 2 | 128 | 720 productive | 0.946 productive live | n/a | 1.944 | 22.66% |
 | 2026-08-16 14:36 | `ap-M6hs8XcPX6Sy9tV6UO1trf` | Completed | `1 × 4` | 2 (2 trees each) | 128 | 1,262 | 1.014 | 1.014 | 3.522 | 13.58% |
 | 2026-08-16 15:08 | `ap-1b5pcLzHzz0oBoIUgAixsQ` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,208 | 4.386 | 4.386 | 3.547 | 18.68% |
+| 2026-08-16 15:52 | `ap-2WsEruDiCINO7HoSDgKMP4` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,208 | 5.694 | 5.694 | 3.547 | 16.75% |
 
 `Worker wall positions/s` is committed output divided by the slowest worker duration for completed
 runs. The stopped run uses completed plus in-flight positions divided by elapsed worker time and is
@@ -29,6 +30,7 @@ not directly equivalent to final committed throughput.
 - [Two MCTS processes, deliberately stopped](2026-08-16-ap-UiYqGyaunc8h5fgZWR6wmC.md)
 - [Two processes with two trees each, 128 simulations](2026-08-16-ap-M6hs8XcPX6Sy9tV6UO1trf.md)
 - [Two processes with two trees each, 32 simulations](2026-08-16-ap-1b5pcLzHzz0oBoIUgAixsQ.md)
+- [Two processes with child-side leaf encoding, 32 simulations](2026-08-16-ap-2WsEruDiCINO7HoSDgKMP4.md)
 - [Cross-run conclusions and next experiments](optimization-progress.md)
 
 ## Measurement conventions
