@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import queue
+import time
 import traceback
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from multiprocessing import get_context
@@ -22,7 +24,7 @@ from pink_elephant.mcts import (
     MCTSNode,
     MCTSRootSummary,
     PolicyValuePrediction,
-    run_mcts,
+    run_mcts_batch,
     summarize_root,
 )
 
@@ -48,8 +50,8 @@ class SearchRequest:
 
 @dataclass(frozen=True, slots=True)
 class _SearchTask:
-    task_id: int
-    request: SearchRequest
+    task_ids: tuple[int, ...]
+    requests: tuple[SearchRequest, ...]
     config: MCTSConfig
 
 
@@ -61,52 +63,71 @@ class _StopProcess:
 @dataclass(frozen=True, slots=True)
 class _InferenceRequest:
     process_index: int
-    request_id: str
-    board: chess.Board
+    requests: tuple[BatchEvaluationRequest, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _InferenceResponse:
-    prediction: PolicyValuePrediction
+    predictions: tuple[tuple[str, PolicyValuePrediction], ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _SearchCompleted:
     process_index: int
-    task_id: int
-    summary: MCTSRootSummary
+    task_ids: tuple[int, ...]
+    summaries: tuple[MCTSRootSummary, ...]
+    search_seconds: float
+    prediction_wait_seconds: float
+    inference_batch_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class _SearchFailed:
     process_index: int
-    task_id: int
+    task_ids: tuple[int, ...]
     error: str
 
 
-class _BrokerClientEvaluator:
-    """Synchronous child-side evaluator backed by parent-process queues."""
+class _BrokerClientEvaluator(BatchedPolicyValueEvaluator):
+    """Synchronous child-side batch evaluator backed by parent-process queues."""
 
     def __init__(self, process_index: int, event_queue: Queue, command_queue: Queue) -> None:
         self._process_index = process_index
         self._event_queue = event_queue
         self._command_queue = command_queue
         self._request_count = 0
+        self.prediction_wait_seconds = 0.0
+        self.batch_count = 0
 
-    def __call__(self, board: chess.Board) -> PolicyValuePrediction:
-        request_id = f"process-{self._process_index:04d}-request-{self._request_count:08d}"
-        self._request_count += 1
+    def __call__(
+        self, requests: Sequence[BatchEvaluationRequest]
+    ) -> Mapping[str, PolicyValuePrediction]:
+        broker_requests: list[BatchEvaluationRequest] = []
+        local_ids_by_broker_id: dict[str, str] = {}
+        for request in requests:
+            broker_id = f"process-{self._process_index:04d}-request-{self._request_count:08d}"
+            self._request_count += 1
+            broker_requests.append(BatchEvaluationRequest(broker_id, request.board))
+            local_ids_by_broker_id[broker_id] = request.request_id
+        wait_started = time.perf_counter()
         self._event_queue.put(
             _InferenceRequest(
                 process_index=self._process_index,
-                request_id=request_id,
-                board=board,
+                requests=tuple(broker_requests),
             )
         )
         response = self._command_queue.get()
+        self.prediction_wait_seconds += time.perf_counter() - wait_started
+        self.batch_count += 1
         if not isinstance(response, _InferenceResponse):
             raise RuntimeError("MCTS process received an invalid inference response")
-        return response.prediction
+        predictions = dict(response.predictions)
+        if set(predictions) != set(local_ids_by_broker_id):
+            raise RuntimeError("MCTS process received predictions for invalid request IDs")
+        return {
+            local_ids_by_broker_id[broker_id]: prediction
+            for broker_id, prediction in predictions.items()
+        }
 
 
 def _apply_root_noise(root_node: MCTSNode, root_noise: RootPriorNoise) -> None:
@@ -135,25 +156,35 @@ def _run_search_process(
         if not isinstance(command, _SearchTask):
             raise RuntimeError("MCTS process received an invalid search command")
         try:
-            root_noise = command.request.root_noise
-            root = run_mcts(
-                command.request.board,
+            search_started = time.perf_counter()
+            wait_seconds_before = evaluator.prediction_wait_seconds
+            batch_count_before = evaluator.batch_count
+            roots = run_mcts_batch(
+                tuple(request.board for request in command.requests),
                 evaluator,
                 command.config,
-                root_prior_modifier=lambda node, noise=root_noise: _apply_root_noise(node, noise),
+                root_prior_modifiers=tuple(
+                    lambda node, noise=request.root_noise: _apply_root_noise(node, noise)
+                    for request in command.requests
+                ),
             )
             event_queue.put(
                 _SearchCompleted(
                     process_index=process_index,
-                    task_id=command.task_id,
-                    summary=summarize_root(root),
+                    task_ids=command.task_ids,
+                    summaries=tuple(summarize_root(root) for root in roots),
+                    search_seconds=time.perf_counter() - search_started,
+                    prediction_wait_seconds=(
+                        evaluator.prediction_wait_seconds - wait_seconds_before
+                    ),
+                    inference_batch_count=evaluator.batch_count - batch_count_before,
                 )
             )
         except Exception:
             event_queue.put(
                 _SearchFailed(
                     process_index=process_index,
-                    task_id=command.task_id,
+                    task_ids=command.task_ids,
                     error=traceback.format_exc(),
                 )
             )
@@ -167,13 +198,22 @@ class MultiprocessMCTSSearch:
         self,
         evaluator: BatchedPolicyValueEvaluator,
         process_count: int,
+        trees_per_process: int = 1,
         *,
         multiprocessing_context: BaseContext | None = None,
     ) -> None:
         if process_count < 1:
             raise ValueError("MCTS process_count must be positive")
+        if trees_per_process < 1:
+            raise ValueError("MCTS trees_per_process must be positive")
         self._evaluator = evaluator
         self.process_count = process_count
+        self.trees_per_process = trees_per_process
+        self.child_search_seconds = 0.0
+        self.child_prediction_wait_seconds = 0.0
+        self.child_inference_batch_count = 0
+        self.broker_peer_wait_seconds = 0.0
+        self.broker_batch_count = 0
         self._context = multiprocessing_context or get_context("spawn")
         self._event_queue: Queue = self._context.Queue()
         self._command_queues: tuple[Queue, ...] = tuple(
@@ -216,23 +256,28 @@ class MultiprocessMCTSSearch:
             raise RuntimeError("MCTS process pool must be entered before searching")
         if not requests:
             return ()
-        next_task_id = 0
-        active: dict[int, int] = {}
+        task_groups = deque(
+            _group_task_ids(len(requests), self.process_count, self.trees_per_process)
+        )
+        active: dict[int, tuple[int, ...]] = {}
         waiting: dict[int, _InferenceRequest] = {}
         completed: dict[int, MCTSRootSummary] = {}
+        peer_wait_started: float | None = None
 
         def dispatch(process_index: int) -> None:
-            nonlocal next_task_id
-            if next_task_id >= len(requests):
+            if not task_groups:
                 return
-            task_id = next_task_id
-            next_task_id += 1
-            active[process_index] = task_id
+            task_ids = task_groups.popleft()
+            active[process_index] = task_ids
             self._command_queues[process_index].put(
-                _SearchTask(task_id=task_id, request=requests[task_id], config=config)
+                _SearchTask(
+                    task_ids=task_ids,
+                    requests=tuple(requests[task_id] for task_id in task_ids),
+                    config=config,
+                )
             )
 
-        for process_index in range(min(self.process_count, len(requests))):
+        for process_index in range(min(self.process_count, len(task_groups))):
             dispatch(process_index)
 
         while active:
@@ -241,41 +286,57 @@ class MultiprocessMCTSSearch:
                 if isinstance(event, _InferenceRequest):
                     if event.process_index not in active or event.process_index in waiting:
                         raise RuntimeError("received an out-of-sequence MCTS inference request")
+                    if not event.requests:
+                        raise RuntimeError("received an empty MCTS inference request")
+                    if not waiting:
+                        peer_wait_started = time.perf_counter()
                     waiting[event.process_index] = event
                 elif isinstance(event, _SearchCompleted):
-                    expected_task_id = active.pop(event.process_index, None)
-                    if expected_task_id != event.task_id:
+                    expected_task_ids = active.pop(event.process_index, None)
+                    if expected_task_ids != event.task_ids:
                         raise RuntimeError("received an out-of-sequence MCTS search result")
-                    completed[event.task_id] = event.summary
+                    if len(event.summaries) != len(event.task_ids):
+                        raise RuntimeError("MCTS process returned the wrong summary count")
+                    self.child_search_seconds += event.search_seconds
+                    self.child_prediction_wait_seconds += event.prediction_wait_seconds
+                    self.child_inference_batch_count += event.inference_batch_count
+                    completed.update(zip(event.task_ids, event.summaries, strict=True))
                     dispatch(event.process_index)
                 elif isinstance(event, _SearchFailed):
                     raise RuntimeError(
-                        f"MCTS process {event.process_index} failed task {event.task_id}:\n"
+                        f"MCTS process {event.process_index} failed tasks {event.task_ids}:\n"
                         f"{event.error}"
                     )
                 else:
                     raise RuntimeError("received an unknown MCTS process event")
 
             if waiting:
+                if peer_wait_started is None:
+                    raise RuntimeError("missing MCTS broker peer-wait start time")
+                self.broker_peer_wait_seconds += time.perf_counter() - peer_wait_started
+                self.broker_batch_count += 1
+                peer_wait_started = None
                 ordered_waiting = tuple(waiting[index] for index in sorted(waiting))
-                predictions = self._evaluator(
-                    tuple(
-                        BatchEvaluationRequest(
-                            request_id=request.request_id,
-                            board=request.board,
-                        )
-                        for request in ordered_waiting
-                    )
+                inference_requests = tuple(
+                    request
+                    for process_request in ordered_waiting
+                    for request in process_request.requests
                 )
-                expected_ids = {request.request_id for request in ordered_waiting}
+                predictions = self._evaluator(inference_requests)
+                expected_ids = {request.request_id for request in inference_requests}
                 if set(predictions) != expected_ids:
                     raise ValueError(
                         "inference broker must return exactly the requested IDs; "
                         f"expected={sorted(expected_ids)}, got={sorted(predictions)}"
                     )
-                for request in ordered_waiting:
-                    self._command_queues[request.process_index].put(
-                        _InferenceResponse(prediction=predictions[request.request_id])
+                for process_request in ordered_waiting:
+                    self._command_queues[process_request.process_index].put(
+                        _InferenceResponse(
+                            predictions=tuple(
+                                (request.request_id, predictions[request.request_id])
+                                for request in process_request.requests
+                            )
+                        )
                     )
                 waiting.clear()
 
@@ -306,6 +367,26 @@ class MultiprocessMCTSSearch:
                 process.terminate()
                 process.join(timeout=5.0)
         self._processes = ()
+
+
+def _group_task_ids(
+    task_count: int,
+    process_count: int,
+    trees_per_process: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Group roots into balanced process waves without idling available processes."""
+
+    groups: list[tuple[int, ...]] = []
+    next_task_id = 0
+    while next_task_id < task_count:
+        wave_size = min(task_count - next_task_id, process_count * trees_per_process)
+        group_count = min(process_count, wave_size)
+        minimum_group_size, larger_group_count = divmod(wave_size, group_count)
+        for group_index in range(group_count):
+            group_size = minimum_group_size + int(group_index < larger_group_count)
+            groups.append(tuple(range(next_task_id, next_task_id + group_size)))
+            next_task_id += group_size
+    return tuple(groups)
 
 
 def validate_root_noise(root_noise: RootPriorNoise) -> None:

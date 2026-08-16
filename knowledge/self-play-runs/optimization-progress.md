@@ -2,6 +2,44 @@
 
 ## Evidence accumulated so far
 
+### Grouping two trees per process works, with a modest matched gain
+
+The grouped `2 processes × 2 trees` implementation completed cleanly at both 32 and 128
+simulations. The closest matched completed comparison is one worker, four active games, and 32
+simulations:
+
+| Search layout | Positions/s | End-to-end positions/s | Average model batch | Model fraction |
+| --- | ---: | ---: | ---: | ---: |
+| `1 process × 4 trees` | 4.1678 | 3.7319 | 3.6591 | 12.04% |
+| `2 processes × 2 trees` | 4.3864 | 3.8471 | 3.5471 | 18.68% |
+
+Grouped search improved committed worker throughput by 5.24% and end-to-end throughput by 3.09%.
+The game-length distributions were reasonably similar, but the runs still used distinct generation
+identities and GPU batching can introduce small numerical trajectory differences. The logs do not
+record source commit SHAs, so the comparison cannot prove that unrelated code was identical.
+
+The 128-simulation grouped run completed 1,262 positions at 1.0137 positions/s. This is roughly 7%
+above the stopped `2 × 1` run's productive live rate after simulation-count normalization, but that
+comparison is not clean because the earlier result was partial and used eight active games.
+
+The batch protocol itself behaved correctly. Both first waves were entirely batch four, and the
+full-pool average was approximately 3.74–3.77. Atomic completion tails reduced the final averages
+to 3.547 and 3.522.
+
+### Broker synchronization is now directly measured
+
+| Simulations | Broker peer wait / wall | Child prediction wait / child search | Summed child search / wall |
+| ---: | ---: | ---: | ---: |
+| 32 | 34.38% | 48.52% | 1.88 |
+| 128 | 47.36% | 48.03% | 1.94 |
+
+The child searches covered nearly two process-wall equivalents, but roughly half of their summed
+search time was prediction wait rather than CPU execution. At 128 simulations, parent encoding was
+only 1.02% of wall time and legal-policy processing was 3.11%, while broker peer-wait was 47.36%.
+Moving encoding into children remains directionally sound because it avoids board-history
+serialization and parent work, but these measurements suggest that strict synchronization and IPC
+latency deserve equal or higher priority.
+
 ### Model batching improved without improving output throughput
 
 The cleanest matched comparison is one worker at 32 simulations:
@@ -53,7 +91,7 @@ speedup of 1.293×.
 
 ## Recommended implementation order
 
-### 1. Use two processes with two batched trees each
+### 1. Use two processes with two batched trees each — completed
 
 Each child should call `run_mcts_batch` for two games and send a two-leaf request. The parent broker
 should flatten the two child mini-batches into a model batch of up to four and partition predictions
@@ -66,13 +104,15 @@ process 2: games C + D --+
 ```
 
 This preserves two-core tree execution, restores the best observed batch-size-four shape, and
-amortizes IPC across two leaves. Test `2 processes × 2 trees` before `2 × 4`.
+amortizes IPC across two leaves. Completed runs confirm a steady-state batch near four and a modest
+5.24% throughput gain in the closest 32-simulation comparison.
 
-### 2. Encode leaves in child processes
+### 2. Reduce broker latency and encode leaves in child processes
 
 Send encoded model inputs and legal action indices rather than complete `chess.Board` objects. This
 moves encoding onto both CPU cores, avoids serial parent encoding, and reduces repeated board-history
-serialization. Send multiple encoded leaves in one message where possible.
+serialization. Send multiple encoded leaves in one message where possible. Preserve the current
+timers and separately measure queue send/serialization time so improvements can be attributed.
 
 ### 3. Add phase and utilization metrics
 
