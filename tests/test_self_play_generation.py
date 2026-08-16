@@ -50,8 +50,10 @@ from pink_elephant.self_play.generation.manifests import (
 from pink_elephant.self_play.generation.modal_app import (
     SELF_PLAY_CPU,
     SELF_PLAY_L4_GPU,
+    SELF_PLAY_MCTS_PROCESS_COUNT,
     _mounted_checkpoint_path,
 )
+from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
 from pink_elephant.self_play.generation.scheduler import GenerationCoordinator
 from pink_elephant.self_play.generation.shards import (
     iter_replay_rows,
@@ -436,6 +438,30 @@ def test_worker_completion_metrics_report_model_batching(tmp_path: Path) -> None
     assert fields["model_positions_per_second"] > 0
 
 
+def test_worker_runs_games_through_multiprocess_search(tmp_path: Path) -> None:
+    generation = _smoke_generation()
+    round_spec = replace(
+        _smoke_round(generation, "worker-process-search", requested_positions=8),
+        active_games_per_worker=2,
+    )
+    worker = replace(
+        _smoke_worker(generation, round_spec),
+        max_game_attempts=2,
+    )
+    evaluator = FoolsmateEvaluator()
+
+    with MultiprocessMCTSSearch(evaluator, process_count=2) as process_search:
+        result = run_worker(
+            worker,
+            evaluator,
+            tmp_path,
+            process_search=process_search,
+        )
+
+    assert result.completed_game_count == 2
+    assert result.position_count == 8
+
+
 def test_worker_retries_truncated_games_and_records_failure_count(tmp_path: Path) -> None:
     generation = _smoke_generation()
     round_spec = _smoke_round(generation, "worker-retry")
@@ -745,6 +771,7 @@ def test_modal_generation_defaults_to_one_l4_worker_with_two_cpus_and_two_games(
     assert args.worker_count == GENERATION_1_WORKER_COUNT == 1
     assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 2
     assert SELF_PLAY_CPU == 2.0
+    assert SELF_PLAY_MCTS_PROCESS_COUNT == 2
 
 
 @pytest.mark.parametrize(

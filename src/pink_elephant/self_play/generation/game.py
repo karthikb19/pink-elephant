@@ -16,8 +16,10 @@ from pink_elephant.mcts import (
     BatchedPolicyValueEvaluator,
     MCTSConfig,
     MCTSNode,
+    MCTSRootSummary,
     root_visit_distribution,
     run_mcts_batch,
+    summarize_root,
 )
 from pink_elephant.self_play.contracts import GameRecord, ReplayRow, SparsePolicyEntry
 from pink_elephant.self_play.generation.config import GenerationSpec
@@ -84,42 +86,52 @@ def select_action_from_root(
 ) -> int:
     """Select an action from visits while retaining raw visits as the target."""
 
-    if not root_node.children_by_action_index:
+    return select_action_from_summary(
+        summarize_root(root_node), temperature=temperature, rng=rng, greedy=greedy
+    )
+
+
+def select_action_from_summary(
+    summary: MCTSRootSummary,
+    *,
+    temperature: float,
+    rng: Random,
+    greedy: bool = False,
+) -> int:
+    """Select an action from compact root statistics."""
+
+    if not summary.actions:
         raise ValueError("cannot select an action from an unexpanded root")
     if not greedy and (not math.isfinite(temperature) or temperature <= 0):
         raise ValueError("temperature must be finite and positive")
-    action_indices = tuple(sorted(root_node.children_by_action_index))
+    actions = tuple(sorted(summary.actions, key=lambda action: action.action_index))
     if greedy:
         return max(
-            action_indices,
-            key=lambda action_index: (
-                root_node.children_by_action_index[action_index].visit_count,
-                root_node.children_by_action_index[action_index].prior_probability,
-                -action_index,
+            actions,
+            key=lambda action: (
+                action.visit_count,
+                action.prior_probability,
+                -action.action_index,
             ),
-        )
-    visits = tuple(
-        root_node.children_by_action_index[index].visit_count for index in action_indices
-    )
+        ).action_index
+    visits = tuple(action.visit_count for action in actions)
     if temperature == 1.0:
         weights = tuple(float(visit) for visit in visits)
     else:
         weights = tuple(float(visit) ** (1.0 / temperature) for visit in visits)
     total = sum(weights)
     if total <= 0 or not math.isfinite(total):
-        weights = tuple(
-            root_node.children_by_action_index[index].prior_probability for index in action_indices
-        )
+        weights = tuple(action.prior_probability for action in actions)
         total = sum(weights)
     if total <= 0 or not math.isfinite(total):
         raise ValueError("root selection weights must have a finite positive total")
     threshold = rng.random() * total
     cumulative = 0.0
-    for action_index, weight in zip(action_indices, weights, strict=True):
+    for action, weight in zip(actions, weights, strict=True):
         cumulative += weight
         if threshold < cumulative:
-            return action_index
-    return action_indices[-1]
+            return action.action_index
+    return actions[-1].action_index
 
 
 def complete_game(
