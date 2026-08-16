@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from random import Random
@@ -22,6 +22,7 @@ from pink_elephant.encoding import encode_board, encode_model_input
 from pink_elephant.mcts import (
     BatchedPolicyValueEvaluator,
     BatchEvaluationRequest,
+    EncodedBatchEvaluationRequest,
     MCTSConfig,
     PolicyValuePrediction,
     root_summary_visit_distribution,
@@ -73,13 +74,15 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         self.model.eval()
 
     def __call__(
-        self, requests: tuple[BatchEvaluationRequest, ...]
+        self,
+        requests: Sequence[BatchEvaluationRequest | EncodedBatchEvaluationRequest],
     ) -> Mapping[str, PolicyValuePrediction]:
         if not requests:
             return {}
         started = time.perf_counter()
         encoding_started = started
-        positions = np.stack([encode_model_input(request.board) for request in requests], axis=0)
+        model_inputs = tuple(_model_input_for_request(request) for request in requests)
+        positions = np.stack([model_input[0] for model_input in model_inputs], axis=0)
         self.encoding_seconds += time.perf_counter() - encoding_started
         inputs = torch.from_numpy(positions).to(self.device)
         with torch.inference_mode():
@@ -94,8 +97,9 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         self.elapsed_seconds += time.perf_counter() - started
         legal_policy_started = time.perf_counter()
         predictions: dict[str, PolicyValuePrediction] = {}
-        for row_index, request in enumerate(requests):
-            action_indices = tuple(sorted(legal_policy_indices(request.board)))
+        for row_index, (request, (_, action_indices)) in enumerate(
+            zip(requests, model_inputs, strict=True)
+        ):
             index_tensor = torch.tensor(action_indices, device=policy_logits.device)
             legal_logits = policy_logits[row_index].index_select(0, index_tensor).cpu().tolist()
             predictions[request.request_id] = PolicyValuePrediction(
@@ -104,6 +108,18 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
             )
         self.legal_policy_seconds += time.perf_counter() - legal_policy_started
         return predictions
+
+
+def _model_input_for_request(
+    request: BatchEvaluationRequest | EncodedBatchEvaluationRequest,
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """Return model-ready data without reconstructing a board in the parent."""
+
+    if isinstance(request, EncodedBatchEvaluationRequest):
+        return request.encoded_position, request.legal_action_indices
+    if isinstance(request, BatchEvaluationRequest):
+        return encode_model_input(request.board), tuple(sorted(legal_policy_indices(request.board)))
+    raise TypeError(f"unsupported model evaluation request: {type(request).__name__}")
 
 
 def load_generation_evaluator(
