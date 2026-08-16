@@ -3,7 +3,7 @@ import math
 import chess
 import pytest
 
-from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, move_to_policy_index
+from pink_elephant.action_mapping import legal_policy_indices, move_to_policy_index
 from pink_elephant.mcts import (
     MCTSConfig,
     MCTSNode,
@@ -16,17 +16,18 @@ from pink_elephant.mcts import (
 )
 
 
-def _uniform_prediction(_board: chess.Board) -> PolicyValuePrediction:
-    return PolicyValuePrediction(policy_logits=[0.0] * POLICY_SIZE, value=0.0)
+def _uniform_prediction(board: chess.Board) -> PolicyValuePrediction:
+    return PolicyValuePrediction(
+        legal_policy_logits={index: 0.0 for index in legal_policy_indices(board)}, value=0.0
+    )
 
 
 def _prediction_with_logits(
-    action_logits: dict[int, float], value: float = 0.0
+    board: chess.Board, action_logits: dict[int, float], value: float = 0.0
 ) -> PolicyValuePrediction:
-    policy_logits = [0.0] * POLICY_SIZE
-    for action_index, logit in action_logits.items():
-        policy_logits[action_index] = logit
-    return PolicyValuePrediction(policy_logits=policy_logits, value=value)
+    legal_logits = {index: 0.0 for index in legal_policy_indices(board)}
+    legal_logits.update(action_logits)
+    return PolicyValuePrediction(legal_policy_logits=legal_logits, value=value)
 
 
 def test_default_search_expands_legal_actions_and_preserves_root_board() -> None:
@@ -58,7 +59,10 @@ def test_first_simulation_evaluates_only_the_root_and_backs_up_its_value() -> No
 
     def evaluator(evaluated_board: chess.Board) -> PolicyValuePrediction:
         evaluator_boards.append(evaluated_board)
-        return PolicyValuePrediction(policy_logits=[0.0] * POLICY_SIZE, value=0.25)
+        return PolicyValuePrediction(
+            legal_policy_logits={index: 0.0 for index in legal_policy_indices(evaluated_board)},
+            value=0.25,
+        )
 
     root_node = run_mcts(board, evaluator, MCTSConfig(num_simulations=1))
 
@@ -71,15 +75,13 @@ def test_first_simulation_evaluates_only_the_root_and_backs_up_its_value() -> No
     )
 
 
-def test_policy_logits_are_masked_to_legal_actions() -> None:
+def test_prediction_expands_only_legal_actions() -> None:
     board = chess.Board()
     illegal_action_index = 0
     assert illegal_action_index not in legal_policy_indices(board)
 
-    def evaluator(_board: chess.Board) -> PolicyValuePrediction:
-        policy_logits = [0.0] * POLICY_SIZE
-        policy_logits[illegal_action_index] = 100.0
-        return PolicyValuePrediction(policy_logits=policy_logits, value=0.0)
+    def evaluator(evaluated_board: chess.Board) -> PolicyValuePrediction:
+        return _uniform_prediction(evaluated_board)
 
     root_node = run_mcts(board, evaluator, MCTSConfig(num_simulations=1))
     child_priors = [
@@ -166,11 +168,9 @@ def test_backup_switches_value_perspective_between_parent_and_child() -> None:
 
     def evaluator(board: chess.Board) -> PolicyValuePrediction:
         evaluator_calls.append(board.turn)
-        policy_logits = [0.0] * POLICY_SIZE
         if board.turn == chess.WHITE:
-            policy_logits[selected_action_index] = 10.0
-            return PolicyValuePrediction(policy_logits=policy_logits, value=0.0)
-        return PolicyValuePrediction(policy_logits=policy_logits, value=0.75)
+            return _prediction_with_logits(board, {selected_action_index: 10.0})
+        return _prediction_with_logits(board, {}, value=0.75)
 
     root_node = run_mcts(chess.Board(), evaluator, MCTSConfig(num_simulations=2))
     child_node = root_node.children_by_action_index[selected_action_index]
@@ -214,7 +214,9 @@ def test_masked_softmax_assigns_exact_relative_priors_to_legal_actions() -> None
 
     root_node = run_mcts(
         board,
-        lambda _board: _prediction_with_logits({doubled_probability_action: math.log(2)}),
+        lambda evaluated_board: _prediction_with_logits(
+            evaluated_board, {doubled_probability_action: math.log(2)}
+        ),
         MCTSConfig(num_simulations=1),
     )
 
@@ -256,7 +258,7 @@ def test_terminal_child_is_backed_up_without_a_second_evaluator_call() -> None:
 
     def evaluator(evaluated_board: chess.Board) -> PolicyValuePrediction:
         evaluator_boards.append(evaluated_board)
-        return _prediction_with_logits({checkmating_action_index: 10.0})
+        return _prediction_with_logits(evaluated_board, {checkmating_action_index: 10.0})
 
     root_node = run_mcts(board, evaluator, MCTSConfig(num_simulations=2))
     child_node = root_node.children_by_action_index[checkmating_action_index]
@@ -353,27 +355,33 @@ def test_config_rejects_invalid_values() -> None:
         MCTSConfig(exploration_constant=math.inf)
 
 
-@pytest.mark.parametrize(
-    ("prediction", "message"),
-    (
-        (PolicyValuePrediction(policy_logits=[0.0], value=0.0), "policy_logits"),
-        (PolicyValuePrediction(policy_logits=[0.0] * POLICY_SIZE, value=2.0), "value"),
-    ),
-)
-def test_evaluator_output_is_validated(prediction: PolicyValuePrediction, message: str) -> None:
-    with pytest.raises(ValueError, match=message):
+def test_prediction_requires_exactly_the_legal_policy_logits() -> None:
+    prediction = PolicyValuePrediction(legal_policy_logits={}, value=0.0)
+
+    with pytest.raises(ValueError, match="legal_policy_logits"):
         run_mcts(chess.Board(), lambda _board: prediction, MCTSConfig(num_simulations=1))
+
+
+def test_prediction_value_is_validated() -> None:
+    board = chess.Board()
+    prediction = PolicyValuePrediction(
+        legal_policy_logits={index: 0.0 for index in legal_policy_indices(board)}, value=2.0
+    )
+
+    with pytest.raises(ValueError, match="value"):
+        run_mcts(board, lambda _board: prediction, MCTSConfig(num_simulations=1))
 
 
 @pytest.mark.parametrize("invalid_logit", (math.nan, math.inf, -math.inf))
 def test_non_finite_policy_logits_are_rejected(invalid_logit: float) -> None:
-    policy_logits = [0.0] * POLICY_SIZE
-    policy_logits[0] = invalid_logit
+    board = chess.Board()
+    policy_logits = {index: 0.0 for index in legal_policy_indices(board)}
+    policy_logits[next(iter(policy_logits))] = invalid_logit
 
     with pytest.raises(ValueError, match="finite"):
         run_mcts(
-            chess.Board(),
-            lambda _board: PolicyValuePrediction(policy_logits=policy_logits, value=0.0),
+            board,
+            lambda _board: PolicyValuePrediction(legal_policy_logits=policy_logits, value=0.0),
             MCTSConfig(num_simulations=1),
         )
 

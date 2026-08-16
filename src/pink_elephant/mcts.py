@@ -1,10 +1,10 @@
 """Single-process Monte Carlo tree search for chess positions.
 
-The evaluator supplied to :func:`run_mcts` returns policy logits for the
-fixed AlphaZero action space and a value from the current player's
-perspective. Each node stores statistics from the perspective of the player
-to move at that node, so PUCT negates a child value before comparing it with
-the parent.
+The evaluator supplied to :func:`run_mcts` returns policy logits keyed by the
+position's legal AlphaZero action indices and a value from the current player's
+perspective. Each node stores statistics from the perspective of the player to
+move at that node, so PUCT negates a child value before comparing it with the
+parent.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from typing import Protocol
 import chess
 
 from pink_elephant.action_mapping import (
-    POLICY_SIZE,
     legal_policy_indices,
     policy_index_to_move,
 )
@@ -43,9 +42,9 @@ class MCTSConfig:
 
 @dataclass(frozen=True, slots=True)
 class PolicyValuePrediction:
-    """Raw policy logits and a bounded value for the current player."""
+    """Legal-action policy logits and a bounded current-player value."""
 
-    policy_logits: Sequence[float]
+    legal_policy_logits: Mapping[int, float]
     value: float
 
 
@@ -53,7 +52,7 @@ class PolicyValueEvaluator(Protocol):
     """Callable contract used by MCTS for one-position evaluation."""
 
     def __call__(self, board: chess.Board) -> PolicyValuePrediction:
-        """Return policy logits and value for ``board``."""
+        """Return legal-action policy logits and a value for ``board``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,9 +307,9 @@ def _expand_with_prediction(node: MCTSNode, prediction: PolicyValuePrediction) -
         raise ValueError("cannot expand an already expanded node")
     if node.board.is_game_over(claim_draw=True):
         raise ValueError("terminal nodes must be evaluated with the exact game outcome")
-    policy_logits = _validated_policy_logits(prediction.policy_logits)
+    legal_policy_logits = _validated_legal_policy_logits(node.board, prediction.legal_policy_logits)
     value_prediction = _validated_value(prediction.value)
-    child_priors = _masked_softmax_prior_probabilities(node.board, policy_logits)
+    child_priors = _softmax_prior_probabilities(legal_policy_logits)
 
     for action_index, prior_probability in child_priors.items():
         move = policy_index_to_move(node.board, action_index)
@@ -326,17 +325,13 @@ def _expand_with_prediction(node: MCTSNode, prediction: PolicyValuePrediction) -
     return value_prediction
 
 
-def _masked_softmax_prior_probabilities(
-    board: chess.Board,
-    policy_logits: Sequence[float],
+def _softmax_prior_probabilities(
+    legal_policy_logits: Mapping[int, float],
 ) -> dict[int, float]:
-    """Normalize policy logits over legal actions only."""
+    """Normalize already-gathered legal-action policy logits."""
 
-    legal_action_indices = tuple(sorted(legal_policy_indices(board)))
-    if not legal_action_indices:
-        raise ValueError("cannot expand a non-terminal board with no legal actions")
-
-    legal_logits = tuple(policy_logits[action_index] for action_index in legal_action_indices)
+    legal_action_indices = tuple(sorted(legal_policy_logits))
+    legal_logits = tuple(legal_policy_logits[index] for index in legal_action_indices)
     maximum_legal_logit = max(legal_logits)
     unnormalized_probabilities = tuple(
         math.exp(logit - maximum_legal_logit) for logit in legal_logits
@@ -353,19 +348,24 @@ def _masked_softmax_prior_probabilities(
     }
 
 
-def _validated_policy_logits(policy_logits: Sequence[float]) -> tuple[float, ...]:
-    """Validate and materialize the fixed-size policy output."""
+def _validated_legal_policy_logits(
+    board: chess.Board, policy_logits: Mapping[int, float]
+) -> dict[int, float]:
+    """Validate and materialize only the logits usable in this position."""
 
+    expected_indices = set(legal_policy_indices(board))
+    if not expected_indices:
+        raise ValueError("cannot expand a non-terminal board with no legal actions")
+    if set(policy_logits) != expected_indices:
+        raise ValueError("legal_policy_logits must contain exactly the board's legal actions")
     try:
-        materialized_logits = tuple(float(logit) for logit in policy_logits)
+        materialized_logits = {
+            action_index: float(policy_logits[action_index]) for action_index in expected_indices
+        }
     except (TypeError, ValueError) as error:
-        raise ValueError("policy_logits must contain numeric values") from error
-    if len(materialized_logits) != POLICY_SIZE:
-        raise ValueError(
-            f"policy_logits must contain {POLICY_SIZE} values, got {len(materialized_logits)}"
-        )
-    if not all(math.isfinite(logit) for logit in materialized_logits):
-        raise ValueError("policy_logits must contain only finite values")
+        raise ValueError("legal_policy_logits must contain numeric values") from error
+    if not all(math.isfinite(logit) for logit in materialized_logits.values()):
+        raise ValueError("legal_policy_logits must contain only finite values")
     return materialized_logits
 
 
