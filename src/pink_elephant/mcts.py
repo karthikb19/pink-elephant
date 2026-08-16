@@ -48,6 +48,22 @@ class PolicyValuePrediction:
     value: float
 
 
+@dataclass(frozen=True, slots=True)
+class RootActionStatistics:
+    """Compact root statistics safe to return across a process boundary."""
+
+    action_index: int
+    visit_count: int
+    prior_probability: float
+
+
+@dataclass(frozen=True, slots=True)
+class MCTSRootSummary:
+    """The root-only MCTS result needed for policy targets and move selection."""
+
+    actions: tuple[RootActionStatistics, ...]
+
+
 class PolicyValueEvaluator(Protocol):
     """Callable contract used by MCTS for one-position evaluation."""
 
@@ -256,6 +272,39 @@ def root_visit_distribution(root_node: MCTSNode) -> dict[int, float]:
     return {
         action_index: child_node.prior_probability / total_prior_probability
         for action_index, child_node in root_node.children_by_action_index.items()
+    }
+
+
+def summarize_root(root_node: MCTSNode) -> MCTSRootSummary:
+    """Discard the tree while retaining everything needed to play the root move."""
+
+    return MCTSRootSummary(
+        actions=tuple(
+            RootActionStatistics(
+                action_index=action_index,
+                visit_count=child.visit_count,
+                prior_probability=child.prior_probability,
+            )
+            for action_index, child in sorted(root_node.children_by_action_index.items())
+        )
+    )
+
+
+def root_summary_visit_distribution(summary: MCTSRootSummary) -> dict[int, float]:
+    """Return a normalized visit target from compact root statistics."""
+
+    if not summary.actions:
+        return {}
+    total_visits = sum(action.visit_count for action in summary.actions)
+    if total_visits > 0:
+        return {
+            action.action_index: action.visit_count / total_visits for action in summary.actions
+        }
+    total_prior = sum(action.prior_probability for action in summary.actions)
+    if total_prior <= 0 or not math.isfinite(total_prior):
+        raise ValueError("root action priors must have a positive finite total")
+    return {
+        action.action_index: action.prior_probability / total_prior for action in summary.actions
     }
 
 

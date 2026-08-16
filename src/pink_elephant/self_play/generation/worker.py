@@ -24,8 +24,9 @@ from pink_elephant.mcts import (
     BatchEvaluationRequest,
     MCTSConfig,
     PolicyValuePrediction,
-    root_visit_distribution,
+    root_summary_visit_distribution,
     run_mcts_batch,
+    summarize_root,
 )
 from pink_elephant.model import ModelOutput
 from pink_elephant.self_play.contracts import (
@@ -40,9 +41,14 @@ from pink_elephant.self_play.generation.game import (
     PendingPosition,
     complete_game,
     make_root_dirichlet_modifier,
-    select_action_from_root,
+    select_action_from_summary,
 )
 from pink_elephant.self_play.generation.observability import configure_logging, log_event
+from pink_elephant.self_play.generation.process_search import (
+    MultiprocessMCTSSearch,
+    RootPriorNoise,
+    SearchRequest,
+)
 from pink_elephant.self_play.generation.shards import (
     ReplayShardBuilder,
     sha256_file,
@@ -143,6 +149,8 @@ def run_worker(
     worker: WorkerSpec,
     evaluator: BatchedPolicyValueEvaluator,
     output_root: Path,
+    *,
+    process_search: MultiprocessMCTSSearch | None = None,
 ) -> WorkerResult:
     """Generate complete games, publish validated shards, then write the result last."""
 
@@ -155,6 +163,7 @@ def run_worker(
             "active_games": worker.round.active_games_per_worker,
             "generation_id": worker.generation.generation_id,
             "invocation_id": worker.invocation_id,
+            "mcts_process_count": 1 if process_search is None else process_search.process_count,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
             "simulations_per_move": worker.generation.simulations_per_move,
@@ -241,19 +250,26 @@ def run_worker(
             continue
 
         search_started = time.perf_counter()
-        roots = run_mcts_batch(
-            tuple(game.board for game in active),
-            evaluator,
-            mcts_config,
-            root_prior_modifiers=tuple(
-                make_root_dirichlet_modifier(
-                    game.noise_rng,
-                    alpha=worker.generation.dirichlet_alpha,
-                    fraction=worker.generation.dirichlet_fraction,
-                )
-                for game in active
-            ),
-        )
+        if process_search is None:
+            roots = run_mcts_batch(
+                tuple(game.board for game in active),
+                evaluator,
+                mcts_config,
+                root_prior_modifiers=tuple(
+                    make_root_dirichlet_modifier(
+                        game.noise_rng,
+                        alpha=worker.generation.dirichlet_alpha,
+                        fraction=worker.generation.dirichlet_fraction,
+                    )
+                    for game in active
+                ),
+            )
+            summaries = tuple(summarize_root(root) for root in roots)
+        else:
+            summaries = process_search.search(
+                tuple(_process_search_request(game, worker) for game in active),
+                mcts_config,
+            )
         search_batch_count += 1
         search_finished = time.perf_counter()
         if search_batch_count == 1 or search_finished - last_search_log_at >= 30:
@@ -266,6 +282,7 @@ def run_worker(
                 "in_flight_position_count": sum(len(game.pending_positions) for game in active),
                 "maximum_active_ply": max(game.board.ply() for game in active),
                 "minimum_active_ply": min(game.board.ply() for game in active),
+                "mcts_process_count": 1 if process_search is None else process_search.process_count,
                 "position_lower_bound": worker.position_lower_bound,
                 "round_id": worker.round.round_id,
                 "search_batch_count": search_batch_count,
@@ -281,18 +298,20 @@ def run_worker(
             log_event(logger, "worker_search_progress", fields)
             last_search_log_at = search_finished
         finished: list[_ActiveGame] = []
-        for game, root in zip(active, roots, strict=True):
+        for game, summary in zip(active, summaries, strict=True):
             policy = tuple(
                 _policy_entry(action_index, probability)
-                for action_index, probability in sorted(root_visit_distribution(root).items())
+                for action_index, probability in sorted(
+                    root_summary_visit_distribution(summary).items()
+                )
             )
             temperature = (
                 worker.generation.opening_temperature
                 if game.board.ply() < worker.generation.temperature_cutoff_ply
                 else 1.0
             )
-            selected_action_index = select_action_from_root(
-                root,
+            selected_action_index = select_action_from_summary(
+                summary,
                 temperature=temperature,
                 rng=game.temperature_rng,
                 greedy=game.board.ply() >= worker.generation.temperature_cutoff_ply,
@@ -496,3 +515,20 @@ def _move_for_action(board: chess.Board, action_index: int) -> chess.Move:
     from pink_elephant.action_mapping import policy_index_to_move
 
     return policy_index_to_move(board, action_index)
+
+
+def _process_search_request(game: _ActiveGame, worker: WorkerSpec) -> SearchRequest:
+    action_indices = tuple(sorted(legal_policy_indices(game.board)))
+    noise = game.noise_rng.dirichlet(
+        np.full(len(action_indices), worker.generation.dirichlet_alpha, dtype=np.float64)
+    )
+    return SearchRequest(
+        board=game.board.copy(stack=True),
+        root_noise=RootPriorNoise(
+            probabilities=tuple(
+                (action_index, float(probability))
+                for action_index, probability in zip(action_indices, noise, strict=True)
+            ),
+            fraction=worker.generation.dirichlet_fraction,
+        ),
+    )
