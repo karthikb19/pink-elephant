@@ -153,6 +153,7 @@ def run_worker(
             "invocation_id": worker.invocation_id,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
+            "simulations_per_move": worker.generation.simulations_per_move,
             "worker_id": worker.worker_id,
         },
     )
@@ -408,17 +409,37 @@ def run_worker(
     log_event(
         logger,
         "worker_completed",
-        {
-            "completed_game_count": result.completed_game_count,
-            "elapsed_seconds": result.elapsed_seconds,
-            "failed_game_count": result.failed_game_count,
-            "position_count": result.position_count,
-            "result_path": result.result_path,
-            "round_id": result.round_id,
-            "worker_id": result.worker_id,
-        },
+        _completion_log_fields(result, evaluator),
     )
     return result
+
+
+def _completion_log_fields(
+    result: WorkerResult,
+    evaluator: BatchedPolicyValueEvaluator,
+) -> dict[str, float | int | str]:
+    """Build comparable throughput metrics for a completed worker."""
+
+    fields: dict[str, float | int | str] = {
+        "completed_game_count": result.completed_game_count,
+        "elapsed_seconds": result.elapsed_seconds,
+        "failed_game_count": result.failed_game_count,
+        "position_count": result.position_count,
+        "positions_per_second": result.position_count / result.elapsed_seconds,
+        "result_path": result.result_path,
+        "round_id": result.round_id,
+        "worker_id": result.worker_id,
+    }
+    if isinstance(evaluator, ModelBatchEvaluator):
+        fields.update(
+            average_model_batch_size=evaluator.position_count / evaluator.batch_count,
+            model_batch_count=evaluator.batch_count,
+            model_evaluation_fraction=evaluator.elapsed_seconds / result.elapsed_seconds,
+            model_evaluation_seconds=evaluator.elapsed_seconds,
+            model_position_count=evaluator.position_count,
+            model_positions_per_second=evaluator.position_count / evaluator.elapsed_seconds,
+        )
+    return fields
 
 
 def _invocation_root(output_root: Path, worker: WorkerSpec) -> Path:

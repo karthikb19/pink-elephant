@@ -26,7 +26,9 @@ from pink_elephant.self_play.contracts import (
 )
 from pink_elephant.self_play.generation import cli
 from pink_elephant.self_play.generation.config import (
+    GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     GENERATION_1_CHECKPOINT_SHA256,
+    GENERATION_1_WORKER_COUNT,
     GenerationRoundSpec,
     WorkerSpec,
     generation_1_spec,
@@ -40,7 +42,11 @@ from pink_elephant.self_play.generation.manifests import (
     load_worker_result,
     seal_round,
 )
-from pink_elephant.self_play.generation.modal_app import _mounted_checkpoint_path
+from pink_elephant.self_play.generation.modal_app import (
+    SELF_PLAY_CPU,
+    SELF_PLAY_L4_GPU,
+    _mounted_checkpoint_path,
+)
 from pink_elephant.self_play.generation.scheduler import GenerationCoordinator
 from pink_elephant.self_play.generation.shards import (
     iter_replay_rows,
@@ -52,6 +58,7 @@ from pink_elephant.self_play.generation.shards import (
 )
 from pink_elephant.self_play.generation.worker import (
     ModelBatchEvaluator,
+    _completion_log_fields,
     load_generation_evaluator,
     run_worker,
 )
@@ -290,10 +297,33 @@ def test_worker_emits_structured_progress_events(
     progress_events = [event for event in events if event["event"] == "worker_progress"]
 
     assert event_names[0] == "worker_started"
+    assert events[0]["simulations_per_move"] == 1
     assert search_events[0]["search_batch_count"] == 1
     assert search_events[0]["maximum_active_ply"] == 0
     assert progress_events[-1]["position_count"] == 4
     assert event_names[-1] == "worker_completed"
+    assert events[-1]["positions_per_second"] > 0
+
+
+def test_worker_completion_metrics_report_model_batching(tmp_path: Path) -> None:
+    generation = _smoke_generation()
+    worker = _smoke_worker(generation, _smoke_round(generation, "worker-metrics"))
+    result = _run_fools_mate_worker(tmp_path, worker)
+    model = RecordingModel()
+    evaluator = ModelBatchEvaluator(model)
+    requests = (
+        BatchEvaluationRequest("first", chess.Board()),
+        BatchEvaluationRequest("second", chess.Board()),
+    )
+
+    evaluator(requests)
+    fields = _completion_log_fields(result, evaluator)
+
+    assert fields["average_model_batch_size"] == 2.0
+    assert fields["model_batch_count"] == 1
+    assert fields["model_position_count"] == 2
+    assert fields["model_evaluation_fraction"] > 0
+    assert fields["model_positions_per_second"] > 0
 
 
 def test_worker_retries_truncated_games_and_records_failure_count(tmp_path: Path) -> None:
@@ -511,6 +541,8 @@ def test_cli_passes_generation_overrides_to_local_scheduler(
             str(tmp_path),
             "--round-id",
             "cli-success",
+            "--generation-id",
+            "generation-cli-test",
             "--requested-positions",
             "4",
             "--worker-count",
@@ -532,6 +564,7 @@ def test_cli_passes_generation_overrides_to_local_scheduler(
     assert exit_code == 0
     assert payload["event"] == "round_completed"
     assert round_spec.round_id == "cli-success"
+    assert round_spec.generation_id == generation.generation_id == "generation-cli-test"
     assert round_spec.worker_count == 1
     assert round_spec.shard_position_limit == 2
     assert generation.base_seed == 9
@@ -579,6 +612,29 @@ def test_cli_passes_l4_worker_selection_to_modal_launcher(
     assert exit_code == 0
     assert captured["worker_gpu"] == "L4"
     assert json.loads(capsys.readouterr().out)["event"] == "round_completed"
+
+
+def test_modal_generation_defaults_to_one_l4_worker_with_two_cpus_and_two_games() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        [
+            "generation",
+            "extend",
+            "--backend",
+            "modal",
+            "--round-id",
+            "resource-defaults",
+            "--requested-positions",
+            "4",
+        ]
+    )
+
+    assert args.worker_gpu == SELF_PLAY_L4_GPU
+    assert args.generation_id == "generation-000001"
+    assert args.worker_count == GENERATION_1_WORKER_COUNT == 1
+    assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 2
+    assert SELF_PLAY_CPU == 2.0
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-"""CPU Modal workers and coordinator for self-play generation rounds."""
+"""Modal workers and coordinator for self-play generation rounds."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     GENERATION_1_DIRICHLET_ALPHA,
     GENERATION_1_DIRICHLET_FRACTION,
+    GENERATION_1_ID,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
     GENERATION_1_SHARD_POSITION_LIMIT,
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
-SELF_PLAY_CPU: Final[float] = 4.0
+SELF_PLAY_CPU: Final[float] = 2.0
 SELF_PLAY_L4_GPU: Final[str] = "L4"
 SELF_PLAY_MEMORY_MB: Final[int] = 16 * 1024
 SELF_PLAY_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
@@ -274,7 +275,7 @@ def coordinate_generation_round(
     generation: GenerationSpec,
     round_spec: GenerationRoundSpec,
     invocation_id: str = "invocation-0001",
-    worker_gpu: str = "cpu",
+    worker_gpu: str = SELF_PLAY_L4_GPU,
 ) -> RoundCompletion:
     """Keep map-and-seal orchestration alive in Modal, independent of the client."""
 
@@ -334,9 +335,9 @@ def launch_modal_generation_round(
     round_spec: GenerationRoundSpec,
     *,
     invocation_id: str = "invocation-0001",
-    worker_gpu: str = "cpu",
+    worker_gpu: str = SELF_PLAY_L4_GPU,
 ) -> RoundCompletion:
-    """Submit one coordinated CPU round and wait for its durable completion."""
+    """Submit one coordinated round and wait for its durable completion."""
 
     configure_logging()
     log_event(
@@ -371,6 +372,7 @@ def launch_modal_generation_round(
 def main(
     round_id: str,
     requested_positions: int,
+    generation_id: str = GENERATION_1_ID,
     worker_count: int = GENERATION_1_WORKER_COUNT,
     active_games_per_worker: int = GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     shard_position_limit: int = GENERATION_1_SHARD_POSITION_LIMIT,
@@ -381,12 +383,13 @@ def main(
     opening_temperature: float = GENERATION_1_OPENING_TEMPERATURE,
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
-    worker_gpu: str = "cpu",
+    worker_gpu: str = SELF_PLAY_L4_GPU,
 ) -> None:
     """Launch a round through ``modal run --detach`` for disconnect safety."""
 
     generation = replace(
         generation_1_spec(base_seed=base_seed),
+        generation_id=generation_id,
         simulations_per_move=simulations,
         exploration_constant=exploration_constant,
         dirichlet_alpha=dirichlet_alpha,
