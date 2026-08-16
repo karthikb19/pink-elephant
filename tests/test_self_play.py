@@ -6,7 +6,7 @@ import chess
 import numpy as np
 import pytest
 
-from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, move_to_policy_index
+from pink_elephant.action_mapping import legal_policy_indices, move_to_policy_index
 from pink_elephant.encoding import encode_board
 from pink_elephant.mcts import (
     MCTSConfig,
@@ -49,8 +49,10 @@ from pink_elephant.self_play.generation.shards import (
 )
 
 
-def _uniform_prediction(_board: chess.Board) -> PolicyValuePrediction:
-    return PolicyValuePrediction(policy_logits=[0.0] * POLICY_SIZE, value=0.0)
+def _uniform_prediction(board: chess.Board) -> PolicyValuePrediction:
+    return PolicyValuePrediction(
+        legal_policy_logits={index: 0.0 for index in legal_policy_indices(board)}, value=0.0
+    )
 
 
 def _batch_uniform(requests):

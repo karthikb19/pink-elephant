@@ -6,6 +6,7 @@ import chess
 import torch
 from torch import nn
 
+from pink_elephant.action_mapping import legal_policy_indices
 from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game
 from pink_elephant.arena_cli import ArenaGame, ArenaSummary, _persist_evaluation, build_parser
 from pink_elephant.artifacts import RunStore
@@ -48,7 +49,7 @@ def test_checkpoint_evaluator_returns_mcts_prediction(tmp_path: Path) -> None:
 
     prediction = evaluator(chess.Board())
 
-    assert len(prediction.policy_logits) == 4_672
+    assert set(prediction.legal_policy_logits) == set(legal_policy_indices(chess.Board()))
     assert -1 <= prediction.value <= 1
 
 

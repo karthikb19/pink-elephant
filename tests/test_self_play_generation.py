@@ -80,10 +80,10 @@ def _predictions_for_sequence(
     for request in reversed(requests):
         target = chess.Move.from_uci(moves[request.board.ply()])
         target_index = move_to_policy_index(request.board, target)
-        logits = [-1000.0] * POLICY_SIZE
+        logits = {index: -1000.0 for index in legal_policy_indices(request.board)}
         logits[target_index] = 1000.0
         predictions[request.request_id] = PolicyValuePrediction(
-            policy_logits=logits,
+            legal_policy_logits=logits,
             value=0.0,
         )
     return predictions
@@ -216,7 +216,12 @@ def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> No
     assert evaluator.position_count == 2
     assert evaluator.elapsed_seconds >= 0
     assert tuple(predictions) == ("second", "first")
-    assert all(len(prediction.policy_logits) == POLICY_SIZE for prediction in predictions.values())
+    assert set(predictions["second"].legal_policy_logits) == set(
+        legal_policy_indices(requests[0].board)
+    )
+    assert set(predictions["first"].legal_policy_logits) == set(
+        legal_policy_indices(requests[1].board)
+    )
 
 
 def test_load_generation_evaluator_validates_checkpoint_digest(tmp_path: Path) -> None:
@@ -256,7 +261,7 @@ def test_load_generation_evaluator_loads_and_evaluates_tiny_checkpoint(tmp_path:
     predictions = evaluator((BatchEvaluationRequest("root", chess.Board()),))
 
     assert tuple(predictions) == ("root",)
-    assert len(predictions["root"].policy_logits) == POLICY_SIZE
+    assert set(predictions["root"].legal_policy_logits) == set(legal_policy_indices(chess.Board()))
     assert -1 <= predictions["root"].value <= 1
 
 

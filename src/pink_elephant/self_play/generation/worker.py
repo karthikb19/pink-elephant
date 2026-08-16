@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from pink_elephant.action_mapping import legal_policy_indices
 from pink_elephant.arena import load_checkpoint_model
 from pink_elephant.encoding import encode_board, encode_model_input
 from pink_elephant.mcts import (
@@ -74,18 +75,21 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
             output = self.model(inputs)
         if not isinstance(output, ModelOutput):
             raise TypeError("self-play model must return ModelOutput")
-        policy_logits = output.policy_logits.detach().cpu()
+        policy_logits = output.policy_logits.detach()
         values = output.value.detach().cpu()
         self.batch_count += 1
         self.position_count += len(requests)
         self.elapsed_seconds += time.perf_counter() - started
-        return {
-            request.request_id: PolicyValuePrediction(
-                policy_logits=tuple(float(value) for value in policy_logits[row_index]),
+        predictions: dict[str, PolicyValuePrediction] = {}
+        for row_index, request in enumerate(requests):
+            action_indices = tuple(sorted(legal_policy_indices(request.board)))
+            index_tensor = torch.tensor(action_indices, device=policy_logits.device)
+            legal_logits = policy_logits[row_index].index_select(0, index_tensor).cpu().tolist()
+            predictions[request.request_id] = PolicyValuePrediction(
+                legal_policy_logits=dict(zip(action_indices, legal_logits, strict=True)),
                 value=float(values[row_index, 0].item()),
             )
-            for row_index, request in enumerate(requests)
-        }
+        return predictions
 
 
 def load_generation_evaluator(

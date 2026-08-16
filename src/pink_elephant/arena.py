@@ -13,6 +13,7 @@ import chess.pgn
 import torch
 from torch import Tensor, nn
 
+from pink_elephant.action_mapping import legal_policy_indices
 from pink_elephant.encoding import encode_model_input
 from pink_elephant.mcts import (
     MCTSConfig,
@@ -90,8 +91,11 @@ class CheckpointEvaluator:
             output = self.model(position.unsqueeze(0))
         if not isinstance(output, ModelOutput):
             raise TypeError("model adapter must construct a model returning ModelOutput")
+        action_indices = tuple(sorted(legal_policy_indices(board)))
+        index_tensor = torch.tensor(action_indices, device=output.policy_logits.device)
+        legal_logits = output.policy_logits[0].index_select(0, index_tensor).cpu().tolist()
         return PolicyValuePrediction(
-            policy_logits=tuple(float(logit) for logit in output.policy_logits[0].cpu()),
+            legal_policy_logits=dict(zip(action_indices, legal_logits, strict=True)),
             value=float(output.value[0, 0].item()),
         )
 
