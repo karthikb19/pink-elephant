@@ -67,6 +67,9 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         self.batch_count = 0
         self.position_count = 0
         self.elapsed_seconds = 0.0
+        self.encoding_seconds = 0.0
+        self.legal_policy_seconds = 0.0
+        self.batch_size_counts: Counter[int] = Counter()
         self.model.eval()
 
     def __call__(
@@ -75,7 +78,9 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         if not requests:
             return {}
         started = time.perf_counter()
+        encoding_started = started
         positions = np.stack([encode_model_input(request.board) for request in requests], axis=0)
+        self.encoding_seconds += time.perf_counter() - encoding_started
         inputs = torch.from_numpy(positions).to(self.device)
         with torch.inference_mode():
             output = self.model(inputs)
@@ -85,7 +90,9 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         values = output.value.detach().cpu()
         self.batch_count += 1
         self.position_count += len(requests)
+        self.batch_size_counts[len(requests)] += 1
         self.elapsed_seconds += time.perf_counter() - started
+        legal_policy_started = time.perf_counter()
         predictions: dict[str, PolicyValuePrediction] = {}
         for row_index, request in enumerate(requests):
             action_indices = tuple(sorted(legal_policy_indices(request.board)))
@@ -95,6 +102,7 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
                 legal_policy_logits=dict(zip(action_indices, legal_logits, strict=True)),
                 value=float(values[row_index, 0].item()),
             )
+        self.legal_policy_seconds += time.perf_counter() - legal_policy_started
         return predictions
 
 
@@ -164,6 +172,9 @@ def run_worker(
             "generation_id": worker.generation.generation_id,
             "invocation_id": worker.invocation_id,
             "mcts_process_count": 1 if process_search is None else process_search.process_count,
+            "mcts_trees_per_process": (
+                1 if process_search is None else process_search.trees_per_process
+            ),
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
             "simulations_per_move": worker.generation.simulations_per_move,
@@ -283,6 +294,9 @@ def run_worker(
                 "maximum_active_ply": max(game.board.ply() for game in active),
                 "minimum_active_ply": min(game.board.ply() for game in active),
                 "mcts_process_count": 1 if process_search is None else process_search.process_count,
+                "mcts_trees_per_process": (
+                    1 if process_search is None else process_search.trees_per_process
+                ),
                 "position_lower_bound": worker.position_lower_bound,
                 "round_id": worker.round.round_id,
                 "search_batch_count": search_batch_count,
@@ -291,10 +305,15 @@ def run_worker(
             }
             if isinstance(evaluator, ModelBatchEvaluator):
                 fields.update(
+                    model_encoding_seconds=evaluator.encoding_seconds,
                     model_batch_count=evaluator.batch_count,
                     model_evaluation_seconds=evaluator.elapsed_seconds,
+                    model_legal_policy_seconds=evaluator.legal_policy_seconds,
                     model_position_count=evaluator.position_count,
                 )
+                fields.update(_model_batch_histogram_fields(evaluator))
+            if process_search is not None:
+                fields.update(_process_search_log_fields(process_search))
             log_event(logger, "worker_search_progress", fields)
             last_search_log_at = search_finished
         finished: list[_ActiveGame] = []
@@ -432,7 +451,7 @@ def run_worker(
     log_event(
         logger,
         "worker_completed",
-        _completion_log_fields(result, evaluator),
+        _completion_log_fields(result, evaluator, process_search=process_search),
     )
     return result
 
@@ -440,6 +459,8 @@ def run_worker(
 def _completion_log_fields(
     result: WorkerResult,
     evaluator: BatchedPolicyValueEvaluator,
+    *,
+    process_search: MultiprocessMCTSSearch | None = None,
 ) -> dict[str, float | int | str]:
     """Build comparable throughput metrics for a completed worker."""
 
@@ -457,12 +478,38 @@ def _completion_log_fields(
         fields.update(
             average_model_batch_size=evaluator.position_count / evaluator.batch_count,
             model_batch_count=evaluator.batch_count,
+            model_encoding_seconds=evaluator.encoding_seconds,
             model_evaluation_fraction=evaluator.elapsed_seconds / result.elapsed_seconds,
             model_evaluation_seconds=evaluator.elapsed_seconds,
+            model_legal_policy_seconds=evaluator.legal_policy_seconds,
             model_position_count=evaluator.position_count,
             model_positions_per_second=evaluator.position_count / evaluator.elapsed_seconds,
         )
+        fields.update(_model_batch_histogram_fields(evaluator))
+    if process_search is not None:
+        fields.update(_process_search_log_fields(process_search))
     return fields
+
+
+def _model_batch_histogram_fields(evaluator: ModelBatchEvaluator) -> dict[str, int]:
+    """Return flat structured-log fields for every observed model batch size."""
+
+    return {
+        f"model_batch_size_{batch_size}_count": count
+        for batch_size, count in sorted(evaluator.batch_size_counts.items())
+    }
+
+
+def _process_search_log_fields(search: MultiprocessMCTSSearch) -> dict[str, float | int]:
+    """Return cumulative child and broker timing counters."""
+
+    return {
+        "mcts_broker_batch_count": search.broker_batch_count,
+        "mcts_broker_peer_wait_seconds": search.broker_peer_wait_seconds,
+        "mcts_child_inference_batch_count": search.child_inference_batch_count,
+        "mcts_child_prediction_wait_seconds": search.child_prediction_wait_seconds,
+        "mcts_child_search_seconds": search.child_search_seconds,
+    }
 
 
 def _invocation_root(output_root: Path, worker: WorkerSpec) -> Path:

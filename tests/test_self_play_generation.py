@@ -217,6 +217,9 @@ def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> No
     assert evaluator.batch_count == 1
     assert evaluator.position_count == 2
     assert evaluator.elapsed_seconds >= 0
+    assert evaluator.encoding_seconds >= 0
+    assert evaluator.legal_policy_seconds >= 0
+    assert evaluator.batch_size_counts == {2: 1}
     assert tuple(predictions) == ("second", "first")
     assert set(predictions["second"].legal_policy_logits) == set(
         legal_policy_indices(requests[0].board)
@@ -433,6 +436,9 @@ def test_worker_completion_metrics_report_model_batching(tmp_path: Path) -> None
 
     assert fields["average_model_batch_size"] == 2.0
     assert fields["model_batch_count"] == 1
+    assert fields["model_batch_size_2_count"] == 1
+    assert fields["model_encoding_seconds"] >= 0
+    assert fields["model_legal_policy_seconds"] >= 0
     assert fields["model_position_count"] == 2
     assert fields["model_evaluation_fraction"] > 0
     assert fields["model_positions_per_second"] > 0

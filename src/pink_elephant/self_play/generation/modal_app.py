@@ -47,6 +47,7 @@ MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
 SELF_PLAY_CPU: Final[float] = 2.0
 SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(SELF_PLAY_CPU)
+SELF_PLAY_MCTS_TREES_PER_PROCESS: Final[int] = 2
 SELF_PLAY_L4_GPU: Final[str] = "L4"
 SELF_PLAY_MEMORY_MB: Final[int] = 16 * 1024
 SELF_PLAY_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
@@ -108,7 +109,11 @@ def _generate_worker_modal(worker: WorkerSpec, *, device: str) -> WorkerResult:
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     checkpoint_path = _mounted_checkpoint_path(worker.generation.checkpoint_volume_path)
     evaluator = load_generation_evaluator(checkpoint_path, worker, device=device)
-    with MultiprocessMCTSSearch(evaluator, SELF_PLAY_MCTS_PROCESS_COUNT) as process_search:
+    with MultiprocessMCTSSearch(
+        evaluator,
+        SELF_PLAY_MCTS_PROCESS_COUNT,
+        trees_per_process=SELF_PLAY_MCTS_TREES_PER_PROCESS,
+    ) as process_search:
         result = run_worker(worker, evaluator, output_root, process_search=process_search)
     self_play_volume.commit()
     log_event(
