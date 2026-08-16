@@ -12,7 +12,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from pink_elephant.action_mapping import POLICY_SIZE, legal_policy_indices, policy_index_to_move
-from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT, encode_board
+from pink_elephant.encoding import (
+    BOARD_SIZE,
+    PLANE_COUNT,
+    REPETITION_ONCE_PLANE,
+    REPETITION_TWICE_PLANE,
+    encode_board,
+)
 
 REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v1"
 GAME_SCHEMA_VERSION: Final[str] = "self-play/games/v1"
@@ -66,8 +72,12 @@ class ReplayRow:
             raise ValueError("policy action indices must be unique")
         board = _board_from_fen(self.fen)
         expected_board = encode_board(board)
-        if not np.array_equal(self.board, expected_board):
+        if not np.array_equal(
+            self.board[:REPETITION_ONCE_PLANE],
+            expected_board[:REPETITION_ONCE_PLANE],
+        ):
             raise ValueError("board tensor does not match fen")
+        _validate_repetition_planes(self.board)
         legal_actions = tuple(sorted(legal_policy_indices(board)))
         if action_indices != legal_actions:
             raise ValueError("policy must contain exactly the legal action indices")
@@ -495,6 +505,18 @@ def _board_from_fen(fen: str) -> chess.Board:
         return chess.Board(fen)
     except ValueError as error:
         raise ValueError(f"invalid replay FEN: {fen!r}") from error
+
+
+def _validate_repetition_planes(board: NDArray[np.uint8]) -> None:
+    values: list[int] = []
+    for plane_index in (REPETITION_ONCE_PLANE, REPETITION_TWICE_PLANE):
+        plane = board[plane_index]
+        value = int(plane[0, 0])
+        if value not in (0, 1) or not np.all(plane == value):
+            raise ValueError("repetition planes must be uniform binary values")
+        values.append(value)
+    if values[1] > values[0]:
+        raise ValueError("threefold repetition requires an earlier repetition")
 
 
 def _validate_sha256(value: str) -> None:

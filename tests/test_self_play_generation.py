@@ -34,7 +34,12 @@ from pink_elephant.self_play.generation.config import (
     generation_1_spec,
     plan_worker_specs,
 )
-from pink_elephant.self_play.generation.game import GameTruncatedError, run_self_play_game
+from pink_elephant.self_play.generation.game import (
+    GameTruncatedError,
+    PendingPosition,
+    complete_game,
+    run_self_play_game,
+)
 from pink_elephant.self_play.generation.manifests import (
     latest_snapshot,
     load_games_table,
@@ -65,6 +70,7 @@ from pink_elephant.self_play.generation.worker import (
 from pink_elephant.training import CHECKPOINT_FORMAT_VERSION
 
 FOOLS_MATE_MOVES = ("f2f3", "e7e5", "g2g4", "d8h4")
+REPETITION_MOVES = ("g1f3", "g8f6", "f3g1", "f6g8") * 2
 
 
 def _predictions_for_sequence(
@@ -168,6 +174,33 @@ def _valid_replay_row() -> ReplayRow:
     )
 
 
+def _repetition_game_inputs() -> tuple[chess.Board, tuple[PendingPosition, ...]]:
+    board = chess.Board()
+    pending_positions: list[PendingPosition] = []
+    for move_uci in REPETITION_MOVES:
+        legal_actions = tuple(sorted(legal_policy_indices(board)))
+        move = chess.Move.from_uci(move_uci)
+        pending_positions.append(
+            PendingPosition(
+                board=encode_board(board),
+                fen=board.fen(en_passant="fen"),
+                policy=tuple(
+                    SparsePolicyEntry(
+                        action_index=action_index,
+                        probability=1 / len(legal_actions),
+                    )
+                    for action_index in legal_actions
+                ),
+                selected_action_index=move_to_policy_index(board, move),
+                side_to_move=board.turn,
+                game_id="repetition-game",
+                ply_index=board.ply(),
+            )
+        )
+        board.push(move)
+    return board, tuple(pending_positions)
+
+
 def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> None:
     model = RecordingModel()
     evaluator = ModelBatchEvaluator(model)
@@ -241,6 +274,78 @@ def test_run_self_play_game_produces_complete_replay_rows() -> None:
     assert completed.record.result == "0-1"
     assert completed.record.termination == "checkmate"
     assert [row.outcome for row in completed.rows] == [-1, 1, -1, 1]
+
+
+def test_complete_game_accepts_history_dependent_repetition_planes(tmp_path: Path) -> None:
+    final_board, pending_positions = _repetition_game_inputs()
+
+    completed = complete_game(
+        game_id="repetition-game",
+        seed=17,
+        initial_fen=chess.Board().fen(en_passant="fen"),
+        moves_uci=REPETITION_MOVES,
+        final_board=final_board,
+        pending_positions=pending_positions,
+    )
+
+    assert completed.record.termination == "threefold_repetition"
+    assert completed.rows[4].board[19].min() == 1
+    assert completed.rows[4].board[20].max() == 0
+    shard_path = tmp_path / "repetition.parquet"
+
+    write_replay_shard(shard_path, completed.rows)
+    loaded_rows = tuple(iter_replay_rows(shard_path))
+
+    assert loaded_rows[4].board[19].min() == 1
+
+
+def test_complete_game_rejects_incorrect_repetition_history() -> None:
+    final_board, pending_positions = _repetition_game_inputs()
+    incorrect_board = pending_positions[4].board.copy()
+    incorrect_board[19] = 0
+    tampered_positions = (
+        *pending_positions[:4],
+        replace(pending_positions[4], board=incorrect_board),
+        *pending_positions[5:],
+    )
+
+    with pytest.raises(ValueError, match="replayed game history"):
+        complete_game(
+            game_id="repetition-game",
+            seed=17,
+            initial_fen=chess.Board().fen(en_passant="fen"),
+            moves_uci=REPETITION_MOVES,
+            final_board=final_board,
+            pending_positions=tampered_positions,
+        )
+
+
+@pytest.mark.parametrize(
+    ("once_value", "twice_value", "message"),
+    (
+        (0, 2, "uniform binary"),
+        (0, 1, "requires an earlier repetition"),
+    ),
+)
+def test_replay_row_rejects_invalid_repetition_planes(
+    once_value: int, twice_value: int, message: str
+) -> None:
+    row = _valid_replay_row()
+    invalid_board = row.board.copy()
+    invalid_board[19] = once_value
+    invalid_board[20] = twice_value
+
+    with pytest.raises(ValueError, match=message):
+        replace(row, board=invalid_board)
+
+
+def test_replay_row_rejects_nonuniform_repetition_plane() -> None:
+    row = _valid_replay_row()
+    invalid_board = row.board.copy()
+    invalid_board[19, 0, 0] = 1
+
+    with pytest.raises(ValueError, match="uniform binary"):
+        replace(row, board=invalid_board)
 
 
 def test_run_self_play_game_rejects_truncated_games() -> None:
