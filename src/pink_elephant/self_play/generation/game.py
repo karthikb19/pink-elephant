@@ -138,6 +138,13 @@ def complete_game(
         raise ValueError("cannot complete a game before a rules-defined terminal result")
     result = outcome.result()
     termination = outcome.termination.name.lower()
+    _validate_pending_positions(
+        game_id=game_id,
+        initial_fen=initial_fen,
+        moves_uci=moves_uci,
+        final_board=final_board,
+        pending_positions=pending_positions,
+    )
     rows: list[ReplayRow] = []
     for pending in pending_positions:
         position_outcome = (
@@ -167,6 +174,41 @@ def complete_game(
     if tuple(row.game_id for row in rows) != (game_id,) * len(rows):
         raise ValueError("completed game rows have inconsistent game IDs")
     return CompletedSelfPlayGame(rows=tuple(rows), record=record)
+
+
+def _validate_pending_positions(
+    *,
+    game_id: str,
+    initial_fen: str,
+    moves_uci: Sequence[str],
+    final_board: chess.Board,
+    pending_positions: Sequence[PendingPosition],
+) -> None:
+    """Replay a completed game to validate every history-dependent tensor plane."""
+
+    if len(pending_positions) != len(moves_uci):
+        raise ValueError("completed game must have one replay position per move")
+    replayed = chess.Board(initial_fen)
+    for pending, move_uci in zip(pending_positions, moves_uci, strict=True):
+        if pending.game_id != game_id:
+            raise ValueError("completed game rows have inconsistent game IDs")
+        if pending.ply_index != replayed.ply():
+            raise ValueError("replay position ply does not match game history")
+        if pending.fen != replayed.fen(en_passant="fen"):
+            raise ValueError("replay position FEN does not match game history")
+        if pending.side_to_move != replayed.turn:
+            raise ValueError("replay position side to move does not match game history")
+        if not np.array_equal(pending.board, encode_board(replayed)):
+            raise ValueError("board tensor does not match replayed game history")
+        selected_move = policy_index_to_move(replayed, pending.selected_action_index)
+        move = chess.Move.from_uci(move_uci)
+        if selected_move != move or move not in replayed.legal_moves:
+            raise ValueError("selected action does not match completed game move")
+        replayed.push(move)
+    if replayed.fen(en_passant="fen") != final_board.fen(en_passant="fen"):
+        raise ValueError("replayed final board does not match completed game")
+    if replayed.outcome(claim_draw=True) != final_board.outcome(claim_draw=True):
+        raise ValueError("replayed outcome does not match completed game")
 
 
 def run_self_play_game(

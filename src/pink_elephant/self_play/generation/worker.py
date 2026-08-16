@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import Counter
 from collections.abc import Mapping
@@ -40,11 +41,14 @@ from pink_elephant.self_play.generation.game import (
     make_root_dirichlet_modifier,
     select_action_from_root,
 )
+from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.shards import (
     ReplayShardBuilder,
     sha256_file,
     write_games_table,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
@@ -53,6 +57,9 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
     def __init__(self, model: nn.Module, device: torch.device | str = "cpu") -> None:
         self.model = model
         self.device = torch.device(device)
+        self.batch_count = 0
+        self.position_count = 0
+        self.elapsed_seconds = 0.0
         self.model.eval()
 
     def __call__(
@@ -60,25 +67,34 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
     ) -> Mapping[str, PolicyValuePrediction]:
         if not requests:
             return {}
+        started = time.perf_counter()
         positions = np.stack([encode_model_input(request.board) for request in requests], axis=0)
         inputs = torch.from_numpy(positions).to(self.device)
         with torch.inference_mode():
             output = self.model(inputs)
         if not isinstance(output, ModelOutput):
             raise TypeError("self-play model must return ModelOutput")
+        policy_logits = output.policy_logits.detach().cpu()
+        values = output.value.detach().cpu()
+        self.batch_count += 1
+        self.position_count += len(requests)
+        self.elapsed_seconds += time.perf_counter() - started
         return {
             request.request_id: PolicyValuePrediction(
-                policy_logits=tuple(
-                    float(value) for value in output.policy_logits[row_index].cpu()
-                ),
-                value=float(output.value[row_index, 0].item()),
+                policy_logits=tuple(float(value) for value in policy_logits[row_index]),
+                value=float(values[row_index, 0].item()),
             )
             for row_index, request in enumerate(requests)
         }
 
 
-def load_generation_evaluator(checkpoint_path: Path, worker: WorkerSpec) -> ModelBatchEvaluator:
-    """Validate the immutable checkpoint digest and load it once on CPU."""
+def load_generation_evaluator(
+    checkpoint_path: Path,
+    worker: WorkerSpec,
+    *,
+    device: torch.device | str = "cpu",
+) -> ModelBatchEvaluator:
+    """Validate the immutable checkpoint digest and load it once on the target device."""
 
     actual_digest = sha256_file(checkpoint_path)
     if actual_digest != worker.generation.checkpoint_sha256:
@@ -86,10 +102,25 @@ def load_generation_evaluator(checkpoint_path: Path, worker: WorkerSpec) -> Mode
             "checkpoint SHA-256 does not match the generation contract; "
             f"expected={worker.generation.checkpoint_sha256}, got={actual_digest}"
         )
-    loaded = load_checkpoint_model(checkpoint_path, device="cpu")
+    target_device = torch.device(device)
+    loaded = load_checkpoint_model(checkpoint_path, device=target_device)
     if loaded.model_spec != worker.generation.model_spec:
         raise ValueError("checkpoint model specification does not match the generation contract")
-    return ModelBatchEvaluator(loaded.model, device="cpu")
+    log_event(
+        logger,
+        "checkpoint_validated",
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "device": str(target_device),
+            "gpu_name": (
+                torch.cuda.get_device_name(target_device) if target_device.type == "cuda" else None
+            ),
+            "generation_id": worker.generation.generation_id,
+            "round_id": worker.round.round_id,
+            "worker_id": worker.worker_id,
+        },
+    )
+    return ModelBatchEvaluator(loaded.model, device=target_device)
 
 
 @dataclass(slots=True)
@@ -111,7 +142,21 @@ def run_worker(
 ) -> WorkerResult:
     """Generate complete games, publish validated shards, then write the result last."""
 
+    configure_logging()
     started = time.perf_counter()
+    log_event(
+        logger,
+        "worker_started",
+        {
+            "active_games": worker.round.active_games_per_worker,
+            "generation_id": worker.generation.generation_id,
+            "invocation_id": worker.invocation_id,
+            "position_lower_bound": worker.position_lower_bound,
+            "round_id": worker.round.round_id,
+            "simulations_per_move": worker.generation.simulations_per_move,
+            "worker_id": worker.worker_id,
+        },
+    )
     invocation_root = _invocation_root(output_root, worker)
     if invocation_root.exists() and any(invocation_root.iterdir()):
         raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
@@ -124,6 +169,10 @@ def run_worker(
     termination_counts: Counter[str] = Counter()
     failed_game_count = 0
     completed_position_count = 0
+    progress_interval = max(1, min(100, worker.position_lower_bound // 10))
+    next_progress_log = progress_interval
+    search_batch_count = 0
+    last_search_log_at = started
     attempts = 0
     active: list[_ActiveGame] = []
     mcts_config = MCTSConfig(
@@ -170,11 +219,24 @@ def run_worker(
             else:
                 searchable.append(game)
         failed_game_count += len(truncated)
+        if truncated:
+            log_event(
+                logger,
+                "worker_games_truncated",
+                {
+                    "attempts": attempts,
+                    "count": len(truncated),
+                    "failed_game_count": failed_game_count,
+                    "round_id": worker.round.round_id,
+                    "worker_id": worker.worker_id,
+                },
+            )
         active = searchable
         if not active:
             start_games_if_needed()
             continue
 
+        search_started = time.perf_counter()
         roots = run_mcts_batch(
             tuple(game.board for game in active),
             evaluator,
@@ -188,6 +250,32 @@ def run_worker(
                 for game in active
             ),
         )
+        search_batch_count += 1
+        search_finished = time.perf_counter()
+        if search_batch_count == 1 or search_finished - last_search_log_at >= 30:
+            fields: dict[str, bool | float | int | None | str] = {
+                "active_game_count": len(active),
+                "completed_game_count": len(completed_games),
+                "completed_position_count": completed_position_count,
+                "elapsed_seconds": search_finished - started,
+                "failed_game_count": failed_game_count,
+                "in_flight_position_count": sum(len(game.pending_positions) for game in active),
+                "maximum_active_ply": max(game.board.ply() for game in active),
+                "minimum_active_ply": min(game.board.ply() for game in active),
+                "position_lower_bound": worker.position_lower_bound,
+                "round_id": worker.round.round_id,
+                "search_batch_count": search_batch_count,
+                "search_seconds": search_finished - search_started,
+                "worker_id": worker.worker_id,
+            }
+            if isinstance(evaluator, ModelBatchEvaluator):
+                fields.update(
+                    model_batch_count=evaluator.batch_count,
+                    model_evaluation_seconds=evaluator.elapsed_seconds,
+                    model_position_count=evaluator.position_count,
+                )
+            log_event(logger, "worker_search_progress", fields)
+            last_search_log_at = search_finished
         finished: list[_ActiveGame] = []
         for game, root in zip(active, roots, strict=True):
             policy = tuple(
@@ -233,13 +321,55 @@ def run_worker(
                     final_board=game.board,
                     pending_positions=game.pending_positions,
                 )
-            except (RuntimeError, ValueError):
+            except (RuntimeError, ValueError) as error:
                 failed_game_count += 1
+                log_event(
+                    logger,
+                    "worker_game_rejected",
+                    {
+                        "error": str(error),
+                        "failed_game_count": failed_game_count,
+                        "game_id": game.game_id,
+                        "ply_count": len(game.moves_uci),
+                        "round_id": worker.round.round_id,
+                        "worker_id": worker.worker_id,
+                    },
+                )
                 continue
             shard_builder.add_game(completed.rows)
             completed_games.append(completed.record)
             completed_position_count += len(completed.rows)
             termination_counts[completed.record.termination] += 1
+            log_event(
+                logger,
+                "worker_game_completed",
+                {
+                    "completed_game_count": len(completed_games),
+                    "game_id": completed.record.game_id,
+                    "ply_count": completed.record.ply_count,
+                    "position_count": completed_position_count,
+                    "position_lower_bound": worker.position_lower_bound,
+                    "round_id": worker.round.round_id,
+                    "termination": completed.record.termination,
+                    "worker_id": worker.worker_id,
+                },
+            )
+            if completed_position_count >= next_progress_log:
+                log_event(
+                    logger,
+                    "worker_progress",
+                    {
+                        "attempts": attempts,
+                        "completed_game_count": len(completed_games),
+                        "failed_game_count": failed_game_count,
+                        "position_count": completed_position_count,
+                        "position_lower_bound": worker.position_lower_bound,
+                        "round_id": worker.round.round_id,
+                        "worker_id": worker.worker_id,
+                    },
+                )
+                while next_progress_log <= completed_position_count:
+                    next_progress_log += progress_interval
         start_games_if_needed()
 
     if completed_position_count < worker.position_lower_bound or not completed_games:
@@ -276,7 +406,40 @@ def run_worker(
     result_path.write_text(
         json.dumps(result.to_payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    log_event(
+        logger,
+        "worker_completed",
+        _completion_log_fields(result, evaluator),
+    )
     return result
+
+
+def _completion_log_fields(
+    result: WorkerResult,
+    evaluator: BatchedPolicyValueEvaluator,
+) -> dict[str, float | int | str]:
+    """Build comparable throughput metrics for a completed worker."""
+
+    fields: dict[str, float | int | str] = {
+        "completed_game_count": result.completed_game_count,
+        "elapsed_seconds": result.elapsed_seconds,
+        "failed_game_count": result.failed_game_count,
+        "position_count": result.position_count,
+        "positions_per_second": result.position_count / result.elapsed_seconds,
+        "result_path": result.result_path,
+        "round_id": result.round_id,
+        "worker_id": result.worker_id,
+    }
+    if isinstance(evaluator, ModelBatchEvaluator):
+        fields.update(
+            average_model_batch_size=evaluator.position_count / evaluator.batch_count,
+            model_batch_count=evaluator.batch_count,
+            model_evaluation_fraction=evaluator.elapsed_seconds / result.elapsed_seconds,
+            model_evaluation_seconds=evaluator.elapsed_seconds,
+            model_position_count=evaluator.position_count,
+            model_positions_per_second=evaluator.position_count / evaluator.elapsed_seconds,
+        )
+    return fields
 
 
 def _invocation_root(output_root: Path, worker: WorkerSpec) -> Path:

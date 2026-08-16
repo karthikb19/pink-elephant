@@ -13,6 +13,8 @@ PLANE_COUNT: Final = 21
 ENCODER_VERSION: Final = "v2"
 HALFMOVE_PLANE: Final = 18
 HALFMOVE_SCALE: Final = 150.0
+REPETITION_ONCE_PLANE: Final = 19
+REPETITION_TWICE_PLANE: Final = 20
 
 
 def _tensor_square(square: chess.Square, turn: chess.Color) -> tuple[int, int]:
@@ -83,8 +85,8 @@ def encode_board(board: chess.Board) -> NDArray[np.uint8]:
         encoded[17, row, column] = 1
 
     _set_broadcast_plane(encoded, 18, min(board.halfmove_clock, 150))
-    _set_broadcast_plane(encoded, 19, int(board.is_repetition(2)))
-    _set_broadcast_plane(encoded, 20, int(board.is_repetition(3)))
+    _set_broadcast_plane(encoded, REPETITION_ONCE_PLANE, int(board.is_repetition(2)))
+    _set_broadcast_plane(encoded, REPETITION_TWICE_PLANE, int(board.is_repetition(3)))
     return encoded
 
 

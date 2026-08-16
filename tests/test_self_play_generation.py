@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -25,12 +26,20 @@ from pink_elephant.self_play.contracts import (
 )
 from pink_elephant.self_play.generation import cli
 from pink_elephant.self_play.generation.config import (
+    GENERATION_1_ACTIVE_GAMES_PER_WORKER,
+    GENERATION_1_CHECKPOINT_SHA256,
+    GENERATION_1_WORKER_COUNT,
     GenerationRoundSpec,
     WorkerSpec,
     generation_1_spec,
     plan_worker_specs,
 )
-from pink_elephant.self_play.generation.game import GameTruncatedError, run_self_play_game
+from pink_elephant.self_play.generation.game import (
+    GameTruncatedError,
+    PendingPosition,
+    complete_game,
+    run_self_play_game,
+)
 from pink_elephant.self_play.generation.manifests import (
     latest_snapshot,
     load_games_table,
@@ -38,7 +47,11 @@ from pink_elephant.self_play.generation.manifests import (
     load_worker_result,
     seal_round,
 )
-from pink_elephant.self_play.generation.modal_app import _mounted_checkpoint_path
+from pink_elephant.self_play.generation.modal_app import (
+    SELF_PLAY_CPU,
+    SELF_PLAY_L4_GPU,
+    _mounted_checkpoint_path,
+)
 from pink_elephant.self_play.generation.scheduler import GenerationCoordinator
 from pink_elephant.self_play.generation.shards import (
     iter_replay_rows,
@@ -50,12 +63,14 @@ from pink_elephant.self_play.generation.shards import (
 )
 from pink_elephant.self_play.generation.worker import (
     ModelBatchEvaluator,
+    _completion_log_fields,
     load_generation_evaluator,
     run_worker,
 )
 from pink_elephant.training import CHECKPOINT_FORMAT_VERSION
 
 FOOLS_MATE_MOVES = ("f2f3", "e7e5", "g2g4", "d8h4")
+REPETITION_MOVES = ("g1f3", "g8f6", "f3g1", "f6g8") * 2
 
 
 def _predictions_for_sequence(
@@ -159,6 +174,33 @@ def _valid_replay_row() -> ReplayRow:
     )
 
 
+def _repetition_game_inputs() -> tuple[chess.Board, tuple[PendingPosition, ...]]:
+    board = chess.Board()
+    pending_positions: list[PendingPosition] = []
+    for move_uci in REPETITION_MOVES:
+        legal_actions = tuple(sorted(legal_policy_indices(board)))
+        move = chess.Move.from_uci(move_uci)
+        pending_positions.append(
+            PendingPosition(
+                board=encode_board(board),
+                fen=board.fen(en_passant="fen"),
+                policy=tuple(
+                    SparsePolicyEntry(
+                        action_index=action_index,
+                        probability=1 / len(legal_actions),
+                    )
+                    for action_index in legal_actions
+                ),
+                selected_action_index=move_to_policy_index(board, move),
+                side_to_move=board.turn,
+                game_id="repetition-game",
+                ply_index=board.ply(),
+            )
+        )
+        board.push(move)
+    return board, tuple(pending_positions)
+
+
 def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> None:
     model = RecordingModel()
     evaluator = ModelBatchEvaluator(model)
@@ -170,6 +212,9 @@ def test_model_batch_evaluator_batches_positions_and_routes_explicit_ids() -> No
     predictions = evaluator(requests)
 
     assert model.batch_sizes == [2]
+    assert evaluator.batch_count == 1
+    assert evaluator.position_count == 2
+    assert evaluator.elapsed_seconds >= 0
     assert tuple(predictions) == ("second", "first")
     assert all(len(prediction.policy_logits) == POLICY_SIZE for prediction in predictions.values())
 
@@ -231,6 +276,78 @@ def test_run_self_play_game_produces_complete_replay_rows() -> None:
     assert [row.outcome for row in completed.rows] == [-1, 1, -1, 1]
 
 
+def test_complete_game_accepts_history_dependent_repetition_planes(tmp_path: Path) -> None:
+    final_board, pending_positions = _repetition_game_inputs()
+
+    completed = complete_game(
+        game_id="repetition-game",
+        seed=17,
+        initial_fen=chess.Board().fen(en_passant="fen"),
+        moves_uci=REPETITION_MOVES,
+        final_board=final_board,
+        pending_positions=pending_positions,
+    )
+
+    assert completed.record.termination == "threefold_repetition"
+    assert completed.rows[4].board[19].min() == 1
+    assert completed.rows[4].board[20].max() == 0
+    shard_path = tmp_path / "repetition.parquet"
+
+    write_replay_shard(shard_path, completed.rows)
+    loaded_rows = tuple(iter_replay_rows(shard_path))
+
+    assert loaded_rows[4].board[19].min() == 1
+
+
+def test_complete_game_rejects_incorrect_repetition_history() -> None:
+    final_board, pending_positions = _repetition_game_inputs()
+    incorrect_board = pending_positions[4].board.copy()
+    incorrect_board[19] = 0
+    tampered_positions = (
+        *pending_positions[:4],
+        replace(pending_positions[4], board=incorrect_board),
+        *pending_positions[5:],
+    )
+
+    with pytest.raises(ValueError, match="replayed game history"):
+        complete_game(
+            game_id="repetition-game",
+            seed=17,
+            initial_fen=chess.Board().fen(en_passant="fen"),
+            moves_uci=REPETITION_MOVES,
+            final_board=final_board,
+            pending_positions=tampered_positions,
+        )
+
+
+@pytest.mark.parametrize(
+    ("once_value", "twice_value", "message"),
+    (
+        (0, 2, "uniform binary"),
+        (0, 1, "requires an earlier repetition"),
+    ),
+)
+def test_replay_row_rejects_invalid_repetition_planes(
+    once_value: int, twice_value: int, message: str
+) -> None:
+    row = _valid_replay_row()
+    invalid_board = row.board.copy()
+    invalid_board[19] = once_value
+    invalid_board[20] = twice_value
+
+    with pytest.raises(ValueError, match=message):
+        replace(row, board=invalid_board)
+
+
+def test_replay_row_rejects_nonuniform_repetition_plane() -> None:
+    row = _valid_replay_row()
+    invalid_board = row.board.copy()
+    invalid_board[19, 0, 0] = 1
+
+    with pytest.raises(ValueError, match="uniform binary"):
+        replace(row, board=invalid_board)
+
+
 def test_run_self_play_game_rejects_truncated_games() -> None:
     with pytest.raises(GameTruncatedError, match="reached max plies"):
         run_self_play_game(
@@ -264,6 +381,54 @@ def test_worker_writes_validated_game_and_replay_artifacts(tmp_path: Path) -> No
     assert validated_games.size_bytes == result.games.size_bytes
     assert validated_shard.sha256 == result.shards[0].sha256
     assert validated_shard.size_bytes == result.shards[0].size_bytes
+
+
+def test_worker_emits_structured_progress_events(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pink_elephant.self_play")
+    generation = _smoke_generation()
+    worker = _smoke_worker(generation, _smoke_round(generation, "worker-logging"))
+
+    _run_fools_mate_worker(tmp_path, worker)
+
+    events = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "pink_elephant.self_play.generation.worker"
+    ]
+    event_names = [event["event"] for event in events]
+    search_events = [event for event in events if event["event"] == "worker_search_progress"]
+    progress_events = [event for event in events if event["event"] == "worker_progress"]
+
+    assert event_names[0] == "worker_started"
+    assert events[0]["simulations_per_move"] == 1
+    assert search_events[0]["search_batch_count"] == 1
+    assert search_events[0]["maximum_active_ply"] == 0
+    assert progress_events[-1]["position_count"] == 4
+    assert event_names[-1] == "worker_completed"
+    assert events[-1]["positions_per_second"] > 0
+
+
+def test_worker_completion_metrics_report_model_batching(tmp_path: Path) -> None:
+    generation = _smoke_generation()
+    worker = _smoke_worker(generation, _smoke_round(generation, "worker-metrics"))
+    result = _run_fools_mate_worker(tmp_path, worker)
+    model = RecordingModel()
+    evaluator = ModelBatchEvaluator(model)
+    requests = (
+        BatchEvaluationRequest("first", chess.Board()),
+        BatchEvaluationRequest("second", chess.Board()),
+    )
+
+    evaluator(requests)
+    fields = _completion_log_fields(result, evaluator)
+
+    assert fields["average_model_batch_size"] == 2.0
+    assert fields["model_batch_count"] == 1
+    assert fields["model_position_count"] == 2
+    assert fields["model_evaluation_fraction"] > 0
+    assert fields["model_positions_per_second"] > 0
 
 
 def test_worker_retries_truncated_games_and_records_failure_count(tmp_path: Path) -> None:
@@ -338,6 +503,31 @@ def test_coordinator_appends_cumulative_snapshots_and_supports_noop_rounds(
     assert noop.new_position_count == 0
     assert noop.snapshot_path == second.snapshot_path
     assert latest_snapshot(tmp_path, generation.generation_id) == second_snapshot
+
+
+def test_snapshot_preserves_append_order_for_non_lexical_round_ids(tmp_path: Path) -> None:
+    generation = _smoke_generation()
+    coordinator = GenerationCoordinator(tmp_path, generation)
+
+    def run_one(worker: WorkerSpec):
+        return run_worker(
+            replace(worker, max_plies_per_game=8, max_game_attempts=1),
+            FoolsmateEvaluator(),
+            tmp_path,
+        )
+
+    coordinator.extend(_smoke_round(generation, "z-first"), run_one, invocation_id="one")
+    completion = coordinator.extend(
+        _smoke_round(generation, "a-second", requested_positions=8),
+        run_one,
+        invocation_id="two",
+    )
+    snapshot = load_snapshot_manifest(tmp_path / completion.snapshot_path)
+
+    assert tuple(round_ref.round_id for round_ref in snapshot.rounds) == (
+        "z-first",
+        "a-second",
+    )
 
 
 def test_coordinator_rejects_changed_generation_manifest(tmp_path: Path) -> None:
@@ -456,6 +646,8 @@ def test_cli_passes_generation_overrides_to_local_scheduler(
             str(tmp_path),
             "--round-id",
             "cli-success",
+            "--generation-id",
+            "generation-cli-test",
             "--requested-positions",
             "4",
             "--worker-count",
@@ -477,10 +669,77 @@ def test_cli_passes_generation_overrides_to_local_scheduler(
     assert exit_code == 0
     assert payload["event"] == "round_completed"
     assert round_spec.round_id == "cli-success"
+    assert round_spec.generation_id == generation.generation_id == "generation-cli-test"
     assert round_spec.worker_count == 1
     assert round_spec.shard_position_limit == 2
     assert generation.base_seed == 9
     assert generation.simulations_per_move == 1
+
+
+def test_cli_passes_l4_worker_selection_to_modal_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_launch(generation, round_spec, *, worker_gpu):
+        captured.update(generation=generation, round_spec=round_spec, worker_gpu=worker_gpu)
+        return RoundCompletion(
+            generation_id=generation.generation_id,
+            round_id=round_spec.round_id,
+            requested_position_milestone=round_spec.requested_cumulative_positions,
+            previous_actual_position_count=0,
+            new_position_count=4,
+            actual_position_count=4,
+            game_count=1,
+            snapshot_path="generation-000001/snapshots/snapshot-000001/snapshot-manifest.json",
+            snapshot_sha256="a" * 64,
+            completed_at="2026-01-01T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(cli, "launch_modal_generation_round", fake_launch)
+
+    exit_code = cli.main(
+        [
+            "generation",
+            "extend",
+            "--backend",
+            "modal",
+            "--worker-gpu",
+            "L4",
+            "--round-id",
+            "l4-cli",
+            "--requested-positions",
+            "4",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["worker_gpu"] == "L4"
+    assert json.loads(capsys.readouterr().out)["event"] == "round_completed"
+
+
+def test_modal_generation_defaults_to_one_l4_worker_with_two_cpus_and_two_games() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(
+        [
+            "generation",
+            "extend",
+            "--backend",
+            "modal",
+            "--round-id",
+            "resource-defaults",
+            "--requested-positions",
+            "4",
+        ]
+    )
+
+    assert args.worker_gpu == SELF_PLAY_L4_GPU
+    assert args.generation_id == "generation-000001"
+    assert args.worker_count == GENERATION_1_WORKER_COUNT == 1
+    assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 2
+    assert SELF_PLAY_CPU == 2.0
 
 
 @pytest.mark.parametrize(
@@ -569,3 +828,9 @@ def test_worker_planning_distributes_quota_and_keeps_worker_identity_stable() ->
     assert tuple(worker.position_lower_bound for worker in workers) == (3, 3, 3)
     assert len({worker.seed_start for worker in workers}) == 3
     assert plan_worker_specs(generation, round_spec, previous_actual_positions=10) == ()
+
+
+def test_generation_1_checkpoint_digest_matches_the_pinned_volume_artifact() -> None:
+    assert GENERATION_1_CHECKPOINT_SHA256 == (
+        "9e1f7bb15cc042357e1e4a0afea18c89f01e25aada7497be83c91f29f62a0229"
+    )
