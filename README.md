@@ -228,9 +228,18 @@ not cancel the worker before sealing:
 ```sh
 uv run modal run --detach --timestamps \
   src/pink_elephant/self_play/generation/modal_app.py \
+  --generation-id generation-l4-4x2-32sims-20260817 \
   --round-id round-000001 \
-  --requested-positions 10000
+  --requested-positions 10000 \
+  --simulations 32 \
+  --active-games-per-worker 8 \
+  --opening-temperature 0.5 \
+  --temperature-cutoff-ply 30
 ```
+
+Terminal-status caching and lazy child-board materialization are enabled by the
+worker implementation; they require no command-line option. Replace the
+generation and round IDs with new unique values for later runs.
 
 The resource defaults can be overridden with `--worker-count`,
 `--active-games-per-worker`, and `--worker-gpu cpu`. Use a new
