@@ -8,7 +8,9 @@ from pink_elephant.mcts import (
     MCTSConfig,
     MCTSNode,
     PolicyValuePrediction,
+    TerminalStatus,
     _backup_value,
+    _cached_terminal_value,
     puct_score,
     root_visit_distribution,
     run_mcts,
@@ -148,6 +150,69 @@ def test_lazy_child_materialization_preserves_rule_state() -> None:
         chess.PAWN, chess.WHITE
     )
     assert en_passant_child.materialize_board().piece_at(chess.D5) is None
+
+
+@pytest.mark.parametrize(
+    ("board", "expected_value"),
+    (
+        (chess.Board("7k/6Q1/5K2/8/8/8/8/8 b - - 0 1"), -1.0),
+        (chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1"), 0.0),
+        (chess.Board("8/8/8/8/8/8/4k3/4K3 w - - 0 1"), 0.0),
+        (chess.Board("4k3/8/8/8/8/8/4K3/7R w - - 100 51"), 0.0),
+    ),
+    ids=("checkmate", "stalemate", "insufficient-material", "fifty-move-rule"),
+)
+def test_terminal_status_cache_stores_exact_outcome(
+    board: chess.Board, expected_value: float
+) -> None:
+    node = MCTSNode(board=board)
+
+    assert _cached_terminal_value(node) == expected_value
+    assert node.terminal_status is TerminalStatus.TERMINAL
+    assert node.terminal_value == expected_value
+
+
+def test_terminal_status_cache_handles_claimable_threefold_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = chess.Board()
+    for move_uci in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"):
+        board.push_uci(move_uci)
+    node = MCTSNode(board=board)
+    outcome_call_count = 0
+    original_outcome = chess.Board.outcome
+
+    def counting_outcome(self: chess.Board, *, claim_draw: bool = False) -> chess.Outcome | None:
+        nonlocal outcome_call_count
+        outcome_call_count += 1
+        return original_outcome(self, claim_draw=claim_draw)
+
+    monkeypatch.setattr(chess.Board, "outcome", counting_outcome)
+
+    assert _cached_terminal_value(node) == 0.0
+    assert _cached_terminal_value(node) == 0.0
+    assert node.terminal_status is TerminalStatus.TERMINAL
+    assert outcome_call_count == 1
+
+
+def test_terminal_status_cache_remembers_nonterminal_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = MCTSNode(board=chess.Board())
+    outcome_call_count = 0
+    original_outcome = chess.Board.outcome
+
+    def counting_outcome(self: chess.Board, *, claim_draw: bool = False) -> chess.Outcome | None:
+        nonlocal outcome_call_count
+        outcome_call_count += 1
+        return original_outcome(self, claim_draw=claim_draw)
+
+    monkeypatch.setattr(chess.Board, "outcome", counting_outcome)
+
+    assert _cached_terminal_value(node) is None
+    assert _cached_terminal_value(node) is None
+    assert node.terminal_status is TerminalStatus.NONTERMINAL
+    assert outcome_call_count == 1
 
 
 def test_puct_negates_child_value_and_applies_prior_exploration_bonus() -> None:

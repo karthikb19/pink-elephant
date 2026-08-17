@@ -21,6 +21,8 @@ identity remains `(generation_id, round_id)`.
 | 2026-08-17 00:26 | `ap-H0rFfAgdqfMCaHCQ6HYNol` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,227 | 11.959 | 11.959 | 3.593 | 34.36% |
 | 2026-08-17 10:04 | `ap-9nfTskLrvuQP5iAtW7GAST` | Completed | `1 × 4` | 2 (2 trees each) | 128 | 1,388 | 2.055 | 2.055 | 3.361 | 35.05% |
 | 2026-08-17 11:49 | `ap-noX8r2MBwEN4GNsrIhsd2L` | Completed | `1 × 2` | 2 (2 trees each) | 32 | 1,128 | 5.996 | 5.996 | 1.787 | 46.22% |
+| 2026-08-17 12:11 | `ap-TkYTONODCb0y8z6hcVNJOA` | Completed | `1 × 4` | 2 (2 trees each) | 128 | 1,397 | 3.258 | 3.258 | 3.492 | 42.21% |
+| 2026-08-17 12:21 | `ap-9j6LBwB7Sqj3XWLQo6xbVl` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,350 | 13.843 | 13.843 | 3.354 | 43.76% |
 
 `Worker wall positions/s` is committed output divided by the slowest worker duration for completed
 runs. The stopped run uses completed plus in-flight positions divided by elapsed worker time and is
@@ -41,6 +43,8 @@ not directly equivalent to final committed throughput.
 - [Lazy child boards, one worker, 32 simulations](2026-08-17-ap-H0rFfAgdqfMCaHCQ6HYNol.md)
 - [Lazy child boards, one worker, 128 simulations](2026-08-17-ap-9nfTskLrvuQP5iAtW7GAST.md)
 - [Temperature 0.5, one worker, 32 simulations](2026-08-17-ap-noX8r2MBwEN4GNsrIhsd2L.md)
+- [Terminal cache, temperature 0.5, four active games, 128 simulations](2026-08-17-ap-TkYTONODCb0y8z6hcVNJOA.md)
+- [Terminal cache, temperature 0.5, four active games, 32 simulations](2026-08-17-ap-9j6LBwB7Sqj3XWLQo6xbVl.md)
 - [Cross-run conclusions and next experiments](optimization-progress.md)
 - [Detailed throughput strategy and experiment plan](../2026-08-17-self-play-throughput-strategy.md)
 
