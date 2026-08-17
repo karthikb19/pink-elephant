@@ -219,7 +219,8 @@ Afterward, retrieve metrics or checkpoints from the Modal Volume with
 
 Initiative A generates immutable replay shards and cumulative snapshot
 manifests from the fixed Generation 1 checkpoint. By default, a Modal round
-uses one L4 worker with two physical CPUs and two active games. It waits for the
+uses one L4 worker with four physical CPUs, four MCTS processes, and eight active games
+(two games per process). It waits for the
 validated snapshot before printing its `round_completed` event. Use the
 detached Modal entrypoint for production rounds so closing the terminal does
 not cancel the worker before sealing:
