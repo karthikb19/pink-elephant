@@ -70,10 +70,14 @@ self_play_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=T
     retries=2,
     max_containers=SELF_PLAY_CONCURRENCY,
 )
-def generate_worker_modal(worker: WorkerSpec) -> WorkerResult:
+def generate_worker_modal(
+    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+) -> WorkerResult:
     """Generate one independently retryable worker invocation on CPU."""
 
-    return _generate_worker_modal(worker, device="cpu")
+    return _generate_worker_modal(
+        worker, device="cpu", autocast=autocast, torch_compile=torch_compile
+    )
 
 
 @app.function(
@@ -85,13 +89,19 @@ def generate_worker_modal(worker: WorkerSpec) -> WorkerResult:
     retries=2,
     max_containers=SELF_PLAY_CONCURRENCY,
 )
-def generate_worker_modal_l4(worker: WorkerSpec) -> WorkerResult:
+def generate_worker_modal_l4(
+    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+) -> WorkerResult:
     """Generate one independently retryable worker invocation on an L4 GPU."""
 
-    return _generate_worker_modal(worker, device="cuda")
+    return _generate_worker_modal(
+        worker, device="cuda", autocast=autocast, torch_compile=torch_compile
+    )
 
 
-def _generate_worker_modal(worker: WorkerSpec, *, device: str) -> WorkerResult:
+def _generate_worker_modal(
+    worker: WorkerSpec, *, device: str, autocast: bool = False, torch_compile: bool = False
+) -> WorkerResult:
     """Load one worker evaluator on the selected compute device and commit its result."""
 
     configure_logging()
@@ -101,6 +111,8 @@ def _generate_worker_modal(worker: WorkerSpec, *, device: str) -> WorkerResult:
         {
             "generation_id": worker.generation.generation_id,
             "device": device,
+            "model_autocast": autocast,
+            "model_torch_compile": torch_compile,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
             "worker_id": worker.worker_id,
@@ -108,7 +120,13 @@ def _generate_worker_modal(worker: WorkerSpec, *, device: str) -> WorkerResult:
     )
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     checkpoint_path = _mounted_checkpoint_path(worker.generation.checkpoint_volume_path)
-    evaluator = load_generation_evaluator(checkpoint_path, worker, device=device)
+    evaluator = load_generation_evaluator(
+        checkpoint_path,
+        worker,
+        device=device,
+        autocast=autocast,
+        torch_compile=torch_compile,
+    )
     with MultiprocessMCTSSearch(
         evaluator,
         SELF_PLAY_MCTS_PROCESS_COUNT,
@@ -284,6 +302,8 @@ def coordinate_generation_round(
     round_spec: GenerationRoundSpec,
     invocation_id: str = "invocation-0001",
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    autocast: bool = False,
+    torch_compile: bool = False,
 ) -> RoundCompletion:
     """Keep map-and-seal orchestration alive in Modal, independent of the client."""
 
@@ -296,6 +316,8 @@ def coordinate_generation_round(
             "requested_position_milestone": round_spec.requested_cumulative_positions,
             "round_id": round_spec.round_id,
             "worker_gpu": worker_gpu,
+            "model_autocast": autocast,
+            "model_torch_compile": torch_compile,
         },
     )
     if worker_gpu not in {"cpu", SELF_PLAY_L4_GPU}:
@@ -318,7 +340,16 @@ def coordinate_generation_round(
     worker_function = (
         generate_worker_modal_l4 if worker_gpu == SELF_PLAY_L4_GPU else generate_worker_modal
     )
-    generated_results = () if not missing_workers else tuple(worker_function.map(missing_workers))
+    generated_results = (
+        ()
+        if not missing_workers
+        else tuple(
+            worker_function.map(
+                missing_workers,
+                kwargs={"autocast": autocast, "torch_compile": torch_compile},
+            )
+        )
+    )
     results = (*committed_results, *generated_results)
     completion = seal_generation_round.remote(
         generation,
@@ -344,6 +375,8 @@ def launch_modal_generation_round(
     *,
     invocation_id: str = "invocation-0001",
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    autocast: bool = False,
+    torch_compile: bool = False,
 ) -> RoundCompletion:
     """Submit one coordinated round and wait for its durable completion."""
 
@@ -363,6 +396,8 @@ def launch_modal_generation_round(
             round_spec,
             invocation_id,
             worker_gpu,
+            autocast,
+            torch_compile,
         ).get()
     log_event(
         logger,
@@ -392,6 +427,8 @@ def main(
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    autocast: bool = False,
+    torch_compile: bool = False,
 ) -> None:
     """Launch a round through ``modal run --detach`` for disconnect safety."""
 
@@ -417,6 +454,8 @@ def main(
         generation,
         round_spec,
         worker_gpu=worker_gpu,
+        autocast=autocast,
+        torch_compile=torch_compile,
     ).get()
     print(json.dumps(completion.to_payload(), indent=2, sort_keys=True), flush=True)
 

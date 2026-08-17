@@ -270,6 +270,11 @@ def test_model_batch_evaluator_consumes_preencoded_position_requests() -> None:
     assert set(predictions["encoded"].legal_policy_logits) == set(request.legal_action_indices)
 
 
+def test_model_batch_evaluator_rejects_cpu_autocast() -> None:
+    with pytest.raises(ValueError, match="CUDA"):
+        ModelBatchEvaluator(RecordingModel(), autocast=True)
+
+
 def test_load_generation_evaluator_validates_checkpoint_digest(tmp_path: Path) -> None:
     generation = _smoke_generation()
     round_spec = _smoke_round(generation, "load-failure")

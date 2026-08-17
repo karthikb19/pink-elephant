@@ -2,6 +2,20 @@
 
 ## Evidence accumulated so far
 
+### Autocast plus `torch.compile` improves warm forward time, not this 10k workload
+
+The 10,000-position L4 run with both CUDA FP16 autocast and `torch.compile` completed cleanly at
+38.157 worker positions/s, compared with 38.573 positions/s for the closest eager FP32 baseline.
+Whole-run CUDA-forward time was effectively unchanged (84.425 versus 84.479 seconds), because the
+first 32 compiled batches spent 13.838 seconds compiling. In the high-batch interval from 2,080 to
+20,800 batches, compiled forward was about 2.10 ms/batch versus the eager baseline's 3.32 ms/batch.
+
+This is a promising model-kernel result, but not a production throughput result. The experiment
+changed autocast and compilation together, and the final drain contained small batches, so it does
+not identify the responsible feature or prove an end-to-end win. Keep both evaluator modes opt-in;
+run autocast-only and compile-only under the same 10,000-position configuration before changing the
+default. Legal-policy conversion, at 0.392 ms/batch, is now the more direct evaluator-side target.
+
 ### Grouping two trees per process works, with a modest matched gain
 
 The grouped `2 processes × 2 trees` implementation completed cleanly at both 32 and 128
