@@ -279,8 +279,9 @@ P_noisy(a) = (1 - epsilon) * P(a) + epsilon * eta(a)
 eta ~ Dirichlet(alpha, ..., alpha)
 ```
 
-Initial chess settings are `epsilon = 0.25` and `alpha = 0.3`. Noise applies
-only at the root and is resampled for each played move.
+Initial chess settings are `epsilon = 0.1` and `alpha = 0.3`. Noise applies
+only at the root and is resampled for each played move. The reduced fraction
+limits low-visit random moves while preserving root exploration.
 
 After search, store the normalized raw root visit counts as the policy target:
 
