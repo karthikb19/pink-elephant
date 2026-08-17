@@ -36,6 +36,7 @@ not directly equivalent to final committed throughput.
 - [Two processes with 2 ms broker coalescing, 32 simulations](2026-08-16-ap-Gs8AQr28VxB3gbpLTL1lHt.md)
 - [Two processes with 5 ms broker coalescing, 32 simulations](2026-08-16-ap-BK0IRzpe0lhQcEeoBWNLw7.md)
 - [Cross-run conclusions and next experiments](optimization-progress.md)
+- [Detailed throughput strategy and experiment plan](../2026-08-17-self-play-throughput-strategy.md)
 
 ## Measurement conventions
 
