@@ -25,6 +25,7 @@ from pink_elephant.self_play.contracts import (
     WorkerResult,
 )
 from pink_elephant.self_play.generation.config import (
+    GENERATION_1_DIRICHLET_FRACTION,
     GenerationRoundSpec,
     generation_1_spec,
 )
@@ -94,6 +95,13 @@ def _fools_mate_game() -> tuple[tuple[PendingPosition, ...], chess.Board, GameRe
         pending_positions=pending,
     )
     return tuple(pending), board, completed.record
+
+
+def test_generation_1_uses_reduced_root_dirichlet_fraction() -> None:
+    generation = generation_1_spec()
+
+    assert GENERATION_1_DIRICHLET_FRACTION == 0.1
+    assert generation.dirichlet_fraction == 0.1
 
 
 def test_batched_mcts_matches_scalar_search_and_routes_by_request_id() -> None:
