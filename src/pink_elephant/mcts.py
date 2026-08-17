@@ -128,21 +128,33 @@ class BatchedPolicyValueEvaluator(Protocol):
 
 @dataclass(slots=True)
 class MCTSNode:
-    """A chess position and the statistics accumulated by tree search.
+    """A lazily materialized chess position and its accumulated statistics.
 
     ``mean_value`` and ``total_value`` are always from the perspective of the
     player to move at this node. A child therefore contributes
-    ``-child.mean_value`` to its parent's PUCT score.
+    ``-child.mean_value`` to its parent's PUCT score. Child boards are created
+    only when search selects or otherwise needs that child.
     """
 
-    board: chess.Board
+    board: chess.Board | None
     prior_probability: float = 1.0
     move_from_parent: chess.Move | None = None
     policy_action_index: int | None = None
+    parent_node: MCTSNode | None = field(default=None, repr=False, compare=False)
     visit_count: int = 0
     total_value: float = 0.0
     expanded: bool = False
     children_by_action_index: dict[int, MCTSNode] = field(default_factory=dict)
+
+    def materialize_board(self) -> chess.Board:
+        """Return this node's history-complete board, creating it if needed."""
+
+        if self.board is None:
+            if self.parent_node is None or self.move_from_parent is None:
+                raise ValueError("a board-less node must have a parent and move")
+            self.board = self.parent_node.materialize_board().copy(stack=True)
+            self.board.push(self.move_from_parent)
+        return self.board
 
     @property
     def mean_value(self) -> float:
@@ -197,14 +209,13 @@ def run_mcts_batch(
         pending: list[tuple[list[MCTSNode], MCTSNode, str]] = []
         for tree_index, root_node in enumerate(root_nodes):
             selected_path, leaf_node = _select_leaf(root_node, search_config.exploration_constant)
-            if leaf_node.board.is_game_over(claim_draw=True):
-                _backup_value(selected_path, _terminal_value(leaf_node.board))
+            leaf_board = leaf_node.materialize_board()
+            if leaf_board.is_game_over(claim_draw=True):
+                _backup_value(selected_path, _terminal_value(leaf_board))
                 continue
             request_id = f"tree-{tree_index:04d}-simulation-{simulation_index:04d}"
             requests.append(
-                BatchEvaluationRequest(
-                    request_id=request_id, board=leaf_node.board.copy(stack=True)
-                )
+                BatchEvaluationRequest(request_id=request_id, board=leaf_board.copy(stack=True))
             )
             pending.append((selected_path, leaf_node, request_id))
 
@@ -351,8 +362,9 @@ def _run_simulation(
 
     selected_path, leaf_node = _select_leaf(root_node, exploration_constant)
 
-    if leaf_node.board.is_game_over(claim_draw=True):
-        leaf_value = _terminal_value(leaf_node.board)
+    leaf_board = leaf_node.materialize_board()
+    if leaf_board.is_game_over(claim_draw=True):
+        leaf_value = _terminal_value(leaf_board)
     else:
         leaf_value = _expand_and_evaluate(leaf_node, evaluator)
 
@@ -366,7 +378,7 @@ def _select_leaf(
 
     selected_path = [root_node]
     leaf_node = root_node
-    while leaf_node.expanded and not leaf_node.board.is_game_over(claim_draw=True):
+    while leaf_node.expanded and not leaf_node.materialize_board().is_game_over(claim_draw=True):
         leaf_node = select_child_with_puct(leaf_node, exploration_constant)
         selected_path.append(leaf_node)
     return selected_path, leaf_node
@@ -377,10 +389,11 @@ def _expand_and_evaluate(node: MCTSNode, evaluator: PolicyValueEvaluator) -> flo
 
     if node.expanded:
         raise ValueError("cannot expand an already expanded node")
-    if node.board.is_game_over(claim_draw=True):
+    node_board = node.materialize_board()
+    if node_board.is_game_over(claim_draw=True):
         raise ValueError("terminal nodes must be evaluated with the exact game outcome")
 
-    return _expand_with_prediction(node, evaluator(node.board.copy(stack=True)))
+    return _expand_with_prediction(node, evaluator(node_board.copy(stack=True)))
 
 
 def _expand_with_prediction(node: MCTSNode, prediction: PolicyValuePrediction) -> float:
@@ -388,21 +401,21 @@ def _expand_with_prediction(node: MCTSNode, prediction: PolicyValuePrediction) -
 
     if node.expanded:
         raise ValueError("cannot expand an already expanded node")
-    if node.board.is_game_over(claim_draw=True):
+    node_board = node.materialize_board()
+    if node_board.is_game_over(claim_draw=True):
         raise ValueError("terminal nodes must be evaluated with the exact game outcome")
-    legal_policy_logits = _validated_legal_policy_logits(node.board, prediction.legal_policy_logits)
+    legal_policy_logits = _validated_legal_policy_logits(node_board, prediction.legal_policy_logits)
     value_prediction = _validated_value(prediction.value)
     child_priors = _softmax_prior_probabilities(legal_policy_logits)
 
     for action_index, prior_probability in child_priors.items():
-        move = policy_index_to_move(node.board, action_index)
-        child_board = node.board.copy(stack=True)
-        child_board.push(move)
+        move = policy_index_to_move(node_board, action_index)
         node.children_by_action_index[action_index] = MCTSNode(
-            board=child_board,
+            board=None,
             prior_probability=prior_probability,
             move_from_parent=move,
             policy_action_index=action_index,
+            parent_node=node,
         )
     node.expanded = True
     return value_prediction
