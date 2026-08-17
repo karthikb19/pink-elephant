@@ -1,9 +1,7 @@
 # Group MCTS trees inside each search process
 
 **Date:** 2026-08-16
-**Status:** Superseded
-
-Superseded by [Increase MCTS trees per process](2026-08-17-increase-mcts-trees-per-process.md).
+**Status:** Accepted
 
 ## Context
 

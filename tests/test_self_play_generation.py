@@ -55,7 +55,6 @@ from pink_elephant.self_play.generation.modal_app import (
     SELF_PLAY_CPU,
     SELF_PLAY_L4_GPU,
     SELF_PLAY_MCTS_PROCESS_COUNT,
-    SELF_PLAY_MCTS_TREES_PER_PROCESS,
     _mounted_checkpoint_path,
 )
 from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
@@ -816,7 +815,6 @@ def test_modal_generation_defaults_to_one_l4_worker_with_two_cpus_and_two_games(
     assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 2
     assert SELF_PLAY_CPU == 2.0
     assert SELF_PLAY_MCTS_PROCESS_COUNT == 2
-    assert SELF_PLAY_MCTS_TREES_PER_PROCESS == 4
 
 
 @pytest.mark.parametrize(
