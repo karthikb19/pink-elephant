@@ -82,7 +82,7 @@ fell 0.70%. This rules out insufficient L4 batching as the primary bottleneck in
 implementation. At eight games, eliminating all measured model time could improve throughput by at
 most 8.2%.
 
-### Four trees per process doubled batching but left output throughput flat
+### Four trees per process was a failed throughput experiment
 
 After the terminal-status cache and temperature 0.5 changes, increasing each of two MCTS processes
 from two to four roots enabled a direct four-versus-eight-active-game comparison at 32 simulations:
@@ -95,8 +95,9 @@ from two to four roots enabled a direct four-versus-eight-active-game comparison
 The larger layout improved average model batch 92.9% and model throughput 36.1%, while worker
 throughput fell 1.1%. End-to-end throughput was effectively flat at 10.314 versus 10.264
 positions/s. The eight-game run crossed its milestone with seven games still active and overshot by
-64%, compared with 35% for the four-game run. Use a quota of at least 10,000 positions and separate
-steady-state from drain-tail throughput before making a final capacity decision.
+64%, compared with 35% for the four-game run. The experiment therefore failed its output-throughput
+objective: faster inference did not produce replay data faster, and the larger active pool increased
+short-run tail work. The four-tree capacity change was reverted.
 
 ### Horizontal workers scale throughput but reduce efficiency
 

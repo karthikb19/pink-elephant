@@ -1,4 +1,4 @@
-# Terminal cache, temperature 0.5, eight active games, 32 simulations
+# Failed experiment: eight active games with four trees per process
 
 ## Identity and status
 
@@ -6,6 +6,7 @@
 - Generation: `generation-terminal-cache-temperature05-32sims-8games-20260817`
 - Round: `round-000001`
 - Status: completed, committed, and sealed
+- Outcome: rejected; the four-tree capacity change was reverted
 - Requested positions: 1,000
 - Actual positions: 1,640
 - Snapshot SHA-256: `f4a2291ef73504bef703629f61836c7c4d326676ac1472d55bc3d1e85815097f`
@@ -95,18 +96,20 @@ It used two trees per process and four active games.
 | Model-time fraction | 43.76% | 31.77% | 11.99 points lower |
 | Quota overshoot | 35.0% | 64.0% | 29.0 points higher |
 
-The `2 × 4` layout successfully exposes batches near eight and substantially improves model
-throughput. It does not materially improve committed replay throughput in this short sample. The
-measured bottleneck shifts away from model execution, while the larger quota drain adds variance
-and end-to-end work. Different active-game scheduling also changes trajectories and the game-length
-tail, so this is strong system-shape evidence rather than a perfectly seed-matched causal result.
+The experiment failed its throughput objective. The `2 × 4` layout successfully exposes batches
+near eight and substantially improves model throughput, but committed replay throughput fell 1.1%.
+The larger layout also raised quota overshoot from 35% to 64%, adding avoidable tail work to short
+runs. Better GPU batching is not valuable by itself when the end product—sealed replay
+positions—does not arrive faster. The result does not justify retaining the higher per-process tree
+capacity.
 
-## Integrity and next experiment
+Different active-game scheduling changes trajectories and the game-length tail, so the exact 1.1%
+regression is not a perfectly seed-matched causal estimate. It is nevertheless sufficient to reject
+this implementation: there is no observed output-throughput benefit to offset its larger drain tail.
+
+## Integrity and disposition
 
 The worker completed without failures, committed one result artifact, and the coordinator sealed
 the snapshot. No duplicate logical run or shared artifact-write conflict was observed among nearby
-self-play apps.
-
-Repeat the same configuration with at least a 10,000-position milestone. Report steady-state
-throughput separately from drain-tail throughput so the larger batch capacity can be evaluated
-without a seven-game tail dominating the comparison.
+self-play apps. The implementation was reverted; this record remains so the failed batching
+experiment is not repeated without new evidence that CPU-side search is no longer the bottleneck.
