@@ -117,6 +117,26 @@ def test_multiprocess_search_batches_two_trees_per_process() -> None:
     assert search.child_search_seconds >= search.child_prediction_wait_seconds
 
 
+def test_multiprocess_search_batches_four_trees_per_process() -> None:
+    evaluator = RecordingUniformEvaluator()
+
+    with MultiprocessMCTSSearch(
+        evaluator,
+        process_count=2,
+        trees_per_process=4,
+    ) as search:
+        summaries = search.search(
+            tuple(_uniform_search_request() for _ in range(8)),
+            MCTSConfig(num_simulations=3),
+        )
+
+    assert evaluator.batch_sizes == [8, 8, 8]
+    assert len(summaries) == 8
+    assert all(summary == summaries[0] for summary in summaries)
+    assert search.child_inference_batch_count == 6
+    assert search.broker_batch_count == 3
+
+
 def test_multiprocess_search_balances_partial_tree_groups() -> None:
     evaluator = RecordingUniformEvaluator()
 
