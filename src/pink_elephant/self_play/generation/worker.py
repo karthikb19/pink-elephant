@@ -7,6 +7,7 @@ import logging
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from random import Random
@@ -62,9 +63,20 @@ logger = logging.getLogger(__name__)
 class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
     """Adapt one loaded PyTorch model to explicit-ID batched requests."""
 
-    def __init__(self, model: nn.Module, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        device: torch.device | str = "cpu",
+        *,
+        autocast: bool = False,
+        torch_compile: bool = False,
+    ) -> None:
         self.model = model
         self.device = torch.device(device)
+        if autocast and self.device.type != "cuda":
+            raise ValueError("autocast inference requires a CUDA device")
+        self.autocast = autocast
+        self.torch_compile = torch_compile
         self.batch_count = 0
         self.position_count = 0
         self.elapsed_seconds = 0.0
@@ -99,7 +111,7 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         self._synchronize_cuda()
         self.h2d_seconds += time.perf_counter() - h2d_started
 
-        with torch.inference_mode():
+        with torch.inference_mode(), self._autocast_context():
             output, forward_elapsed = self._forward_with_timing(inputs)
         self.forward_seconds += forward_elapsed
         if not isinstance(output, ModelOutput):
@@ -132,6 +144,11 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
 
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+
+    def _autocast_context(self):
+        if self.autocast:
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return nullcontext()
 
     def _forward_with_timing(self, inputs: torch.Tensor) -> tuple[object, float]:
         """Run inference and return CUDA-kernel time when the model is on CUDA."""
@@ -166,6 +183,8 @@ def load_generation_evaluator(
     worker: WorkerSpec,
     *,
     device: torch.device | str = "cpu",
+    autocast: bool = False,
+    torch_compile: bool = False,
 ) -> ModelBatchEvaluator:
     """Validate the immutable checkpoint digest and load it once on the target device."""
 
@@ -176,9 +195,14 @@ def load_generation_evaluator(
             f"expected={worker.generation.checkpoint_sha256}, got={actual_digest}"
         )
     target_device = torch.device(device)
+    if (autocast or torch_compile) and target_device.type != "cuda":
+        raise ValueError("autocast and torch.compile inference require a CUDA device")
     loaded = load_checkpoint_model(checkpoint_path, device=target_device)
     if loaded.model_spec != worker.generation.model_spec:
         raise ValueError("checkpoint model specification does not match the generation contract")
+    model = loaded.model
+    if torch_compile:
+        model = torch.compile(model, dynamic=None)
     log_event(
         logger,
         "checkpoint_validated",
@@ -188,12 +212,19 @@ def load_generation_evaluator(
             "gpu_name": (
                 torch.cuda.get_device_name(target_device) if target_device.type == "cuda" else None
             ),
+            "model_autocast": autocast,
+            "model_torch_compile": torch_compile,
             "generation_id": worker.generation.generation_id,
             "round_id": worker.round.round_id,
             "worker_id": worker.worker_id,
         },
     )
-    return ModelBatchEvaluator(loaded.model, device=target_device)
+    return ModelBatchEvaluator(
+        model,
+        device=target_device,
+        autocast=autocast,
+        torch_compile=torch_compile,
+    )
 
 
 @dataclass(slots=True)
