@@ -219,7 +219,8 @@ Afterward, retrieve metrics or checkpoints from the Modal Volume with
 
 Initiative A generates immutable replay shards and cumulative snapshot
 manifests from the fixed Generation 1 checkpoint. By default, a Modal round
-uses one L4 worker with two physical CPUs and two active games. It waits for the
+uses one L4 worker with eight physical CPUs, eight MCTS processes, and sixteen active games
+(two games per process). It waits for the
 validated snapshot before printing its `round_completed` event. Use the
 detached Modal entrypoint for production rounds so closing the terminal does
 not cancel the worker before sealing:
@@ -227,9 +228,18 @@ not cancel the worker before sealing:
 ```sh
 uv run modal run --detach --timestamps \
   src/pink_elephant/self_play/generation/modal_app.py \
+  --generation-id generation-l4-8x2-32sims-20260817 \
   --round-id round-000001 \
-  --requested-positions 10000
+  --requested-positions 1000 \
+  --simulations 32 \
+  --active-games-per-worker 16 \
+  --opening-temperature 0.5 \
+  --temperature-cutoff-ply 30
 ```
+
+Terminal-status caching and lazy child-board materialization are enabled by the
+worker implementation; they require no command-line option. Replace the
+generation and round IDs with new unique values for later runs.
 
 The resource defaults can be overridden with `--worker-count`,
 `--active-games-per-worker`, and `--worker-gpu cpu`. Use a new

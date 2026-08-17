@@ -793,7 +793,7 @@ def test_cli_passes_l4_worker_selection_to_modal_launcher(
     assert json.loads(capsys.readouterr().out)["event"] == "round_completed"
 
 
-def test_modal_generation_defaults_to_one_l4_worker_with_two_cpus_and_two_games() -> None:
+def test_modal_generation_defaults_to_one_l4_worker_with_eight_cpus_and_sixteen_games() -> None:
     parser = cli.build_parser()
 
     args = parser.parse_args(
@@ -812,9 +812,9 @@ def test_modal_generation_defaults_to_one_l4_worker_with_two_cpus_and_two_games(
     assert args.worker_gpu == SELF_PLAY_L4_GPU
     assert args.generation_id == "generation-000001"
     assert args.worker_count == GENERATION_1_WORKER_COUNT == 1
-    assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 2
-    assert SELF_PLAY_CPU == 2.0
-    assert SELF_PLAY_MCTS_PROCESS_COUNT == 2
+    assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 16
+    assert SELF_PLAY_CPU == 8.0
+    assert SELF_PLAY_MCTS_PROCESS_COUNT == 8
 
 
 @pytest.mark.parametrize(
