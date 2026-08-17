@@ -26,6 +26,7 @@ from pink_elephant.self_play.contracts import (
 )
 from pink_elephant.self_play.generation.config import (
     GENERATION_1_DIRICHLET_FRACTION,
+    GENERATION_1_OPENING_TEMPERATURE,
     GenerationRoundSpec,
     generation_1_spec,
 )
@@ -102,6 +103,13 @@ def test_generation_1_uses_reduced_root_dirichlet_fraction() -> None:
 
     assert GENERATION_1_DIRICHLET_FRACTION == 0.1
     assert generation.dirichlet_fraction == 0.1
+
+
+def test_generation_1_uses_lower_opening_temperature() -> None:
+    generation = generation_1_spec()
+
+    assert GENERATION_1_OPENING_TEMPERATURE == 0.5
+    assert generation.opening_temperature == 0.5
 
 
 def test_batched_mcts_matches_scalar_search_and_routes_by_request_id() -> None:

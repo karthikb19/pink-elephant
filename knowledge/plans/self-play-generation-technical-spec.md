@@ -298,7 +298,9 @@ Pr(a) = N(a) ** (1 / temperature)
 
 Use the opening temperature before the configured ply cutoff and select the
 maximum-visit action afterward. Temperature changes the played move, not the
-stored policy target.
+stored policy target. Generation 1 uses `temperature = 0.5` for the first 30
+plies, squaring visit counts before sampling so one-visit exploration is less
+likely to determine the played game.
 
 ## Replay example contract
 
