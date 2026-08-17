@@ -1,4 +1,4 @@
-"""CPU self-play workers and checkpoint-backed batched model evaluation."""
+"""Self-play workers and checkpoint-backed batched model evaluation."""
 
 from __future__ import annotations
 
@@ -68,6 +68,10 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         self.batch_count = 0
         self.position_count = 0
         self.elapsed_seconds = 0.0
+        self.cpu_input_seconds = 0.0
+        self.h2d_seconds = 0.0
+        self.forward_seconds = 0.0
+        self.d2h_seconds = 0.0
         self.encoding_seconds = 0.0
         self.legal_policy_seconds = 0.0
         self.batch_size_counts: Counter[int] = Counter()
@@ -80,17 +84,31 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         if not requests:
             return {}
         started = time.perf_counter()
-        encoding_started = started
+        cpu_input_started = started
         model_inputs = tuple(_model_input_for_request(request) for request in requests)
         positions = np.stack([model_input[0] for model_input in model_inputs], axis=0)
-        self.encoding_seconds += time.perf_counter() - encoding_started
-        inputs = torch.from_numpy(positions).to(self.device)
+        cpu_inputs = torch.from_numpy(positions)
+        cpu_input_elapsed = time.perf_counter() - cpu_input_started
+        self.cpu_input_seconds += cpu_input_elapsed
+        # Retain this counter for existing consumers; CPU input supersedes its old name.
+        self.encoding_seconds += cpu_input_elapsed
+
+        self._synchronize_cuda()
+        h2d_started = time.perf_counter()
+        inputs = cpu_inputs.to(self.device)
+        self._synchronize_cuda()
+        self.h2d_seconds += time.perf_counter() - h2d_started
+
         with torch.inference_mode():
-            output = self.model(inputs)
+            output, forward_elapsed = self._forward_with_timing(inputs)
+        self.forward_seconds += forward_elapsed
         if not isinstance(output, ModelOutput):
             raise TypeError("self-play model must return ModelOutput")
-        policy_logits = output.policy_logits.detach()
+
+        d2h_started = time.perf_counter()
+        policy_logits = output.policy_logits.detach().cpu()
         values = output.value.detach().cpu()
+        self.d2h_seconds += time.perf_counter() - d2h_started
         self.batch_count += 1
         self.position_count += len(requests)
         self.batch_size_counts[len(requests)] += 1
@@ -101,13 +119,34 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
             zip(requests, model_inputs, strict=True)
         ):
             index_tensor = torch.tensor(action_indices, device=policy_logits.device)
-            legal_logits = policy_logits[row_index].index_select(0, index_tensor).cpu().tolist()
+            legal_logits = policy_logits[row_index].index_select(0, index_tensor).tolist()
             predictions[request.request_id] = PolicyValuePrediction(
                 legal_policy_logits=dict(zip(action_indices, legal_logits, strict=True)),
                 value=float(values[row_index, 0].item()),
             )
         self.legal_policy_seconds += time.perf_counter() - legal_policy_started
         return predictions
+
+    def _synchronize_cuda(self) -> None:
+        """Synchronize only when CUDA timing boundaries need a completed device."""
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _forward_with_timing(self, inputs: torch.Tensor) -> tuple[object, float]:
+        """Run inference and return CUDA-kernel time when the model is on CUDA."""
+
+        if self.device.type != "cuda":
+            started = time.perf_counter()
+            return self.model(inputs), time.perf_counter() - started
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        output = self.model(inputs)
+        end_event.record()
+        end_event.synchronize()
+        return output, start_event.elapsed_time(end_event) / 1_000
 
 
 def _model_input_for_request(
@@ -322,6 +361,10 @@ def run_worker(
             if isinstance(evaluator, ModelBatchEvaluator):
                 fields.update(
                     model_encoding_seconds=evaluator.encoding_seconds,
+                    model_cpu_input_seconds=evaluator.cpu_input_seconds,
+                    model_h2d_seconds=evaluator.h2d_seconds,
+                    model_forward_seconds=evaluator.forward_seconds,
+                    model_d2h_seconds=evaluator.d2h_seconds,
                     model_batch_count=evaluator.batch_count,
                     model_evaluation_seconds=evaluator.elapsed_seconds,
                     model_legal_policy_seconds=evaluator.legal_policy_seconds,
@@ -495,6 +538,10 @@ def _completion_log_fields(
             average_model_batch_size=evaluator.position_count / evaluator.batch_count,
             model_batch_count=evaluator.batch_count,
             model_encoding_seconds=evaluator.encoding_seconds,
+            model_cpu_input_seconds=evaluator.cpu_input_seconds,
+            model_h2d_seconds=evaluator.h2d_seconds,
+            model_forward_seconds=evaluator.forward_seconds,
+            model_d2h_seconds=evaluator.d2h_seconds,
             model_evaluation_fraction=evaluator.elapsed_seconds / result.elapsed_seconds,
             model_evaluation_seconds=evaluator.elapsed_seconds,
             model_legal_policy_seconds=evaluator.legal_policy_seconds,
