@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 
 import chess
@@ -126,6 +127,14 @@ class BatchedPolicyValueEvaluator(Protocol):
         """Return exactly one prediction for every request ID."""
 
 
+class TerminalStatus(Enum):
+    """Whether a node's immutable board has been checked for termination."""
+
+    UNKNOWN = "unknown"
+    NONTERMINAL = "nonterminal"
+    TERMINAL = "terminal"
+
+
 @dataclass(slots=True)
 class MCTSNode:
     """A lazily materialized chess position and its accumulated statistics.
@@ -145,6 +154,8 @@ class MCTSNode:
     total_value: float = 0.0
     expanded: bool = False
     children_by_action_index: dict[int, MCTSNode] = field(default_factory=dict)
+    terminal_status: TerminalStatus = field(default=TerminalStatus.UNKNOWN, init=False)
+    terminal_value: float | None = field(default=None, init=False)
 
     def materialize_board(self) -> chess.Board:
         """Return this node's history-complete board, creating it if needed."""
@@ -209,10 +220,11 @@ def run_mcts_batch(
         pending: list[tuple[list[MCTSNode], MCTSNode, str]] = []
         for tree_index, root_node in enumerate(root_nodes):
             selected_path, leaf_node = _select_leaf(root_node, search_config.exploration_constant)
-            leaf_board = leaf_node.materialize_board()
-            if leaf_board.is_game_over(claim_draw=True):
-                _backup_value(selected_path, _terminal_value(leaf_board))
+            terminal_value = _cached_terminal_value(leaf_node)
+            if terminal_value is not None:
+                _backup_value(selected_path, terminal_value)
                 continue
+            leaf_board = leaf_node.materialize_board()
             request_id = f"tree-{tree_index:04d}-simulation-{simulation_index:04d}"
             requests.append(
                 BatchEvaluationRequest(request_id=request_id, board=leaf_board.copy(stack=True))
@@ -362,9 +374,9 @@ def _run_simulation(
 
     selected_path, leaf_node = _select_leaf(root_node, exploration_constant)
 
-    leaf_board = leaf_node.materialize_board()
-    if leaf_board.is_game_over(claim_draw=True):
-        leaf_value = _terminal_value(leaf_board)
+    terminal_value = _cached_terminal_value(leaf_node)
+    if terminal_value is not None:
+        leaf_value = terminal_value
     else:
         leaf_value = _expand_and_evaluate(leaf_node, evaluator)
 
@@ -378,7 +390,7 @@ def _select_leaf(
 
     selected_path = [root_node]
     leaf_node = root_node
-    while leaf_node.expanded and not leaf_node.materialize_board().is_game_over(claim_draw=True):
+    while leaf_node.expanded and _cached_terminal_value(leaf_node) is None:
         leaf_node = select_child_with_puct(leaf_node, exploration_constant)
         selected_path.append(leaf_node)
     return selected_path, leaf_node
@@ -389,9 +401,9 @@ def _expand_and_evaluate(node: MCTSNode, evaluator: PolicyValueEvaluator) -> flo
 
     if node.expanded:
         raise ValueError("cannot expand an already expanded node")
-    node_board = node.materialize_board()
-    if node_board.is_game_over(claim_draw=True):
+    if _cached_terminal_value(node) is not None:
         raise ValueError("terminal nodes must be evaluated with the exact game outcome")
+    node_board = node.materialize_board()
 
     return _expand_with_prediction(node, evaluator(node_board.copy(stack=True)))
 
@@ -401,9 +413,9 @@ def _expand_with_prediction(node: MCTSNode, prediction: PolicyValuePrediction) -
 
     if node.expanded:
         raise ValueError("cannot expand an already expanded node")
-    node_board = node.materialize_board()
-    if node_board.is_game_over(claim_draw=True):
+    if _cached_terminal_value(node) is not None:
         raise ValueError("terminal nodes must be evaluated with the exact game outcome")
+    node_board = node.materialize_board()
     legal_policy_logits = _validated_legal_policy_logits(node_board, prediction.legal_policy_logits)
     value_prediction = _validated_value(prediction.value)
     child_priors = _softmax_prior_probabilities(legal_policy_logits)
@@ -477,15 +489,25 @@ def _validated_value(value: float) -> float:
     return materialized_value
 
 
-def _terminal_value(board: chess.Board) -> float:
-    """Return an exact terminal value from the side-to-move perspective."""
+def _cached_terminal_value(node: MCTSNode) -> float | None:
+    """Return a node's exact terminal value, checking its immutable board once."""
 
+    if node.terminal_status is TerminalStatus.TERMINAL:
+        return node.terminal_value
+    if node.terminal_status is TerminalStatus.NONTERMINAL:
+        return None
+
+    board = node.materialize_board()
     outcome = board.outcome(claim_draw=True)
     if outcome is None:
-        raise ValueError("board is not terminal")
-    if outcome.winner is None:
-        return 0.0
-    return 1.0 if outcome.winner == board.turn else -1.0
+        node.terminal_status = TerminalStatus.NONTERMINAL
+        return None
+
+    node.terminal_status = TerminalStatus.TERMINAL
+    node.terminal_value = (
+        0.0 if outcome.winner is None else (1.0 if outcome.winner == board.turn else -1.0)
+    )
+    return node.terminal_value
 
 
 def _backup_value(selected_path: Sequence[MCTSNode], leaf_value: float) -> None:
