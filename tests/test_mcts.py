@@ -33,24 +33,25 @@ def _prediction_with_logits(
 def test_default_search_expands_legal_actions_and_preserves_root_board() -> None:
     board = chess.Board()
 
-    root_node = run_mcts(board, _uniform_prediction, MCTSConfig(num_simulations=4))
+    root_node = run_mcts(board, _uniform_prediction, MCTSConfig(num_simulations=1))
 
     assert root_node.board.fen() == board.fen()
     assert root_node.board is not board
     assert root_node.expanded
     assert set(root_node.children_by_action_index) == set(legal_policy_indices(board))
     assert all(
+        child_node.board is None for child_node in root_node.children_by_action_index.values()
+    )
+    materialized_child = root_node.children_by_action_index[
+        move_to_policy_index(board, chess.Move.from_uci("e2e4"))
+    ]
+    materialized_board = materialized_child.materialize_board()
+    assert all(
         child_node.move_from_parent in board.legal_moves
         for child_node in root_node.children_by_action_index.values()
     )
-    assert all(
-        child_node.board.peek() == child_node.move_from_parent
-        for child_node in root_node.children_by_action_index.values()
-    )
-    assert all(
-        child_node.board.turn != root_node.board.turn
-        for child_node in root_node.children_by_action_index.values()
-    )
+    assert materialized_board.peek() == materialized_child.move_from_parent
+    assert materialized_board.turn != root_node.materialize_board().turn
 
 
 def test_first_simulation_evaluates_only_the_root_and_backs_up_its_value() -> None:
@@ -90,6 +91,63 @@ def test_prediction_expands_only_legal_actions() -> None:
 
     assert illegal_action_index not in root_node.children_by_action_index
     assert math.isclose(sum(child_priors), 1.0)
+
+
+def test_lazy_child_materialization_preserves_rule_state() -> None:
+    repetition_board = chess.Board()
+    for move_uci in (
+        "g1f3",
+        "g8f6",
+        "f3g1",
+        "f6g8",
+        "g1f3",
+        "g8f6",
+        "f3g1",
+    ):
+        repetition_board.push_uci(move_uci)
+    repetition_action = move_to_policy_index(repetition_board, chess.Move.from_uci("f6g8"))
+    repetition_parent = MCTSNode(board=repetition_board, expanded=True)
+    repetition_child = MCTSNode(
+        board=None,
+        move_from_parent=chess.Move.from_uci("f6g8"),
+        policy_action_index=repetition_action,
+        parent_node=repetition_parent,
+    )
+
+    halfmove_board = chess.Board("4k3/8/8/8/8/8/4K3/7R w - - 99 50")
+    halfmove_action = move_to_policy_index(halfmove_board, chess.Move.from_uci("e2f2"))
+    halfmove_child = MCTSNode(
+        board=None,
+        move_from_parent=chess.Move.from_uci("e2f2"),
+        policy_action_index=halfmove_action,
+        parent_node=MCTSNode(board=halfmove_board),
+    )
+
+    castling_board = chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+    castling_action = move_to_policy_index(castling_board, chess.Move.from_uci("e1g1"))
+    castling_child = run_mcts(
+        castling_board, _uniform_prediction, MCTSConfig(num_simulations=1)
+    ).children_by_action_index[castling_action]
+
+    en_passant_board = chess.Board("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1")
+    en_passant_action = move_to_policy_index(en_passant_board, chess.Move.from_uci("e5d6"))
+    en_passant_child = run_mcts(
+        en_passant_board, _uniform_prediction, MCTSConfig(num_simulations=1)
+    ).children_by_action_index[en_passant_action]
+
+    assert repetition_child.board is None
+    assert not repetition_child.materialize_board().is_fifty_moves()
+    assert repetition_child.materialize_board().is_repetition(3)
+    assert repetition_child.materialize_board().is_game_over(claim_draw=True)
+    assert halfmove_child.materialize_board().is_fifty_moves()
+    assert castling_child.materialize_board().king(chess.WHITE) == chess.G1
+    assert castling_child.materialize_board().piece_at(chess.F1) == chess.Piece(
+        chess.ROOK, chess.WHITE
+    )
+    assert en_passant_child.materialize_board().piece_at(chess.D6) == chess.Piece(
+        chess.PAWN, chess.WHITE
+    )
+    assert en_passant_child.materialize_board().piece_at(chess.D5) is None
 
 
 def test_puct_negates_child_value_and_applies_prior_exploration_bonus() -> None:
@@ -182,7 +240,9 @@ def test_backup_switches_value_perspective_between_parent_and_child() -> None:
     assert root_node.total_value == pytest.approx(-0.75)
     assert root_node.mean_value == pytest.approx(-0.375)
     assert child_node.expanded
-    assert set(child_node.children_by_action_index) == set(legal_policy_indices(child_node.board))
+    assert set(child_node.children_by_action_index) == set(
+        legal_policy_indices(child_node.materialize_board())
+    )
 
 
 def test_simulation_budget_controls_root_visits_and_child_visits() -> None:
@@ -263,7 +323,7 @@ def test_terminal_child_is_backed_up_without_a_second_evaluator_call() -> None:
     root_node = run_mcts(board, evaluator, MCTSConfig(num_simulations=2))
     child_node = root_node.children_by_action_index[checkmating_action_index]
 
-    assert child_node.board.is_checkmate()
+    assert child_node.materialize_board().is_checkmate()
     assert len(evaluator_boards) == 1
     assert evaluator_boards[0].fen() == board.fen()
     assert child_node.visit_count == 1

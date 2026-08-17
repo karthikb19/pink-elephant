@@ -18,6 +18,7 @@ identity remains `(generation_id, round_id)`.
 | 2026-08-16 15:52 | `ap-2WsEruDiCINO7HoSDgKMP4` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,208 | 5.694 | 5.694 | 3.547 | 16.75% |
 | 2026-08-16 22:26 | `ap-Gs8AQr28VxB3gbpLTL1lHt` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,208 | 5.416 | 5.416 | 2.068 | 29.03% |
 | 2026-08-16 22:57 | `ap-BK0IRzpe0lhQcEeoBWNLw7` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,208 | 5.375 | 5.375 | 2.542 | 22.93% |
+| 2026-08-17 00:26 | `ap-H0rFfAgdqfMCaHCQ6HYNol` | Completed | `1 × 4` | 2 (2 trees each) | 32 | 1,227 | 11.959 | 11.959 | 3.593 | 34.36% |
 
 `Worker wall positions/s` is committed output divided by the slowest worker duration for completed
 runs. The stopped run uses completed plus in-flight positions divided by elapsed worker time and is
@@ -35,6 +36,7 @@ not directly equivalent to final committed throughput.
 - [Two processes with child-side leaf encoding, 32 simulations](2026-08-16-ap-2WsEruDiCINO7HoSDgKMP4.md)
 - [Two processes with 2 ms broker coalescing, 32 simulations](2026-08-16-ap-Gs8AQr28VxB3gbpLTL1lHt.md)
 - [Two processes with 5 ms broker coalescing, 32 simulations](2026-08-16-ap-BK0IRzpe0lhQcEeoBWNLw7.md)
+- [Lazy child boards, one worker, 32 simulations](2026-08-17-ap-H0rFfAgdqfMCaHCQ6HYNol.md)
 - [Cross-run conclusions and next experiments](optimization-progress.md)
 - [Detailed throughput strategy and experiment plan](../2026-08-17-self-play-throughput-strategy.md)
 
