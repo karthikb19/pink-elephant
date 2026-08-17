@@ -62,8 +62,8 @@ L4 GPU as `ap-H0rFfAgdqfMCaHCQ6HYNol`, changing only the simulation count from 3
 | Average model batch | 3.593 | 3.361 | 6.5% lower |
 
 Raw position throughput declines substantially as expected when quadrupling MCTS simulations.
-Normalizing by search work gives approximately 262 leaf-evaluations/simulation-second for this run
-versus 383 for the 32-simulation run, so the higher simulation count also has lower search efficiency in
+Normalizing by search work gives approximately 262 position-simulations/second for this run versus
+383 for the 32-simulation run, so the higher simulation count also has lower search efficiency in
 this sample. This is a throughput comparison, not a playing-strength comparison.
 
 The measured model-time fraction implies a theoretical upper bound of about 1.54x if measured
