@@ -27,6 +27,7 @@ identity remains `(generation_id, round_id)`.
 | 2026-08-17 13:26 | `ap-aAA6grS4M6nTmJrMiVexod` | Completed | `1 × 8` | 4 (2 trees each) | 32 | 1,866 | 22.246 | 22.246 | 6.665 | 35.81% |
 | 2026-08-17 13:35 | `ap-sdeUnF5RtdVcBQEqsnuKc8` | Completed; short-pilot only | `1 × 16` | 8 (2 trees each) | 32 | 2,605 | 20.685 | 20.685 | 10.634 | 30.41% |
 | 2026-08-17 13:41 | `ap-0hKz2fzWYg9ipAG9ORYcHZ` | Completed | `1 × 16` | 8 (2 trees each) | 32 | 11,644 | 28.413 | 28.413 | 13.994 | 25.30% |
+| 2026-08-17 16:52 | `ap-1ipN2SblJAndmpyiu6pu5J` | Completed | `1 × 16` | 8 (2 trees each) | 32 | 11,620 | 38.157 | 38.157 | 14.319 | 30.81% |
 
 `Worker wall positions/s` is committed output divided by the slowest worker duration for completed
 runs. The stopped run uses completed plus in-flight positions divided by elapsed worker time and is
@@ -53,6 +54,7 @@ not directly equivalent to final committed throughput.
 - [Four cores, four processes, eight games: 1,000-position run](2026-08-17-ap-aAA6grS4M6nTmJrMiVexod.md)
 - [Eight cores, eight processes, sixteen games: 1,000-position pilot](2026-08-17-ap-sdeUnF5RtdVcBQEqsnuKc8.md)
 - [Eight cores, eight processes, sixteen games: 10,000-position run](2026-08-17-ap-0hKz2fzWYg9ipAG9ORYcHZ.md)
+- [Autocast plus `torch.compile`, eight cores and sixteen games](2026-08-17-ap-1ipN2SblJAndmpyiu6pu5J.md)
 - [Cross-run conclusions and next experiments](optimization-progress.md)
 - [Detailed throughput strategy and experiment plan](../2026-08-17-self-play-throughput-strategy.md)
 
