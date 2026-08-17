@@ -49,6 +49,7 @@ SELF_PLAY_CPU: Final[float] = 8.0
 SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(SELF_PLAY_CPU)
 SELF_PLAY_MCTS_TREES_PER_PROCESS: Final[int] = 2
 SELF_PLAY_L4_GPU: Final[str] = "L4"
+SELF_PLAY_A100_40GB_GPU: Final[str] = "A100-40GB"
 SELF_PLAY_MEMORY_MB: Final[int] = 16 * 1024
 SELF_PLAY_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
 SELF_PLAY_CONCURRENCY: Final[int] = 16
@@ -93,6 +94,25 @@ def generate_worker_modal_l4(
     worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
 ) -> WorkerResult:
     """Generate one independently retryable worker invocation on an L4 GPU."""
+
+    return _generate_worker_modal(
+        worker, device="cuda", autocast=autocast, torch_compile=torch_compile
+    )
+
+
+@app.function(
+    gpu=SELF_PLAY_A100_40GB_GPU,
+    cpu=SELF_PLAY_CPU,
+    memory=SELF_PLAY_MEMORY_MB,
+    volumes={MODAL_VOLUME_MOUNT: self_play_volume},
+    timeout=SELF_PLAY_TIMEOUT_SECONDS,
+    retries=2,
+    max_containers=SELF_PLAY_CONCURRENCY,
+)
+def generate_worker_modal_a100_40gb(
+    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+) -> WorkerResult:
+    """Generate one independently retryable worker invocation on an A100 40 GB GPU."""
 
     return _generate_worker_modal(
         worker, device="cuda", autocast=autocast, torch_compile=torch_compile
@@ -320,7 +340,7 @@ def coordinate_generation_round(
             "model_torch_compile": torch_compile,
         },
     )
-    if worker_gpu not in {"cpu", SELF_PLAY_L4_GPU}:
+    if worker_gpu not in {"cpu", SELF_PLAY_L4_GPU, SELF_PLAY_A100_40GB_GPU}:
         raise ValueError(f"unsupported self-play worker GPU: {worker_gpu}")
     plan = plan_generation_round.remote(generation, round_spec, invocation_id)
     committed_results = load_committed_worker_results.remote(plan.workers)
@@ -337,9 +357,11 @@ def coordinate_generation_round(
                 "round_id": round_spec.round_id,
             },
         )
-    worker_function = (
-        generate_worker_modal_l4 if worker_gpu == SELF_PLAY_L4_GPU else generate_worker_modal
-    )
+    worker_function = {
+        "cpu": generate_worker_modal,
+        SELF_PLAY_L4_GPU: generate_worker_modal_l4,
+        SELF_PLAY_A100_40GB_GPU: generate_worker_modal_a100_40gb,
+    }[worker_gpu]
     generated_results = (
         ()
         if not missing_workers

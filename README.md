@@ -242,7 +242,8 @@ worker implementation; they require no command-line option. Replace the
 generation and round IDs with new unique values for later runs.
 
 The resource defaults can be overridden with `--worker-count`,
-`--active-games-per-worker`, and `--worker-gpu cpu`. Use a new
+`--active-games-per-worker`, and `--worker-gpu` set to `cpu`, `L4`, or
+`A100-40GB`. Use a new
 `--generation-id` when changing semantic settings such as `--simulations`; the
 existing Generation 1 manifest retains its immutable 128-simulation search
 configuration.

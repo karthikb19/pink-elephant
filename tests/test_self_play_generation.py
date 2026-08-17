@@ -52,6 +52,7 @@ from pink_elephant.self_play.generation.manifests import (
     seal_round,
 )
 from pink_elephant.self_play.generation.modal_app import (
+    SELF_PLAY_A100_40GB_GPU,
     SELF_PLAY_CPU,
     SELF_PLAY_L4_GPU,
     SELF_PLAY_MCTS_PROCESS_COUNT,
@@ -827,6 +828,49 @@ def test_cli_passes_l4_worker_selection_to_modal_launcher(
 
     assert exit_code == 0
     assert captured["worker_gpu"] == "L4"
+    assert json.loads(capsys.readouterr().out)["event"] == "round_completed"
+
+
+def test_cli_passes_a100_40gb_worker_selection_to_modal_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_launch(generation, round_spec, *, worker_gpu):
+        captured.update(generation=generation, round_spec=round_spec, worker_gpu=worker_gpu)
+        return RoundCompletion(
+            generation_id=generation.generation_id,
+            round_id=round_spec.round_id,
+            requested_position_milestone=round_spec.requested_cumulative_positions,
+            previous_actual_position_count=0,
+            new_position_count=4,
+            actual_position_count=4,
+            game_count=1,
+            snapshot_path="generation-000001/snapshots/snapshot-000001/snapshot-manifest.json",
+            snapshot_sha256="a" * 64,
+            completed_at="2026-01-01T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(cli, "launch_modal_generation_round", fake_launch)
+
+    exit_code = cli.main(
+        [
+            "generation",
+            "extend",
+            "--backend",
+            "modal",
+            "--worker-gpu",
+            SELF_PLAY_A100_40GB_GPU,
+            "--round-id",
+            "a100-cli",
+            "--requested-positions",
+            "4",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["worker_gpu"] == SELF_PLAY_A100_40GB_GPU
     assert json.loads(capsys.readouterr().out)["event"] == "round_completed"
 
 

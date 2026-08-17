@@ -24,6 +24,7 @@ from pink_elephant.self_play.generation.config import (
     generation_1_spec,
 )
 from pink_elephant.self_play.generation.modal_app import (
+    SELF_PLAY_A100_40GB_GPU,
     SELF_PLAY_L4_GPU,
     launch_modal_generation_round,
 )
@@ -51,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     extend.add_argument("--backend", choices=("local", "modal"), default="local")
     extend.add_argument(
         "--worker-gpu",
-        choices=("cpu", SELF_PLAY_L4_GPU),
+        choices=("cpu", SELF_PLAY_L4_GPU, SELF_PLAY_A100_40GB_GPU),
         default=SELF_PLAY_L4_GPU,
     )
     extend.add_argument("--checkpoint", type=Path, help="local checkpoint for the local backend")
