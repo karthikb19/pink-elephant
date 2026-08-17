@@ -230,7 +230,7 @@ uv run modal run --detach --timestamps \
   src/pink_elephant/self_play/generation/modal_app.py \
   --generation-id generation-l4-4x2-32sims-20260817 \
   --round-id round-000001 \
-  --requested-positions 10000 \
+  --requested-positions 1000 \
   --simulations 32 \
   --active-games-per-worker 8 \
   --opening-temperature 0.5 \
