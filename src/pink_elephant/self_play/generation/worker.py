@@ -117,23 +117,37 @@ class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
         if not isinstance(output, ModelOutput):
             raise TypeError("self-play model must return ModelOutput")
 
+        legal_policy_started = time.perf_counter()
+        action_indices = tuple(model_input[1] for model_input in model_inputs)
+        action_counts = tuple(len(indices) for indices in action_indices)
+        max_action_count = max(action_counts)
+        gathered_indices = np.zeros((len(requests), max_action_count), dtype=np.int64)
+        for row_index, indices in enumerate(action_indices):
+            gathered_indices[row_index, : action_counts[row_index]] = indices
+
+        index_tensor = torch.from_numpy(gathered_indices).to(self.device)
+        legal_policy_logits = output.policy_logits.gather(1, index_tensor)
+
         d2h_started = time.perf_counter()
-        policy_logits = output.policy_logits.detach().cpu()
+        legal_logits = legal_policy_logits.detach().cpu()
         values = output.value.detach().cpu()
         self.d2h_seconds += time.perf_counter() - d2h_started
         self.batch_count += 1
         self.position_count += len(requests)
         self.batch_size_counts[len(requests)] += 1
         self.elapsed_seconds += time.perf_counter() - started
-        legal_policy_started = time.perf_counter()
         predictions: dict[str, PolicyValuePrediction] = {}
-        for row_index, (request, (_, action_indices)) in enumerate(
-            zip(requests, model_inputs, strict=True)
+        for row_index, (request, indices, action_count) in enumerate(
+            zip(requests, action_indices, action_counts, strict=True)
         ):
-            index_tensor = torch.tensor(action_indices, device=policy_logits.device)
-            legal_logits = policy_logits[row_index].index_select(0, index_tensor).tolist()
             predictions[request.request_id] = PolicyValuePrediction(
-                legal_policy_logits=dict(zip(action_indices, legal_logits, strict=True)),
+                legal_policy_logits=dict(
+                    zip(
+                        indices,
+                        map(float, legal_logits[row_index, :action_count].numpy()),
+                        strict=True,
+                    )
+                ),
                 value=float(values[row_index, 0].item()),
             )
         self.legal_policy_seconds += time.perf_counter() - legal_policy_started

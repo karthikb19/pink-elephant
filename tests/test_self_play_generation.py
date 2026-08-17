@@ -142,6 +142,13 @@ class RecordingModel(nn.Module):
         )
 
 
+class IndexedPolicyModel(nn.Module):
+    def forward(self, inputs: Tensor) -> ModelOutput:
+        offsets = torch.arange(inputs.shape[0], dtype=torch.float32).unsqueeze(1)
+        policy = torch.arange(POLICY_SIZE, dtype=torch.float32).unsqueeze(0) + offsets
+        return ModelOutput(policy_logits=policy, value=torch.zeros((inputs.shape[0], 1)))
+
+
 def _smoke_generation(*, base_seed: int = 17):
     return replace(
         generation_1_spec(base_seed=base_seed),
@@ -273,6 +280,23 @@ def test_model_batch_evaluator_consumes_preencoded_position_requests() -> None:
 def test_model_batch_evaluator_rejects_cpu_autocast() -> None:
     with pytest.raises(ValueError, match="CUDA"):
         ModelBatchEvaluator(RecordingModel(), autocast=True)
+
+
+def test_model_batch_evaluator_gathers_variable_length_legal_policies() -> None:
+    encoded_position = encode_model_input(chess.Board())
+    requests = (
+        EncodedBatchEvaluationRequest("first", encoded_position, (4, 17)),
+        EncodedBatchEvaluationRequest("second", encoded_position, (0, 18, POLICY_SIZE - 1)),
+    )
+
+    predictions = ModelBatchEvaluator(IndexedPolicyModel())(requests)
+
+    assert predictions["first"].legal_policy_logits == {4: 4.0, 17: 17.0}
+    assert predictions["second"].legal_policy_logits == {
+        0: 1.0,
+        18: 19.0,
+        POLICY_SIZE - 1: float(POLICY_SIZE),
+    }
 
 
 def test_load_generation_evaluator_validates_checkpoint_digest(tmp_path: Path) -> None:
