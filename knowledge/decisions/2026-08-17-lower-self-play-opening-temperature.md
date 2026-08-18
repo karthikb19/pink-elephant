@@ -1,7 +1,7 @@
 # Lower the self-play opening temperature
 
 **Date:** 2026-08-17
-**Status:** Accepted
+**Status:** Superseded
 
 ## Context
 
