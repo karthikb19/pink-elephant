@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from random import Random
 
 import chess
 import pytest
 
+from pink_elephant.action_mapping import legal_policy_indices
 from pink_elephant.checkpoint_match_cli import (
     MatchGame,
+    VariedModelPlayer,
     _print_move,
     build_parser,
     parse_modal_source,
     resolve_checkpoint,
     score_games,
 )
+from pink_elephant.mcts import MCTSConfig, PolicyValuePrediction
 
 
 def test_parser_uses_color_balanced_match_defaults() -> None:
@@ -23,6 +27,23 @@ def test_parser_uses_color_balanced_match_defaults() -> None:
     assert args.simulations == 32
     assert args.exploration == 1.25
     assert args.max_plies == 256
+    assert args.opening_temperature == 1.0
+    assert args.temperature_cutoff_ply == 12
+    assert args.seed == 0
+
+
+def test_varied_model_player_is_reproducible_for_the_same_seed() -> None:
+    def uniform_evaluator(board: chess.Board) -> PolicyValuePrediction:
+        return PolicyValuePrediction(
+            legal_policy_logits={index: 0.0 for index in legal_policy_indices(board)},
+            value=0.0,
+        )
+
+    config = MCTSConfig(num_simulations=8)
+    first = VariedModelPlayer(uniform_evaluator, config, 1.0, 12, Random(17))
+    second = VariedModelPlayer(uniform_evaluator, config, 1.0, 12, Random(17))
+
+    assert first.choose_move(chess.Board()) == second.choose_move(chess.Board())
 
 
 def test_parse_modal_uri() -> None:
@@ -94,10 +115,10 @@ def test_resolve_checkpoint_removes_partial_download_after_failure(tmp_path: Pat
 
 def test_score_games_uses_model_a_color() -> None:
     games = (
-        MatchGame(1, "white", "1-0", "checkmate", 20, 1.0, "one.pgn"),
-        MatchGame(2, "black", "0-1", "checkmate", 22, 1.0, "two.pgn"),
-        MatchGame(3, "white", "1/2-1/2", "stalemate", 40, 1.0, "three.pgn"),
-        MatchGame(4, "black", "*", "move_limit", 50, 1.0, "four.pgn"),
+        MatchGame(1, "white", "1-0", "checkmate", 20, 1.0, "one.pgn", 10),
+        MatchGame(2, "black", "0-1", "checkmate", 22, 1.0, "two.pgn", 11),
+        MatchGame(3, "white", "1/2-1/2", "stalemate", 40, 1.0, "three.pgn", 12),
+        MatchGame(4, "black", "*", "move_limit", 50, 1.0, "four.pgn", 13),
     )
 
     score = score_games(games)

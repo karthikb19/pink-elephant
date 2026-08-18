@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from random import Random
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
@@ -21,11 +23,11 @@ import torch
 
 from pink_elephant.arena import (
     CheckpointEvaluator,
-    ModelPlayer,
     load_checkpoint_model,
     play_players,
 )
-from pink_elephant.mcts import MCTSConfig
+from pink_elephant.mcts import MCTSConfig, PolicyValueEvaluator, run_mcts
+from pink_elephant.self_play.generation.game import select_action_from_root
 
 CommandRunner = Callable[[Sequence[str]], None]
 
@@ -51,6 +53,7 @@ class MatchGame:
     plies: int
     seconds: float
     pgn: str
+    seed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +67,32 @@ class MatchScore:
     score: float
 
 
+@dataclass(slots=True)
+class VariedModelPlayer:
+    """Use MCTS with seeded visit sampling for early-game variation."""
+
+    evaluator: PolicyValueEvaluator
+    config: MCTSConfig
+    opening_temperature: float
+    temperature_cutoff_ply: int
+    rng: Random
+
+    def choose_move(self, board: chess.Board) -> chess.Move:
+        """Sample an opening move, then use highest visits after the cutoff."""
+
+        root = run_mcts(board, self.evaluator, self.config)
+        action_index = select_action_from_root(
+            root,
+            temperature=self.opening_temperature,
+            rng=self.rng,
+            greedy=board.ply() >= self.temperature_cutoff_ply,
+        )
+        selected = root.children_by_action_index[action_index]
+        if selected.move_from_parent is None:
+            raise RuntimeError("model search selected a child without a move")
+        return selected.move_from_parent
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the checkpoint match command parser."""
 
@@ -75,6 +104,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--games", type=int, default=2, help="even number of games (default: 2)")
     parser.add_argument("--simulations", type=int, default=32, help="MCTS simulations per move")
     parser.add_argument("--exploration", type=float, default=1.25, help="MCTS PUCT constant")
+    parser.add_argument(
+        "--opening-temperature",
+        type=float,
+        default=1.0,
+        help="visit-count sampling temperature during opening play (default: 1.0)",
+    )
+    parser.add_argument(
+        "--temperature-cutoff-ply",
+        type=int,
+        default=12,
+        help="opening plies sampled before greedy play (default: 12)",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="reproducible base match seed")
     parser.add_argument("--max-plies", type=int, default=256, help="maximum plies per game")
     parser.add_argument("--device", default="cpu", help="Torch device for both checkpoints")
     parser.add_argument("--torch-threads", type=int, default=4, help="Torch CPU worker threads")
@@ -121,8 +163,8 @@ def run(args: argparse.Namespace) -> int:
         num_simulations=args.simulations,
         exploration_constant=args.exploration,
     )
-    player_a = ModelPlayer(CheckpointEvaluator(loaded_a.model, device), search)
-    player_b = ModelPlayer(CheckpointEvaluator(loaded_b.model, device), search)
+    evaluator_a = CheckpointEvaluator(loaded_a.model, device)
+    evaluator_b = CheckpointEvaluator(loaded_b.model, device)
     output_dir = args.output_dir or _default_output_directory()
     output_dir.mkdir(parents=True, exist_ok=False)
     checkpoint_a_sha256 = sha256_file(checkpoint_a)
@@ -139,13 +181,30 @@ def run(args: argparse.Namespace) -> int:
     games: list[MatchGame] = []
     for game_index in range(args.games):
         a_is_white = game_index % 2 == 0
+        game_seed = args.seed + game_index
+        game_rng = Random(game_seed)
+        player_a = VariedModelPlayer(
+            evaluator_a,
+            search,
+            args.opening_temperature,
+            args.temperature_cutoff_ply,
+            game_rng,
+        )
+        player_b = VariedModelPlayer(
+            evaluator_b,
+            search,
+            args.opening_temperature,
+            args.temperature_cutoff_ply,
+            game_rng,
+        )
         started = time.perf_counter()
         white_player, black_player = (player_a, player_b) if a_is_white else (player_b, player_a)
         white_name, black_name = (
             (args.name_a, args.name_b) if a_is_white else (args.name_b, args.name_a)
         )
         print(
-            f"\nGame {game_index + 1}/{args.games}: White={white_name}, Black={black_name}",
+            f"\nGame {game_index + 1}/{args.games}: "
+            f"White={white_name}, Black={black_name}, seed={game_seed}",
             flush=True,
         )
         result = play_players(
@@ -167,6 +226,7 @@ def run(args: argparse.Namespace) -> int:
             plies=result.plies,
             seconds=round(time.perf_counter() - started, 3),
             pgn=str(pgn_path),
+            seed=game_seed,
         )
         games.append(game)
         print(f"\nResult: {result.result} ({result.termination}, {result.plies} plies)")
@@ -197,6 +257,9 @@ def run(args: argparse.Namespace) -> int:
             "games": args.games,
             "simulations": args.simulations,
             "exploration": args.exploration,
+            "opening_temperature": args.opening_temperature,
+            "temperature_cutoff_ply": args.temperature_cutoff_ply,
+            "seed": args.seed,
             "max_plies": args.max_plies,
             "device": args.device,
             "torch_threads": args.torch_threads,
@@ -336,6 +399,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-plies must be positive")
     if args.torch_threads < 1:
         raise ValueError("--torch-threads must be positive")
+    if not math.isfinite(args.opening_temperature) or args.opening_temperature <= 0:
+        raise ValueError("--opening-temperature must be finite and positive")
+    if args.temperature_cutoff_ply < 0:
+        raise ValueError("--temperature-cutoff-ply must be non-negative")
     MCTSConfig(num_simulations=args.simulations, exploration_constant=args.exploration)
 
 

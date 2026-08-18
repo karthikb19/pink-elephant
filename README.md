@@ -458,6 +458,9 @@ uv run play-checkpoints \
   --games 2 \
   --simulations 32 \
   --exploration 1.25 \
+  --opening-temperature 1.0 \
+  --temperature-cutoff-ply 12 \
+  --seed 0 \
   --max-plies 256 \
   --device cpu \
   --torch-threads 4
@@ -472,7 +475,11 @@ per game and `results.json` with both checkpoint hashes, epochs, steps, all
 match parameters, timings, and the score from model A's perspective. Model A
 plays White first and the colors alternate, so `--games` must be even. During
 the match, every move is printed live in SAN notation; each complete PGN and
-its saved path are printed immediately after its game.
+its saved path are printed immediately after its game. The first 12 plies use
+seeded sampling from MCTS visit counts at temperature 1.0, then selection
+becomes greedy. Each game receives a distinct seed derived from `--seed`; the
+seed and variation settings are recorded in `results.json`, so a varied match
+can still be replayed exactly.
 
 The executable entry point and `scripts/play_checkpoints.py` share the same
 implementation; the script can also be invoked directly with `uv run python
