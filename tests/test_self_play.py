@@ -98,11 +98,11 @@ def _fools_mate_game() -> tuple[tuple[PendingPosition, ...], chess.Board, GameRe
     return tuple(pending), board, completed.record
 
 
-def test_generation_1_uses_reduced_root_dirichlet_fraction() -> None:
+def test_generation_1_uses_increased_root_dirichlet_fraction() -> None:
     generation = generation_1_spec()
 
-    assert GENERATION_1_DIRICHLET_FRACTION == 0.1
-    assert generation.dirichlet_fraction == 0.1
+    assert GENERATION_1_DIRICHLET_FRACTION == 0.2
+    assert generation.dirichlet_fraction == 0.2
 
 
 def test_generation_1_uses_unit_opening_temperature() -> None:
