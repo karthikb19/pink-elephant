@@ -25,6 +25,19 @@ defaults are deliberately conservative:
 - legal-masked soft MCTS-policy cross-entropy plus terminal-value MSE at weight `1.0`;
 - one immutable checkpoint and one metrics record per epoch.
 
+## Live progress
+
+Modal logs an `epoch_started` event with the exact train and validation batch counts. During each
+phase it logs batch progress after the first batch, every 25 batches, and the final batch. Each
+progress record includes percent complete, elapsed time, recent seconds per batch, batches and
+positions per second, ETA, optimizer step, and current prefetch queue depth. The first five training
+batches of each epoch also report synchronized loader wait, GPU transfer, forward, backward, and
+optimizer timings, followed by their mean.
+
+For the current 1,226,456-position dataset, a 95/5 game split should produce roughly 1,138 optimizer
+batches and 60 validation batches per epoch at batch size 1,024. The exact counts are printed before
+training because complete games, rather than individual rows, are assigned to validation.
+
 Hash verification is enabled. The initial scan is intentional: it checks that every selected shard
 still matches the consolidation manifest before GPU training starts.
 

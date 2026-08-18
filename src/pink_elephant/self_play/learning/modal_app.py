@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Final
@@ -28,6 +28,7 @@ import modal
 import torch
 
 from pink_elephant.artifacts import RunIdentity, RunParameter, RunStore
+from pink_elephant.contracts import TrainingBatch
 from pink_elephant.model_adapter import build_model
 from pink_elephant.self_play.learning.replay import (
     DEFAULT_REPLAY_CAPACITY,
@@ -35,7 +36,12 @@ from pink_elephant.self_play.learning.replay import (
     DEFAULT_VALIDATION_FRACTION,
     ReplayBuffer,
 )
-from pink_elephant.training import Trainer, TrainerConfig, TrainingSummary
+from pink_elephant.training import (
+    Trainer,
+    TrainerConfig,
+    TrainingPhaseTimings,
+    TrainingSummary,
+)
 
 APP_NAME: Final[str] = "pink-elephant-self-play-training"
 DATASET_VOLUME_NAME: Final[str] = "pink-elephant-self-play-datasets"
@@ -54,6 +60,8 @@ DEFAULT_GRAD_CLIP_NORM: Final[float] = 1.0
 DEFAULT_VALUE_WEIGHT: Final[float] = 1.0
 DEFAULT_CHECKPOINT_INTERVAL: Final[int] = 1
 DEFAULT_PREFETCH_BATCHES: Final[int] = 4
+DEFAULT_PROGRESS_INTERVAL_BATCHES: Final[int] = 25
+DEFAULT_PHASE_TIMING_BATCHES: Final[int] = 5
 FUNCTION_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
 METRICS_FILENAME: Final[str] = "self-play-metrics.json"
 METRICS_HISTORY_FILENAME: Final[str] = "self-play-metrics-history.jsonl"
@@ -83,6 +91,8 @@ class SelfPlayTrainingConfig:
     value_weight: float = DEFAULT_VALUE_WEIGHT
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES
+    progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES
+    phase_timing_batches: int = DEFAULT_PHASE_TIMING_BATCHES
     seed: int = 0
     verify_hashes: bool = True
     parent_checkpoint_volume_path: str | None = None
@@ -97,11 +107,14 @@ class SelfPlayTrainingConfig:
             ("replay_capacity", self.replay_capacity),
             ("checkpoint_interval", self.checkpoint_interval),
             ("prefetch_batches", self.prefetch_batches),
+            ("progress_interval_batches", self.progress_interval_batches),
         ):
             if value < 1:
                 raise ValueError(f"{name} must be positive")
         if self.seed < 0:
             raise ValueError("seed must be non-negative")
+        if self.phase_timing_batches < 0:
+            raise ValueError("phase_timing_batches must be non-negative")
         if not 0 < self.validation_fraction < 1:
             raise ValueError("validation_fraction must be in (0, 1)")
         for name, value in (
@@ -151,6 +164,51 @@ class SelfPlayTrainingResult:
     metrics_path: str
 
 
+@dataclass(slots=True)
+class _PhaseTimingLogger:
+    """Log synchronized samples and their mean for one training epoch."""
+
+    epoch: int
+    expected_samples: int
+    samples: list[TrainingPhaseTimings] = field(default_factory=list)
+    summary_logged: bool = field(default=False, init=False)
+
+    def __call__(self, batch: int, timings: TrainingPhaseTimings) -> None:
+        self.samples.append(timings)
+        _log_event(
+            "training_phase_timing",
+            batch=batch,
+            epoch=self.epoch,
+            timings=asdict(timings),
+            total_seconds=timings.total_seconds,
+        )
+        if len(self.samples) == self.expected_samples:
+            self.log_summary()
+
+    def log_summary(self) -> None:
+        if not self.samples or self.summary_logged:
+            return
+        phase_names = (
+            "loader_wait_seconds",
+            "transfer_seconds",
+            "forward_seconds",
+            "backward_seconds",
+            "optimizer_seconds",
+        )
+        means = {
+            name: sum(getattr(sample, name) for sample in self.samples) / len(self.samples)
+            for name in phase_names
+        }
+        _log_event(
+            "training_phase_timing_summary",
+            epoch=self.epoch,
+            mean_seconds=means,
+            sample_count=len(self.samples),
+            total_mean_seconds=sum(means.values()),
+        )
+        self.summary_logged = True
+
+
 @app.function(
     gpu=DEFAULT_GPU,
     cpu=DEFAULT_CPU,
@@ -162,7 +220,6 @@ class SelfPlayTrainingResult:
 def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
     """Run or resume one checkpointed self-play replay fine-tuning job."""
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     if not torch.cuda.is_available():
         raise RuntimeError("self-play training requires a CUDA GPU")
     torch.manual_seed(config.seed)
@@ -211,11 +268,30 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
     metrics_path = layout.directory / METRICS_FILENAME
     history_path = layout.directory / METRICS_HISTORY_FILENAME
     latest_checkpoint = layout.checkpoints.list()[-1].name if config.resume else ""
-    _log_event("self_play_training_started", config=asdict(config), replay=asdict(replay.stats))
+    train_batch_count = _total_batches(replay.stats.train_positions, config.batch_size)
+    validation_batch_count = _total_batches(replay.stats.validation_positions, config.batch_size)
+    _log_event(
+        "self_play_training_started",
+        config=asdict(config),
+        replay=asdict(replay.stats),
+        train_batches_per_epoch=train_batch_count,
+        validation_batches_per_epoch=validation_batch_count,
+        total_optimizer_steps=train_batch_count * config.epochs,
+    )
 
     while trainer.epoch < config.epochs:
         started = time.perf_counter()
         target_epoch = trainer.epoch + 1
+        _log_event(
+            "epoch_started",
+            epoch=target_epoch,
+            optimizer_step=trainer.step,
+            total_epochs=config.epochs,
+            train_batches=train_batch_count,
+            train_positions=replay.stats.train_positions,
+            validation_batches=validation_batch_count,
+            validation_positions=replay.stats.validation_positions,
+        )
         train_batches = replay.iter_batches(
             split="train",
             batch_size=config.batch_size,
@@ -227,10 +303,32 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             prefetch_batches=config.prefetch_batches,
             pin_memory=True,
         )
+        timing_sample_count = min(config.phase_timing_batches, train_batch_count)
+        timing_logger = _PhaseTimingLogger(target_epoch, timing_sample_count)
         try:
-            training = trainer.train_epoch(train_batches)
+            training = trainer.train_epoch(
+                _log_batch_progress(
+                    train_batches,
+                    phase="train",
+                    epoch=target_epoch,
+                    total_batches=train_batch_count,
+                    total_examples=replay.stats.train_positions,
+                    interval_batches=config.progress_interval_batches,
+                    optimizer_step_start=trainer.step,
+                ),
+                phase_timing_batches=timing_sample_count,
+                phase_timing_observer=timing_logger if timing_sample_count else None,
+            )
         finally:
             _close_batches(train_batches)
+        timing_logger.log_summary()
+        _log_event(
+            "training_phase_completed",
+            elapsed_seconds=time.perf_counter() - started,
+            epoch=target_epoch,
+            optimizer_step=trainer.step,
+            summary=asdict(training),
+        )
         validation_batches = replay.iter_batches(
             split="validation",
             batch_size=config.batch_size,
@@ -238,10 +336,28 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             prefetch_batches=config.prefetch_batches,
             pin_memory=True,
         )
+        validation_started = time.perf_counter()
         try:
-            validation = trainer.validate(validation_batches)
+            validation = trainer.validate(
+                _log_batch_progress(
+                    validation_batches,
+                    phase="validation",
+                    epoch=target_epoch,
+                    total_batches=validation_batch_count,
+                    total_examples=replay.stats.validation_positions,
+                    interval_batches=config.progress_interval_batches,
+                    optimizer_step_start=trainer.step,
+                )
+            )
         finally:
             _close_batches(validation_batches)
+        _log_event(
+            "validation_phase_completed",
+            elapsed_seconds=time.perf_counter() - validation_started,
+            epoch=target_epoch,
+            metrics=asdict(validation),
+            optimizer_step=trainer.step,
+        )
         checkpoint_name: str | None = None
         if target_epoch % config.checkpoint_interval == 0 or target_epoch == config.epochs:
             checkpoint_path = layout.checkpoints.path_for(trainer.epoch, trainer.step)
@@ -253,6 +369,12 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             )
             checkpoint_name = checkpoint_path.name
             latest_checkpoint = checkpoint_name
+            _log_event(
+                "checkpoint_saved",
+                checkpoint=checkpoint_name,
+                epoch=trainer.epoch,
+                optimizer_step=trainer.step,
+            )
         metrics = SelfPlayEpochMetrics(
             run_id=config.run_id,
             epoch=trainer.epoch,
@@ -303,6 +425,8 @@ def main(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES,
+    progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES,
+    phase_timing_batches: int = DEFAULT_PHASE_TIMING_BATCHES,
     parent_checkpoint_volume_path: str | None = None,
     resume: bool = False,
     verify_hashes: bool = True,
@@ -319,6 +443,8 @@ def main(
         learning_rate=learning_rate,
         checkpoint_interval=checkpoint_interval,
         prefetch_batches=prefetch_batches,
+        progress_interval_batches=progress_interval_batches,
+        phase_timing_batches=phase_timing_batches,
         parent_checkpoint_volume_path=parent_checkpoint_volume_path,
         resume=resume,
         verify_hashes=verify_hashes,
@@ -384,6 +510,8 @@ def _run_parameters(
                 "parent_checkpoint": str(parent_path.relative_to(TRAINING_MOUNT)),
                 "parent_checkpoint_sha256": parent_sha256,
                 "prefetch_batches": config.prefetch_batches,
+                "progress_interval_batches": config.progress_interval_batches,
+                "phase_timing_batches": config.phase_timing_batches,
                 "replay_capacity": config.replay_capacity,
                 "seed": config.seed,
                 "training_objective": "soft-mcts-policy-cross-entropy-plus-value-mse",
@@ -409,6 +537,72 @@ def _close_batches(batches: object) -> None:
         close()
 
 
+def _log_batch_progress(
+    batches: Iterable[TrainingBatch],
+    *,
+    phase: str,
+    epoch: int,
+    total_batches: int,
+    total_examples: int,
+    interval_batches: int,
+    optimizer_step_start: int,
+) -> Iterator[TrainingBatch]:
+    """Log end-to-end throughput and ETA after periodically completed batches."""
+
+    started = time.perf_counter()
+    interval_started = started
+    interval_start_batch = 0
+    examples_completed = 0
+    for batch_index, batch in enumerate(batches, start=1):
+        batch_examples = int(batch.positions.shape[0])
+        yield batch
+        examples_completed += batch_examples
+        should_log = (
+            batch_index == 1 or batch_index % interval_batches == 0 or batch_index == total_batches
+        )
+        if not should_log:
+            continue
+        now = time.perf_counter()
+        elapsed = max(now - started, 1e-12)
+        interval_elapsed = max(now - interval_started, 1e-12)
+        interval_batch_count = batch_index - interval_start_batch
+        seconds_per_batch = interval_elapsed / interval_batch_count
+        batches_per_second = interval_batch_count / interval_elapsed
+        positions_per_second = examples_completed / elapsed
+        remaining_batches = max(0, total_batches - batch_index)
+        _log_event(
+            "batch_progress",
+            batch=batch_index,
+            batch_examples=batch_examples,
+            batches_per_second=batches_per_second,
+            elapsed_seconds=elapsed,
+            epoch=epoch,
+            eta_seconds=remaining_batches * seconds_per_batch,
+            examples_completed=examples_completed,
+            optimizer_step=(
+                optimizer_step_start + batch_index if phase == "train" else optimizer_step_start
+            ),
+            percent_complete=100 * examples_completed / total_examples,
+            phase=phase,
+            positions_per_second=positions_per_second,
+            prefetched_batches=_prefetch_depth(batches),
+            seconds_per_batch=seconds_per_batch,
+            total_batches=total_batches,
+            total_examples=total_examples,
+        )
+        interval_started = now
+        interval_start_batch = batch_index
+
+
+def _prefetch_depth(batches: object) -> int | None:
+    depth = getattr(batches, "buffered_batches", None)
+    return depth if isinstance(depth, int) else None
+
+
+def _total_batches(example_count: int, batch_size: int) -> int:
+    return (example_count + batch_size - 1) // batch_size
+
+
 def _git_revision() -> str | None:
     try:
         return subprocess.run(
@@ -422,6 +616,9 @@ def _git_revision() -> str | None:
 
 
 def _log_event(event: str, **fields: object) -> None:
-    logging.getLogger("pink_elephant.self_play.learning").info(
-        json.dumps({"event": event, **fields}, sort_keys=True)
-    )
+    payload = {
+        "event": event,
+        "timestamp": datetime.now(UTC).isoformat(),
+        **fields,
+    }
+    print(json.dumps(payload, sort_keys=True), flush=True)

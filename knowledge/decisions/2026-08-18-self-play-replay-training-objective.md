@@ -22,6 +22,8 @@ batches ahead on a bounded thread, pins them, and transfers them asynchronously 
 validation on the GPU. Training creates candidates only; promotion remains a separate arena
 decision. Use one explicitly selected `A100-40GB` Modal GPU while keeping batch size and optimizer
 settings independent of hardware selection.
+Emit live progress every 25 batches and synchronized component timings for the first five batches of
+each epoch so throughput, prefetch health, and ETA are visible before the epoch completes.
 
 ## Alternatives
 
