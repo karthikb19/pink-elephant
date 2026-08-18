@@ -233,6 +233,7 @@ uv run modal run --detach --timestamps \
   --requested-positions 1000 \
   --simulations 32 \
   --active-games-per-worker 16 \
+  --dirichlet-fraction 0.2 \
   --opening-temperature 1.0 \
   --temperature-cutoff-ply 30
 ```

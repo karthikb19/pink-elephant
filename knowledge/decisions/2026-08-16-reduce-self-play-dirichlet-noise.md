@@ -1,7 +1,7 @@
 # Reduce self-play root Dirichlet noise
 
 **Date:** 2026-08-16
-**Status:** Accepted
+**Status:** Superseded
 
 ## Context
 
