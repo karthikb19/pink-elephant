@@ -33,6 +33,34 @@ Black. Eight games are already decided inside the sampled opening: game 14 hangs
 lost by move 6. Excluding those eight, the candidate still scores about 0.39, and it converts
 poorly when ahead: game 26 was up 9 pawns at ply 16 and lost, game 30 was up 10 and drew.
 
+## The two-game greedy result does not disagree
+
+An earlier ad-hoc script played the same two checkpoints greedily from the standard position at 32
+simulations and the candidate won both games. Byte-identical checkpoints: the parent it loaded
+hashes to `9e1f7bb1`, the same file the 30-game match used.
+
+Two deterministic players from one fixed position produce exactly one game per color assignment, so
+that run has no variance to average over. Replaying the protocol confirms how brittle it is.
+
+| Protocol | Games | Candidate score |
+| --- | --- | --- |
+| Greedy, standard start, 32 simulations | 2 | 1.00 |
+| Greedy, standard start, 64 simulations | 2 | 0.00 |
+| Greedy, 5 book positions, 32 simulations | 10 | 0.15 |
+| Greedy, 5 book positions, 64 simulations | 10 | 0.30 |
+| Sampled openings, standard start, 64 simulations | 30 | 0.30 |
+
+Doubling simulations inverts the two-game verdict, and the same greedy play at the same 32
+simulations scores 0.15 once the starting position moves off the candidate's preferred line.
+Pooling every match with more than two games gives 0.270 over 50 games, 95% interval 0.164 to
+0.376, about -173 Elo. The candidate is competitive in the single line it steers toward and much
+weaker everywhere else, which is what a model overfitted to its own replay distribution looks like.
+
+The color split does not survive this either. Book games give the candidate 2.5/10 as White and
+4.0/10 as Black, reversing the sampled-opening run, so the earlier "Black problem" reading was
+mostly an artifact of unpaired sampled openings punishing Black harder, not a property of the
+model. The regression itself replicates in every protocol.
+
 ## What the problem might be
 
 1. The fine-tune flattened or corrupted the opening policy. Both models play the same sampled
@@ -45,6 +73,8 @@ poorly when ahead: game 26 was up 9 pawns at ply 16 and lost, game 30 was up 10 
 3. The measurement amplifies whatever the fine-tune did to the prior. Opening temperature 1.25
    through ply 16 samples from the visit distribution, and 64 simulations barely lets search
    correct a bad prior, so this match reads closer to a policy benchmark than a strength benchmark.
+   The book runs point the same way: 0.15 at 32 simulations against 0.30 at 64, which is what a
+   damaged prior that search can partly repair would look like, though ten games cannot settle it.
 4. Self-play data distribution. The replay window comes from the candidate's own games, which may
    never visit the human opening positions the parent knows, so the value head can also be
    miscalibrated exactly where the parent is strongest.
