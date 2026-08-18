@@ -20,7 +20,8 @@ split. Use AdamW at `1e-4`, gradient clipping at `1.0`, and immutable epoch chec
 reads only required Parquet columns in threaded 32,768-row Arrow batches, prepares four dense
 batches ahead on a bounded thread, pins them, and transfers them asynchronously without repeating
 validation on the GPU. Training creates candidates only; promotion remains a separate arena
-decision.
+decision. Use one explicitly selected `A100-40GB` Modal GPU while keeping batch size and optimizer
+settings independent of hardware selection.
 
 ## Alternatives
 

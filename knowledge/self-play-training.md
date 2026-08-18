@@ -3,7 +3,7 @@
 The training job reads `dataset-manifest.json` and replay `shard-*.parquet` files directly from the
 `pink-elephant-self-play-datasets` Modal Volume. It discovers the model architecture and parent
 checkpoint from dataset provenance, then writes run metadata, metrics, and checkpoints to
-`pink-elephant-training/runs/`.
+`pink-elephant-training/runs/`. Training runs on one explicitly requested NVIDIA A100 40 GB GPU.
 
 ## Start the first candidate
 

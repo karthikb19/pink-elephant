@@ -43,7 +43,7 @@ TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
 DATASET_MOUNT: Final[Path] = Path("/replay")
 TRAINING_MOUNT: Final[Path] = Path("/training")
 RUNS_ROOT: Final[Path] = TRAINING_MOUNT / "runs"
-DEFAULT_GPU: Final[str] = "L4"
+DEFAULT_GPU: Final[str] = "A100-40GB"
 DEFAULT_CPU: Final[float] = 4.0
 DEFAULT_MEMORY_MB: Final[int] = 16_384
 DEFAULT_BATCH_SIZE: Final[int] = 1_024
@@ -141,6 +141,7 @@ class SelfPlayTrainingResult:
     """Small result returned to the local Modal client after training."""
 
     run_id: str
+    gpu: str
     epochs_completed: int
     optimizer_steps: int
     replay_positions: int
@@ -279,6 +280,7 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
         raise RuntimeError("training completed without writing a checkpoint")
     result = SelfPlayTrainingResult(
         run_id=config.run_id,
+        gpu=DEFAULT_GPU,
         epochs_completed=trainer.epoch,
         optimizer_steps=trainer.step,
         replay_positions=replay.stats.selected_positions,
@@ -376,6 +378,7 @@ def _run_parameters(
                 "checkpoint_interval": config.checkpoint_interval,
                 "dataset_manifest": replay.source_identity,
                 "git_revision": config.git_revision,
+                "gpu": DEFAULT_GPU,
                 "grad_clip_norm": config.grad_clip_norm,
                 "learning_rate": config.learning_rate,
                 "parent_checkpoint": str(parent_path.relative_to(TRAINING_MOUNT)),

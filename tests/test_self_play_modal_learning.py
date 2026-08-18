@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from pink_elephant.self_play.learning.modal_app import (
+    DEFAULT_GPU,
     SelfPlayTrainingConfig,
     _training_volume_path,
 )
@@ -18,6 +19,7 @@ def test_self_play_modal_config_uses_conservative_defaults() -> None:
     assert config.value_weight == pytest.approx(1.0)
     assert config.grad_clip_norm == pytest.approx(1.0)
     assert config.prefetch_batches == 4
+    assert DEFAULT_GPU == "A100-40GB"
 
 
 def test_self_play_modal_config_rejects_a_zero_learning_rate() -> None:
