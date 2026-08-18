@@ -245,6 +245,28 @@ def mask_policy_logits(policy_logits: Tensor, legal_mask: Tensor) -> Tensor:
     return policy_logits.masked_fill(~legal_mask, -torch.inf)
 
 
+def _policy_cross_entropy(masked_logits: Tensor, batch: TrainingBatch) -> Tensor:
+    """Return hard-label or soft-target policy cross-entropy for one batch."""
+
+    if batch.policy_targets is None:
+        return F.cross_entropy(masked_logits, batch.played_actions)
+    if batch.policy_targets.device != masked_logits.device:
+        raise ValueError("policy logits and targets must be on the same device")
+    log_probabilities = F.log_softmax(masked_logits, dim=1)
+    target_values = batch.policy_targets.masked_select(batch.legal_mask)
+    legal_log_probabilities = log_probabilities.masked_select(batch.legal_mask)
+    legal_terms = target_values * legal_log_probabilities
+    return -legal_terms.sum() / batch.positions.shape[0]
+
+
+def _policy_labels(batch: TrainingBatch) -> Tensor:
+    """Return the reference action used only by top-k validation metrics."""
+
+    if batch.policy_targets is None:
+        return batch.played_actions
+    return batch.policy_targets.argmax(dim=1)
+
+
 def compute_joint_loss(
     output: ModelOutput,
     batch: TrainingBatch,
@@ -264,7 +286,7 @@ def compute_joint_loss(
         raise ValueError("value predictions and outcomes must be on the same device")
     if not bool(torch.isfinite(value_predictions).all()):
         raise ValueError("value predictions must contain only finite values")
-    policy_loss = F.cross_entropy(masked_logits, batch.played_actions)
+    policy_loss = _policy_cross_entropy(masked_logits, batch)
     value_loss = F.mse_loss(value_predictions, batch.outcomes)
     total_loss = policy_loss + value_weight * value_loss
     return JointLoss(total=total_loss, policy=policy_loss, value=value_loss)
@@ -299,11 +321,12 @@ def _compute_validation_metric_tensors(
         raise ValueError("value predictions must contain only finite values")
 
     legal_action_counts = batch.legal_mask.sum(dim=1).to(dtype=masked_logits.dtype)
-    policy_loss = F.cross_entropy(masked_logits, batch.played_actions)
+    policy_loss = _policy_cross_entropy(masked_logits, batch)
     uniform_policy_loss = torch.log(legal_action_counts).mean()
     top_actions = masked_logits.topk(k=min(5, POLICY_SIZE), dim=1).indices
-    top1 = top_actions[:, 0].eq(batch.played_actions).float().mean()
-    top5 = top_actions.eq(batch.played_actions.unsqueeze(1)).any(dim=1).float().mean()
+    policy_labels = _policy_labels(batch)
+    top1 = top_actions[:, 0].eq(policy_labels).float().mean()
+    top5 = top_actions.eq(policy_labels.unsqueeze(1)).any(dim=1).float().mean()
     value_errors = value_predictions - batch.outcomes
     value_mse = value_errors.square().mean()
     value_mae = value_errors.abs().mean()
@@ -633,8 +656,11 @@ class Trainer:
 
         payload = _load_checkpoint_payload(path, map_location=self.device)
         checkpoint_schema = _schema_from_payload(payload["schema"])
-        if checkpoint_schema != self.schema:
-            raise ValueError("checkpoint dataset schema does not match this trainer")
+        if (
+            checkpoint_schema.encoder_version != self.schema.encoder_version
+            or checkpoint_schema.action_schema_version != self.schema.action_schema_version
+        ):
+            raise ValueError("checkpoint encoder or action schema does not match this trainer")
         checkpoint_model_spec = self._checkpoint_model_spec(payload)
         if (
             checkpoint_model_spec is not None
@@ -670,13 +696,9 @@ class Trainer:
         return output
 
     def _on_device(self, batch: TrainingBatch) -> TrainingBatch:
-        if batch.positions.device == self.device:
-            return batch
-        return TrainingBatch(
-            positions=batch.positions.to(self.device),
-            legal_mask=batch.legal_mask.to(self.device),
-            played_actions=batch.played_actions.to(self.device),
-            outcomes=batch.outcomes.to(self.device),
+        return batch.to(
+            self.device,
+            non_blocking=batch.positions.device.type == "cpu" and batch.positions.is_pinned(),
         )
 
     def _synchronize_device(self) -> None:

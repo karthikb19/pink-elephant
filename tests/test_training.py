@@ -166,6 +166,50 @@ def test_joint_loss_has_policy_value_and_weighted_terms() -> None:
     assert torch.allclose(losses.total, expected_policy + 0.25 * expected_value)
 
 
+def test_joint_loss_learns_the_soft_mcts_policy_distribution() -> None:
+    logits = torch.zeros((2, POLICY_SIZE), dtype=torch.float32)
+    targets = torch.zeros_like(logits)
+    targets[0, [0, 1]] = torch.tensor([0.75, 0.25])
+    targets[1, [0, 1]] = torch.tensor([0.1, 0.9])
+    base = _batch(outcomes=(1.0, -1.0))
+    batch = TrainingBatch(
+        positions=base.positions,
+        legal_mask=base.legal_mask,
+        played_actions=base.played_actions,
+        outcomes=base.outcomes,
+        policy_targets=targets,
+    )
+
+    losses = compute_joint_loss(_output(logits), batch, value_weight=1.0)
+
+    expected = -(targets[:, :2] * torch.log_softmax(logits[:, :2], dim=1)).sum(dim=1).mean()
+    assert torch.allclose(losses.policy, expected)
+
+
+def test_model_weights_can_cross_from_expert_to_compatible_self_play_schema(
+    tmp_path: Path,
+) -> None:
+    expert = Trainer(
+        TinyPolicyValueModel(),
+        TrainerConfig(seed=0),
+        schema=DatasetSchema(dataset_version="expert/v1"),
+        model_spec=TINY_MODEL_SPEC,
+    )
+    checkpoint = tmp_path / "expert.pt"
+    expert.save_checkpoint(checkpoint)
+    self_play = Trainer(
+        TinyPolicyValueModel(),
+        TrainerConfig(seed=0),
+        schema=DatasetSchema(dataset_version="self-play/replay/v1"),
+        model_spec=TINY_MODEL_SPEC,
+    )
+
+    metadata = self_play.load_model_weights(checkpoint)
+
+    assert metadata.schema.dataset_version == "expert/v1"
+    assert self_play.schema.dataset_version == "self-play/replay/v1"
+
+
 def test_validation_metrics_rank_only_legal_actions() -> None:
     legal_actions = ((0, 1), (0, 1, 2, 3, 4, 5))
     batch = _batch(legal_actions=legal_actions, played_actions=(0, 0))

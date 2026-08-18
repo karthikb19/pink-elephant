@@ -59,6 +59,12 @@ _GAME_SCHEMA = pa.schema(
 )
 
 
+def validate_replay_schema(schema: pa.Schema) -> None:
+    """Validate replay columns and version metadata without reading every row."""
+
+    _validate_schema(schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+
+
 def write_replay_shard(path: Path, rows: Sequence[ReplayRow]) -> ReplayShardRef:
     """Write and immediately validate one immutable replay shard."""
 
