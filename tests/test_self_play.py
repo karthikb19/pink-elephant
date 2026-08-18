@@ -105,11 +105,11 @@ def test_generation_1_uses_reduced_root_dirichlet_fraction() -> None:
     assert generation.dirichlet_fraction == 0.1
 
 
-def test_generation_1_uses_lower_opening_temperature() -> None:
+def test_generation_1_uses_unit_opening_temperature() -> None:
     generation = generation_1_spec()
 
-    assert GENERATION_1_OPENING_TEMPERATURE == 0.5
-    assert generation.opening_temperature == 0.5
+    assert GENERATION_1_OPENING_TEMPERATURE == 1.0
+    assert generation.opening_temperature == 1.0
 
 
 def test_batched_mcts_matches_scalar_search_and_routes_by_request_id() -> None:
