@@ -27,6 +27,12 @@ from pink_elephant.arena import (
     play_players,
 )
 from pink_elephant.mcts import MCTSConfig, PolicyValueEvaluator, run_mcts
+from pink_elephant.opening_book import (
+    OpeningPosition,
+    load_opening_book,
+    playable_openings,
+    select_openings,
+)
 from pink_elephant.self_play.generation.game import select_action_from_root
 
 CommandRunner = Callable[[Sequence[str]], None]
@@ -54,6 +60,8 @@ class MatchGame:
     seconds: float
     pgn: str
     seed: int
+    opening_hash: str | None = None
+    opening_fen: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +75,58 @@ class MatchScore:
     score: float
 
 
+@dataclass(frozen=True, slots=True)
+class MatchPairing:
+    """One scheduled game: its colors, seed, and optional book position."""
+
+    game_index: int
+    a_is_white: bool
+    seed: int
+    opening: OpeningPosition | None
+
+
+def build_pairings(
+    games: int,
+    base_seed: int,
+    openings: Sequence[OpeningPosition] | None = None,
+) -> tuple[MatchPairing, ...]:
+    """Schedule color-balanced games, replaying each book position with both colors."""
+
+    if games < 2 or games % 2:
+        raise ValueError("games must be a positive, even number of at least 2")
+    if openings is not None and len(openings) != games // 2:
+        raise ValueError(f"need {games // 2} openings for {games} games, got {len(openings)}")
+    pairings: list[MatchPairing] = []
+    for game_index in range(games):
+        pair_index = game_index // 2
+        # Paired games share a seed so a color swap replays one opening, not one stream.
+        seed = base_seed + (pair_index if openings is not None else game_index)
+        pairings.append(
+            MatchPairing(
+                game_index=game_index,
+                a_is_white=game_index % 2 == 0,
+                seed=seed,
+                opening=None if openings is None else openings[pair_index],
+            )
+        )
+    return tuple(pairings)
+
+
+def resolve_openings(args: argparse.Namespace) -> tuple[OpeningPosition, ...] | None:
+    """Select the book positions for a match, or None for standard-start games."""
+
+    if args.openings is None:
+        return None
+    book = load_opening_book(args.openings)
+    usable = playable_openings(
+        book,
+        min_total_count=args.min_opening_count,
+        min_ply=args.min_opening_ply,
+        max_ply=args.max_opening_ply,
+    )
+    return select_openings(usable, args.games // 2, seed=args.opening_seed)
+
+
 @dataclass(slots=True)
 class VariedModelPlayer:
     """Use MCTS with seeded visit sampling for early-game variation."""
@@ -76,16 +136,18 @@ class VariedModelPlayer:
     opening_temperature: float
     temperature_cutoff_ply: int
     rng: Random
+    start_ply: int = 0
 
     def choose_move(self, board: chess.Board) -> chess.Move:
         """Sample an opening move, then use highest visits after the cutoff."""
 
         root = run_mcts(board, self.evaluator, self.config)
+        played_plies = board.ply() - self.start_ply
         action_index = select_action_from_root(
             root,
             temperature=self.opening_temperature,
             rng=self.rng,
-            greedy=board.ply() >= self.temperature_cutoff_ply,
+            greedy=played_plies >= self.temperature_cutoff_ply,
         )
         selected = root.children_by_action_index[action_index]
         if selected.move_from_parent is None:
@@ -117,6 +179,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="opening plies sampled before greedy play (default: 12)",
     )
     parser.add_argument("--seed", type=int, default=0, help="reproducible base match seed")
+    parser.add_argument(
+        "--openings",
+        type=Path,
+        help="JSON Lines opening book; each selected position is played once with each color",
+    )
+    parser.add_argument(
+        "--opening-seed",
+        type=int,
+        default=0,
+        help="reproducible seed for sampling book positions (default: 0)",
+    )
+    parser.add_argument(
+        "--min-opening-count",
+        type=int,
+        default=0,
+        help="skip book positions reached by fewer human games (default: 0)",
+    )
+    parser.add_argument(
+        "--min-opening-ply",
+        type=int,
+        default=0,
+        help="skip book positions shallower than this ply (default: 0)",
+    )
+    parser.add_argument(
+        "--max-opening-ply",
+        type=int,
+        help="skip book positions deeper than this ply (default: unlimited)",
+    )
     parser.add_argument("--max-plies", type=int, default=256, help="maximum plies per game")
     parser.add_argument("--device", default="cpu", help="Torch device for both checkpoints")
     parser.add_argument("--torch-threads", type=int, default=4, help="Torch CPU worker threads")
@@ -150,6 +240,8 @@ def run(args: argparse.Namespace) -> int:
     """Resolve both checkpoints, play the match, and persist its artifacts."""
 
     _validate_args(args)
+    openings = resolve_openings(args)
+    pairings = build_pairings(args.games, args.seed, openings)
     checkpoint_a = resolve_checkpoint(args.checkpoint_a, args.cache_dir)
     checkpoint_b = resolve_checkpoint(args.checkpoint_b, args.cache_dir)
     device = torch.device(args.device)
@@ -178,17 +270,23 @@ def run(args: argparse.Namespace) -> int:
         f"model-b={checkpoint_b} epoch={loaded_b.epoch} step={loaded_b.step} "
         f"sha256={checkpoint_b_sha256}"
     )
+    if openings is not None:
+        print(f"openings={args.openings} positions={len(openings)} seed={args.opening_seed}")
     games: list[MatchGame] = []
-    for game_index in range(args.games):
-        a_is_white = game_index % 2 == 0
-        game_seed = args.seed + game_index
+    for pairing in pairings:
+        game_index = pairing.game_index
+        a_is_white = pairing.a_is_white
+        game_seed = pairing.seed
         game_rng = Random(game_seed)
+        start_board = chess.Board() if pairing.opening is None else pairing.opening.board()
+        start_ply = start_board.ply()
         player_a = VariedModelPlayer(
             evaluator_a,
             search,
             args.opening_temperature,
             args.temperature_cutoff_ply,
             game_rng,
+            start_ply,
         )
         player_b = VariedModelPlayer(
             evaluator_b,
@@ -196,15 +294,17 @@ def run(args: argparse.Namespace) -> int:
             args.opening_temperature,
             args.temperature_cutoff_ply,
             game_rng,
+            start_ply,
         )
         started = time.perf_counter()
         white_player, black_player = (player_a, player_b) if a_is_white else (player_b, player_a)
         white_name, black_name = (
             (args.name_a, args.name_b) if a_is_white else (args.name_b, args.name_a)
         )
+        opening_label = "" if pairing.opening is None else f", opening={start_board.fen()}"
         print(
             f"\nGame {game_index + 1}/{args.games}: "
-            f"White={white_name}, Black={black_name}, seed={game_seed}",
+            f"White={white_name}, Black={black_name}, seed={game_seed}{opening_label}",
             flush=True,
         )
         result = play_players(
@@ -215,6 +315,7 @@ def run(args: argparse.Namespace) -> int:
             event="Pink Elephant checkpoint match",
             max_plies=args.max_plies,
             observer=_print_move,
+            start_fen=None if pairing.opening is None else start_board.fen(),
         )
         pgn_path = output_dir / f"game-{game_index + 1:04d}.pgn"
         pgn_path.write_text(result.pgn + "\n", encoding="utf-8")
@@ -227,6 +328,8 @@ def run(args: argparse.Namespace) -> int:
             seconds=round(time.perf_counter() - started, 3),
             pgn=str(pgn_path),
             seed=game_seed,
+            opening_hash=None if pairing.opening is None else pairing.opening.position_hash,
+            opening_fen=None if pairing.opening is None else start_board.fen(),
         )
         games.append(game)
         print(f"\nResult: {result.result} ({result.termination}, {result.plies} plies)")
@@ -263,7 +366,15 @@ def run(args: argparse.Namespace) -> int:
             "max_plies": args.max_plies,
             "device": args.device,
             "torch_threads": args.torch_threads,
+            "openings": None if args.openings is None else str(args.openings),
+            "opening_seed": args.opening_seed,
+            "min_opening_count": args.min_opening_count,
+            "min_opening_ply": args.min_opening_ply,
+            "max_opening_ply": args.max_opening_ply,
         },
+        "openings": (
+            None if openings is None else [position.as_payload() for position in openings]
+        ),
         "score_from_model_a_perspective": asdict(score),
         "games": [asdict(game) for game in games],
     }
@@ -403,6 +514,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--opening-temperature must be finite and positive")
     if args.temperature_cutoff_ply < 0:
         raise ValueError("--temperature-cutoff-ply must be non-negative")
+    if args.openings is not None and not args.openings.is_file():
+        raise ValueError(f"opening book does not exist: {args.openings}")
     MCTSConfig(num_simulations=args.simulations, exploration_constant=args.exploration)
 
 

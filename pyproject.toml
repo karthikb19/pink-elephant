@@ -18,6 +18,7 @@ dependencies = [
 pink-elephant = "pink_elephant.cli:main"
 play-stockfish = "pink_elephant.arena_cli:main"
 play-checkpoints = "pink_elephant.checkpoint_match_cli:main"
+pe-openings = "pink_elephant.opening_book_cli:main"
 pe-self-play = "pink_elephant.self_play.generation.cli:main"
 
 [dependency-groups]

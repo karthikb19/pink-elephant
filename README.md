@@ -485,6 +485,41 @@ The executable entry point and `scripts/play_checkpoints.py` share the same
 implementation; the script can also be invoked directly with `uv run python
 scripts/play_checkpoints.py ...`.
 
+### Human opening books
+
+Standard-start matches spend most of their variation budget on sampled opening
+moves, which measures opening policy noise more than playing strength. Pin a
+book of real human positions instead, then replay each position with both
+colors:
+
+```sh
+uv run pe-openings data/openings/members_2025-10.jsonl data/openings/human-2025-10-30.jsonl \
+  --count 30 --seed 0 --min-count 500 --min-ply 4 --max-ply 12
+```
+
+The source is any JSON Lines file of `position_hash`, `fen`, `disc_count`, and
+`conf_count` records, such as `members_2025-10.jsonl` from
+[engine-equal-human-unequal](https://github.com/jesung/engine-equal-human-unequal):
+1,661 positions that Stockfish deep-verified as approximately equal, with
+`disc_count` and `conf_count` counting how often October 2025 Lichess games
+reached each one before and after 2025-10-15. Engine-equal starting positions
+suit a match book because neither side begins with an objective advantage.
+Selection drops illegal, finished, and transposed positions, applies the
+occurrence and ply filters, and then samples reproducibly from `--seed`.
+
+Pass the book to a match with `--openings`; it must hold exactly `--games / 2`
+positions, because each position is played once with each color under a shared
+game seed. `--temperature-cutoff-ply` is then measured from the book position
+rather than the standard start, so `--temperature-cutoff-ply 0` plays every
+game greedily from the book and removes opening sampling noise entirely:
+
+```sh
+SIMULATIONS=128 ./scripts/run_book_match.sh
+```
+
+`results.json` records the selected book and each game's `opening_hash` and
+`opening_fen`, and every PGN carries `FEN`/`SetUp` headers.
+
 ## Development
 
 ```sh

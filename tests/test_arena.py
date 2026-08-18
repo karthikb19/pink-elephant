@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import chess
+import pytest
 import torch
 from torch import nn
 
@@ -151,3 +152,41 @@ def test_run_arena_results_are_persisted_below_the_run(tmp_path: Path) -> None:
 def _write_and_return(path: Path) -> Path:
     _write_checkpoint(path)
     return path
+
+
+def test_play_players_starts_from_a_book_position_and_records_it() -> None:
+    class FirstLegalMovePlayer:
+        def choose_move(self, board: chess.Board) -> chess.Move:
+            return next(iter(board.legal_moves))
+
+    start_fen = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+
+    result = play_players(
+        FirstLegalMovePlayer(),
+        FirstLegalMovePlayer(),
+        white_name="candidate",
+        black_name="parent",
+        event="Checkpoint match",
+        max_plies=3,
+        start_fen=start_fen,
+    )
+
+    assert f'[FEN "{start_fen}"]' in result.pgn
+    assert '[SetUp "1"]' in result.pgn
+    assert result.plies == 3
+
+
+def test_play_players_rejects_an_unplayable_start_position() -> None:
+    class FirstLegalMovePlayer:
+        def choose_move(self, board: chess.Board) -> chess.Move:
+            return next(iter(board.legal_moves))
+
+    with pytest.raises(ValueError, match="not playable"):
+        play_players(
+            FirstLegalMovePlayer(),
+            FirstLegalMovePlayer(),
+            white_name="candidate",
+            black_name="parent",
+            event="Checkpoint match",
+            start_fen="8/8/8/8/8/8/8/8 w - - 0 1",
+        )

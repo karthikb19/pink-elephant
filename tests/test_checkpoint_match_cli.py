@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from random import Random
@@ -12,12 +13,15 @@ from pink_elephant.checkpoint_match_cli import (
     MatchGame,
     VariedModelPlayer,
     _print_move,
+    build_pairings,
     build_parser,
     parse_modal_source,
     resolve_checkpoint,
+    resolve_openings,
     score_games,
 )
 from pink_elephant.mcts import MCTSConfig, PolicyValuePrediction
+from pink_elephant.opening_book import OpeningPosition
 
 
 def test_parser_uses_color_balanced_match_defaults() -> None:
@@ -130,3 +134,96 @@ def test_score_games_uses_model_a_color() -> None:
         1,
         5 / 6,
     )
+
+
+def test_parser_defaults_to_standard_start_positions() -> None:
+    args = build_parser().parse_args(["a.pt", "b.pt"])
+
+    assert args.openings is None
+    assert args.opening_seed == 0
+    assert args.min_opening_count == 0
+    assert args.min_opening_ply == 0
+    assert args.max_opening_ply is None
+
+
+def test_build_pairings_alternates_colors_and_advances_seeds_without_a_book() -> None:
+    pairings = build_pairings(4, 10)
+
+    assert [pairing.a_is_white for pairing in pairings] == [True, False, True, False]
+    assert [pairing.seed for pairing in pairings] == [10, 11, 12, 13]
+    assert all(pairing.opening is None for pairing in pairings)
+
+
+def test_build_pairings_replays_each_opening_with_both_colors() -> None:
+    openings = (
+        OpeningPosition(position_hash="aa", fen=chess.STARTING_FEN, disc_count=2, conf_count=0),
+        OpeningPosition(position_hash="bb", fen=chess.STARTING_FEN, disc_count=1, conf_count=0),
+    )
+
+    pairings = build_pairings(4, 5, openings)
+
+    assert [pairing.opening for pairing in pairings] == [
+        openings[0],
+        openings[0],
+        openings[1],
+        openings[1],
+    ]
+    assert [pairing.a_is_white for pairing in pairings] == [True, False, True, False]
+    assert [pairing.seed for pairing in pairings] == [5, 5, 6, 6]
+
+
+def test_build_pairings_rejects_a_book_that_does_not_cover_every_pair() -> None:
+    openings = (
+        OpeningPosition(position_hash="aa", fen=chess.STARTING_FEN, disc_count=1, conf_count=0),
+    )
+
+    with pytest.raises(ValueError, match="need 2 openings"):
+        build_pairings(4, 0, openings)
+
+
+def test_resolve_openings_selects_half_a_match_of_positions(tmp_path: Path) -> None:
+    fens = (
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+        "rnbqkb1r/pppppppp/5n2/8/2P5/8/PP1PPPPP/RNBQKBNR w KQkq - 2 2",
+        "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+    )
+    book = tmp_path / "book.jsonl"
+    book.write_text(
+        "".join(
+            json.dumps(
+                {"position_hash": f"h{index}", "fen": fen, "disc_count": 10, "conf_count": 0}
+            )
+            + "\n"
+            for index, fen in enumerate(fens)
+        )
+    )
+    args = build_parser().parse_args(
+        ["a.pt", "b.pt", "--games", "4", "--openings", str(book), "--opening-seed", "3"]
+    )
+
+    selected = resolve_openings(args)
+
+    assert selected is not None
+    assert len(selected) == 2
+    assert resolve_openings(args) == selected
+
+
+def test_varied_model_player_measures_the_cutoff_from_the_book_position() -> None:
+    def uniform_evaluator(board: chess.Board) -> PolicyValuePrediction:
+        return PolicyValuePrediction(
+            legal_policy_logits={index: 0.0 for index in legal_policy_indices(board)},
+            value=0.0,
+        )
+
+    board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3")
+    config = MCTSConfig(num_simulations=8)
+    book_rng = Random(3)
+    plain_rng = Random(3)
+    book_player = VariedModelPlayer(uniform_evaluator, config, 1.0, 4, book_rng, board.ply())
+    plain_player = VariedModelPlayer(uniform_evaluator, config, 1.0, 4, plain_rng)
+
+    book_player.choose_move(board.copy())
+    plain_player.choose_move(board.copy())
+
+    assert book_rng.getstate() != Random(3).getstate()
+    assert plain_rng.getstate() == Random(3).getstate()

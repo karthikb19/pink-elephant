@@ -168,19 +168,25 @@ def play_players(
     event: str,
     max_plies: int = 512,
     observer: MoveObserver | None = None,
+    start_fen: str | None = None,
 ) -> GameResult:
-    """Play two move providers from the standard position and return the PGN."""
+    """Play two move providers from a starting position and return the PGN."""
 
     if max_plies < 1:
         raise ValueError(f"max_plies must be positive, got {max_plies}")
 
-    board = chess.Board()
+    board = chess.Board() if start_fen is None else chess.Board(start_fen)
+    if board.status() != chess.STATUS_VALID:
+        raise ValueError(f"start position is not playable: {board.fen()}")
     game = chess.pgn.Game()
+    if start_fen is not None:
+        game.setup(board)
     game.headers["Event"] = event
     game.headers["White"] = white_name
     game.headers["Black"] = black_name
     node: chess.pgn.ChildNode | chess.pgn.Game = game
 
+    played = 0
     for ply in range(1, max_plies + 1):
         if board.is_game_over(claim_draw=True):
             break
@@ -192,6 +198,7 @@ def play_players(
         san = board.san(move)
         board.push(move)
         node = node.add_variation(move)
+        played = ply
         if observer is not None:
             observer(ply, turn, move, san)
 
@@ -203,7 +210,7 @@ def play_players(
         result = outcome.result()
         termination = outcome.termination.name.lower()
     game.headers["Result"] = result
-    return GameResult(result=result, termination=termination, plies=board.ply(), pgn=str(game))
+    return GameResult(result=result, termination=termination, plies=played, pgn=str(game))
 
 
 def _mapping_payload(loaded: object) -> Mapping[str, object]:
