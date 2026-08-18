@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+import chess
 import pytest
 
 from pink_elephant.checkpoint_match_cli import (
     MatchGame,
+    _print_move,
     build_parser,
     parse_modal_source,
     resolve_checkpoint,
@@ -70,6 +72,13 @@ def test_resolve_checkpoint_downloads_atomically_and_then_reuses_cache(tmp_path:
     assert commands[0][2:7] == ("modal", "volume", "get", "training", "runs/trial/checkpoint.pt")
     assert commands[0][-2:] == ("--env", "main")
     assert not tuple((tmp_path / "cache").glob("*.partial"))
+
+
+def test_print_move_streams_standard_move_pairs(capsys: pytest.CaptureFixture[str]) -> None:
+    _print_move(1, True, chess.Move.from_uci("e2e4"), "e4")
+    _print_move(2, False, chess.Move.from_uci("e7e5"), "e5")
+
+    assert capsys.readouterr().out == "1. e4 e5\n"
 
 
 def test_resolve_checkpoint_removes_partial_download_after_failure(tmp_path: Path) -> None:

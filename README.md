@@ -470,7 +470,9 @@ and is then reused from `data/modal-checkpoints/cache/`. The default result
 directory is timestamped under `data/checkpoint-arena/`; it contains one PGN
 per game and `results.json` with both checkpoint hashes, epochs, steps, all
 match parameters, timings, and the score from model A's perspective. Model A
-plays White first and the colors alternate, so `--games` must be even.
+plays White first and the colors alternate, so `--games` must be even. During
+the match, every move is printed live in SAN notation; each complete PGN and
+its saved path are printed immediately after its game.
 
 The executable entry point and `scripts/play_checkpoints.py` share the same
 implementation; the script can also be invoked directly with `uv run python

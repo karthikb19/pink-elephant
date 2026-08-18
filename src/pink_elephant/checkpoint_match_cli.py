@@ -89,12 +89,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="result directory (default: timestamped directory under data/checkpoint-arena)",
     )
-    parser.add_argument(
-        "--progress-every",
-        type=int,
-        default=10,
-        help="print move progress every N plies (default: 10)",
-    )
     return parser
 
 
@@ -146,29 +140,13 @@ def run(args: argparse.Namespace) -> int:
     for game_index in range(args.games):
         a_is_white = game_index % 2 == 0
         started = time.perf_counter()
-
-        def observe(
-            ply: int,
-            color: chess.Color,
-            _move: chess.Move,
-            san: str,
-            *,
-            model_a_is_white: bool = a_is_white,
-            current_game: int = game_index + 1,
-            game_started: float = started,
-        ) -> None:
-            if ply == 1 or ply % args.progress_every == 0:
-                player_name = args.name_a if color == model_a_is_white else args.name_b
-                print(
-                    f"game={current_game}/{args.games} ply={ply} "
-                    f"player={player_name} move={san} "
-                    f"elapsed={time.perf_counter() - game_started:.1f}s",
-                    flush=True,
-                )
-
         white_player, black_player = (player_a, player_b) if a_is_white else (player_b, player_a)
         white_name, black_name = (
             (args.name_a, args.name_b) if a_is_white else (args.name_b, args.name_a)
+        )
+        print(
+            f"\nGame {game_index + 1}/{args.games}: White={white_name}, Black={black_name}",
+            flush=True,
         )
         result = play_players(
             white_player,
@@ -177,7 +155,7 @@ def run(args: argparse.Namespace) -> int:
             black_name=black_name,
             event="Pink Elephant checkpoint match",
             max_plies=args.max_plies,
-            observer=observe,
+            observer=_print_move,
         )
         pgn_path = output_dir / f"game-{game_index + 1:04d}.pgn"
         pgn_path.write_text(result.pgn + "\n", encoding="utf-8")
@@ -191,7 +169,9 @@ def run(args: argparse.Namespace) -> int:
             pgn=str(pgn_path),
         )
         games.append(game)
-        print(f"completed={json.dumps(asdict(game), sort_keys=True)}", flush=True)
+        print(f"\nResult: {result.result} ({result.termination}, {result.plies} plies)")
+        print(result.pgn)
+        print(f"PGN saved: {pgn_path}", flush=True)
 
     score = score_games(games)
     payload = {
@@ -227,10 +207,11 @@ def run(args: argparse.Namespace) -> int:
     results_path = output_dir / "results.json"
     results_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(
-        f"match-summary wins={score.wins} draws={score.draws} losses={score.losses} "
-        f"unfinished={score.unfinished} score={score.score:.3f}"
+        f"\nMatch summary ({args.name_a}): "
+        f"wins={score.wins}, draws={score.draws}, losses={score.losses}, "
+        f"unfinished={score.unfinished}, score={score.score:.3f}"
     )
-    print(f"results={results_path}")
+    print(f"Results saved: {results_path}")
     return 0
 
 
@@ -260,7 +241,7 @@ def resolve_checkpoint(
     identity = hashlib.sha256(modal_source.canonical_source.encode()).hexdigest()[:12]
     destination = cache_dir / f"{stem}-{identity}{suffix}"
     if destination.is_file():
-        print(f"cache-hit source={source} path={destination}")
+        print(f"Checkpoint cache hit: {destination}")
         return destination
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +258,7 @@ def resolve_checkpoint(
     ]
     if modal_source.environment is not None:
         command.extend(("--env", modal_source.environment))
-    print(f"downloading source={source} path={destination}")
+    print(f"Downloading checkpoint: {source}")
     execute = runner or _run_command
     try:
         execute(command)
@@ -286,6 +267,7 @@ def resolve_checkpoint(
         os.replace(partial, destination)
     finally:
         partial.unlink(missing_ok=True)
+    print(f"Checkpoint cached: {destination}")
     return destination
 
 
@@ -354,8 +336,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-plies must be positive")
     if args.torch_threads < 1:
         raise ValueError("--torch-threads must be positive")
-    if args.progress_every < 1:
-        raise ValueError("--progress-every must be positive")
     MCTSConfig(num_simulations=args.simulations, exploration_constant=args.exploration)
 
 
@@ -369,6 +349,13 @@ def _clean_remote_path(path: str) -> str:
 
 def _run_command(command: Sequence[str]) -> None:
     subprocess.run(command, check=True)
+
+
+def _print_move(ply: int, turn: chess.Color, _move: chess.Move, san: str) -> None:
+    if turn == chess.WHITE:
+        print(f"{(ply + 1) // 2}. {san}", end="", flush=True)
+    else:
+        print(f" {san}", flush=True)
 
 
 def _default_output_directory() -> Path:
