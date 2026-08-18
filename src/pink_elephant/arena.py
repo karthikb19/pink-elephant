@@ -144,21 +144,48 @@ def play_game(
 ) -> GameResult:
     """Play one standard game and return its PGN."""
 
+    white_player = model_player if model_color else stockfish_player
+    black_player = stockfish_player if model_color else model_player
+    white_name = "Pink Elephant checkpoint" if model_color else "Stockfish"
+    black_name = "Stockfish" if model_color else "Pink Elephant checkpoint"
+    return play_players(
+        white_player,
+        black_player,
+        white_name=white_name,
+        black_name=black_name,
+        event="Pink Elephant Stockfish Arena",
+        max_plies=max_plies,
+        observer=observer,
+    )
+
+
+def play_players(
+    white_player: MovePlayer,
+    black_player: MovePlayer,
+    *,
+    white_name: str,
+    black_name: str,
+    event: str,
+    max_plies: int = 512,
+    observer: MoveObserver | None = None,
+) -> GameResult:
+    """Play two move providers from the standard position and return the PGN."""
+
     if max_plies < 1:
         raise ValueError(f"max_plies must be positive, got {max_plies}")
 
     board = chess.Board()
     game = chess.pgn.Game()
-    game.headers["Event"] = "Pink Elephant Stockfish Arena"
-    game.headers["White"] = "Pink Elephant checkpoint" if model_color else "Stockfish"
-    game.headers["Black"] = "Stockfish" if model_color else "Pink Elephant checkpoint"
+    game.headers["Event"] = event
+    game.headers["White"] = white_name
+    game.headers["Black"] = black_name
     node: chess.pgn.ChildNode | chess.pgn.Game = game
 
     for ply in range(1, max_plies + 1):
         if board.is_game_over(claim_draw=True):
             break
         turn = board.turn
-        player = model_player if turn == model_color else stockfish_player
+        player = white_player if turn == chess.WHITE else black_player
         move = player.choose_move(board.copy(stack=True))
         if move not in board.legal_moves:
             raise RuntimeError(f"player returned illegal move {move.uci()}")

@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from pink_elephant.action_mapping import legal_policy_indices
-from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game
+from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game, play_players
 from pink_elephant.arena_cli import ArenaGame, ArenaSummary, _persist_evaluation, build_parser
 from pink_elephant.artifacts import RunStore
 from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
@@ -91,6 +91,25 @@ def test_play_game_stops_at_move_limit_and_emits_pgn() -> None:
     assert result.termination == "move_limit"
     assert result.plies == 4
     assert "1." in result.pgn
+
+
+def test_play_players_uses_checkpoint_names_in_pgn() -> None:
+    class FirstLegalMovePlayer:
+        def choose_move(self, board: chess.Board) -> chess.Move:
+            return next(iter(board.legal_moves))
+
+    result = play_players(
+        FirstLegalMovePlayer(),
+        FirstLegalMovePlayer(),
+        white_name="candidate",
+        black_name="parent",
+        event="Checkpoint match",
+        max_plies=2,
+    )
+
+    assert '[Event "Checkpoint match"]' in result.pgn
+    assert '[White "candidate"]' in result.pgn
+    assert '[Black "parent"]' in result.pgn
 
 
 def test_arena_defaults_to_ten_games_against_1500_stockfish() -> None:

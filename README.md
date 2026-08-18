@@ -444,6 +444,38 @@ To download Stockfish without playing:
 
 An existing executable can be supplied with `--stockfish-binary`.
 
+### Checkpoint versus checkpoint
+
+Run a reproducible, color-balanced match between two local or Modal Volume
+checkpoints:
+
+```sh
+uv run play-checkpoints \
+  'modal://pink-elephant-training/runs/<candidate-run>/checkpoints/<candidate>.pt?environment=main' \
+  'modal://pink-elephant-training/runs/<parent-run>/checkpoints/<parent>.pt?environment=main' \
+  --name-a self-play-candidate \
+  --name-b parent \
+  --games 2 \
+  --simulations 32 \
+  --exploration 1.25 \
+  --max-plies 256 \
+  --device cpu \
+  --torch-threads 4
+```
+
+Either positional checkpoint may instead be an existing local path or a full
+`https://modal.com/storage/.../volumes/.../<checkpoint>.pt` URL. A remote
+checkpoint is downloaded only on a cache miss, using an atomic partial file,
+and is then reused from `data/modal-checkpoints/cache/`. The default result
+directory is timestamped under `data/checkpoint-arena/`; it contains one PGN
+per game and `results.json` with both checkpoint hashes, epochs, steps, all
+match parameters, timings, and the score from model A's perspective. Model A
+plays White first and the colors alternate, so `--games` must be even.
+
+The executable entry point and `scripts/play_checkpoints.py` share the same
+implementation; the script can also be invoked directly with `uv run python
+scripts/play_checkpoints.py ...`.
+
 ## Development
 
 ```sh
