@@ -14,7 +14,11 @@ Two details are load-bearing and were both learned from failed builds:
   copied to ``/.uv/rust``, not to the image's working directory.
 * The toolchain is installed to an explicit ``CARGO_HOME`` instead of relying on
   rustup's default of ``$HOME/.cargo``, so the location does not depend on which
-  user or ``HOME`` the builder happens to use.
+  user or ``HOME`` the builder happens to use. ``CARGO_HOME`` and ``RUSTUP_HOME``
+  must be set as image environment *before* anything invokes cargo: the binaries
+  in ``$CARGO_HOME/bin`` are rustup shims that read ``RUSTUP_HOME`` at run time to
+  find the toolchain, so setting them only on the install command leaves every
+  later layer unable to select a toolchain.
 """
 
 from __future__ import annotations
@@ -30,17 +34,24 @@ UV_ROOT: Final[str] = "/.uv"
 CARGO_HOME: Final[str] = "/opt/cargo"
 RUSTUP_HOME: Final[str] = "/opt/rustup"
 
+SYSTEM_PATH: Final[str] = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+
+RUST_ENV: Final[dict[str, str]] = {
+    "CARGO_HOME": CARGO_HOME,
+    "RUSTUP_HOME": RUSTUP_HOME,
+    "PATH": f"{CARGO_HOME}/bin:{SYSTEM_PATH}",
+}
+
 RUST_INSTALL: Final[str] = (
-    f"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
-    f"| CARGO_HOME={CARGO_HOME} RUSTUP_HOME={RUSTUP_HOME} "
-    f"sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path"
+    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
+    "| sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path"
 )
 
-# Fail in the toolchain layer with an obvious message rather than surfacing a
-# missing compiler later as an opaque maturin build error.
-RUST_VERIFY: Final[str] = f"{CARGO_HOME}/bin/cargo --version && {CARGO_HOME}/bin/rustc --version"
-
-SYSTEM_PATH: Final[str] = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+# Resolve cargo through PATH and the rustup shim rather than by absolute path, so
+# this checks the toolchain is genuinely usable the way maturin will invoke it,
+# not merely that a file exists. Failing here names the problem; failing later
+# surfaces as an opaque maturin build error.
+RUST_VERIFY: Final[str] = "cargo --version && rustc --version"
 
 
 def build_image() -> modal.Image:
@@ -49,14 +60,10 @@ def build_image() -> modal.Image:
     return (
         modal.Image.debian_slim(python_version=PYTHON_VERSION)
         .apt_install("curl", "build-essential")
+        # Set before the install so every later layer, including uv's maturin
+        # invocation, can resolve the toolchain through the rustup shims.
+        .env(RUST_ENV)
         .run_commands(RUST_INSTALL, RUST_VERIFY)
-        .env(
-            {
-                "CARGO_HOME": CARGO_HOME,
-                "RUSTUP_HOME": RUSTUP_HOME,
-                "PATH": f"{CARGO_HOME}/bin:{SYSTEM_PATH}",
-            }
-        )
         # uv resolves the `rust/pe-search` path dependency relative to UV_ROOT,
         # and needs it on disk before `uv sync` runs.
         .add_local_dir("rust", f"{UV_ROOT}/rust", copy=True)
