@@ -19,6 +19,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ID,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
+    GENERATION_1_ROOT_POLICY_TEMPERATURE,
     GENERATION_1_SHARD_POSITION_LIMIT,
     GENERATION_1_SIMULATIONS,
     GENERATION_1_TEMPERATURE_CUTOFF_PLY,
@@ -423,6 +424,7 @@ def main(
     exploration_constant: float = GENERATION_1_PUCT,
     dirichlet_alpha: float = GENERATION_1_DIRICHLET_ALPHA,
     dirichlet_fraction: float = GENERATION_1_DIRICHLET_FRACTION,
+    root_policy_temperature: float = GENERATION_1_ROOT_POLICY_TEMPERATURE,
     opening_temperature: float = GENERATION_1_OPENING_TEMPERATURE,
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
@@ -439,6 +441,7 @@ def main(
         exploration_constant=exploration_constant,
         dirichlet_alpha=dirichlet_alpha,
         dirichlet_fraction=dirichlet_fraction,
+        root_policy_temperature=root_policy_temperature,
         opening_temperature=opening_temperature,
         temperature_cutoff_ply=temperature_cutoff_ply,
     )

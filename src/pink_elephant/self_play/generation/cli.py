@@ -16,6 +16,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ID,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
+    GENERATION_1_ROOT_POLICY_TEMPERATURE,
     GENERATION_1_SHARD_POSITION_LIMIT,
     GENERATION_1_SIMULATIONS,
     GENERATION_1_TEMPERATURE_CUTOFF_PLY,
@@ -70,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     extend.add_argument("--dirichlet-alpha", type=float, default=GENERATION_1_DIRICHLET_ALPHA)
     extend.add_argument("--dirichlet-fraction", type=float, default=GENERATION_1_DIRICHLET_FRACTION)
     extend.add_argument(
+        "--root-policy-temperature", type=float, default=GENERATION_1_ROOT_POLICY_TEMPERATURE
+    )
+    extend.add_argument(
         "--opening-temperature", type=float, default=GENERATION_1_OPENING_TEMPERATURE
     )
     extend.add_argument(
@@ -102,6 +106,7 @@ def _extend_generation(args: argparse.Namespace) -> int:
         exploration_constant=args.exploration_constant,
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_fraction=args.dirichlet_fraction,
+        root_policy_temperature=args.root_policy_temperature,
         opening_temperature=args.opening_temperature,
         temperature_cutoff_ply=args.temperature_cutoff_ply,
     )

@@ -17,6 +17,7 @@ from pink_elephant.mcts import (
     MCTSConfig,
     MCTSNode,
     MCTSRootSummary,
+    apply_root_policy_temperature,
     root_visit_distribution,
     run_mcts_batch,
     summarize_root,
@@ -55,17 +56,21 @@ def make_root_dirichlet_modifier(
     *,
     alpha: float,
     fraction: float,
+    policy_temperature: float = 1.0,
 ) -> Callable[[MCTSNode], None]:
-    """Create a root-only seeded Dirichlet-prior modifier."""
+    """Create a root-only modifier applying policy temperature then seeded noise."""
 
     if not math.isfinite(alpha) or alpha <= 0:
         raise ValueError("Dirichlet alpha must be finite and positive")
     if not math.isfinite(fraction) or not 0 <= fraction <= 1:
         raise ValueError("Dirichlet fraction must be finite and in [0, 1]")
+    if not math.isfinite(policy_temperature) or policy_temperature <= 0:
+        raise ValueError("root policy temperature must be finite and positive")
 
     def apply(root_node: MCTSNode) -> None:
         if not root_node.children_by_action_index:
             return
+        apply_root_policy_temperature(root_node, policy_temperature)
         action_indices = tuple(sorted(root_node.children_by_action_index))
         noise = rng.dirichlet(np.full(len(action_indices), alpha, dtype=np.float64))
         for action_index, noise_probability in zip(action_indices, noise, strict=True):
@@ -254,6 +259,7 @@ def run_self_play_game(
             noise_rng,
             alpha=generation.dirichlet_alpha,
             fraction=generation.dirichlet_fraction,
+            policy_temperature=generation.root_policy_temperature,
         )
         root = run_mcts_batch(
             (current_board,),

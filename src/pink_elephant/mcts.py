@@ -32,7 +32,7 @@ class MCTSConfig:
     """Configuration for one tree search."""
 
     num_simulations: int = 32
-    exploration_constant: float = 1.25
+    exploration_constant: float = 1.1
 
     def __post_init__(self) -> None:
         if not isinstance(self.num_simulations, int) or isinstance(self.num_simulations, bool):
@@ -330,6 +330,26 @@ def root_visit_distribution(root_node: MCTSNode) -> dict[int, float]:
         action_index: child_node.prior_probability / total_prior_probability
         for action_index, child_node in root_node.children_by_action_index.items()
     }
+
+
+def apply_root_policy_temperature(root_node: MCTSNode, temperature: float) -> None:
+    """Sharpen or flatten root priors by a softmax temperature, in place."""
+
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError(f"root policy temperature must be finite and positive, got {temperature}")
+    if temperature == 1.0 or not root_node.children_by_action_index:
+        return
+    # Priors are already softmax outputs, so a logit temperature is a power on probabilities.
+    exponent = 1.0 / temperature
+    scaled = {
+        action_index: child_node.prior_probability**exponent
+        for action_index, child_node in root_node.children_by_action_index.items()
+    }
+    total = sum(scaled.values())
+    if total <= 0 or not math.isfinite(total):
+        raise ValueError("root child priors must have a positive finite total")
+    for action_index, child_node in root_node.children_by_action_index.items():
+        child_node.prior_probability = scaled[action_index] / total
 
 
 def summarize_root(root_node: MCTSNode) -> MCTSRootSummary:
