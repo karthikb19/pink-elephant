@@ -51,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     extend.add_argument("--requested-positions", type=int, required=True)
     extend.add_argument("--backend", choices=("local", "modal"), default="local")
     extend.add_argument(
+        "--search-backend",
+        choices=("native", "python"),
+        default="native",
+        help="native runs the Rust engine; python retains the legacy path for comparison",
+    )
+    extend.add_argument(
         "--worker-gpu",
         choices=("cpu", SELF_PLAY_L4_GPU),
         default=SELF_PLAY_L4_GPU,
@@ -126,12 +132,14 @@ def _extend_generation(args: argparse.Namespace) -> int:
             generation,
             round_spec,
             args.checkpoint,
+            search_backend=args.search_backend,
         )
     else:
         completion = launch_modal_generation_round(
             generation,
             round_spec,
             worker_gpu=args.worker_gpu,
+            search_backend=args.search_backend,
         )
     print(json.dumps(completion.to_payload(), indent=2, sort_keys=True))
     return 0

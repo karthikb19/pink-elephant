@@ -40,7 +40,12 @@ from pink_elephant.self_play.generation.manifests import (
 from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
 from pink_elephant.self_play.generation.shards import sha256_file
-from pink_elephant.self_play.generation.worker import load_generation_evaluator, run_worker
+from pink_elephant.self_play.generation.worker import (
+    load_generation_evaluator,
+    load_generation_model,
+    run_native_worker,
+    run_worker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +74,19 @@ self_play_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=T
     max_containers=SELF_PLAY_CONCURRENCY,
 )
 def generate_worker_modal(
-    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+    worker: WorkerSpec,
+    autocast: bool = False,
+    torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> WorkerResult:
     """Generate one independently retryable worker invocation on CPU."""
 
     return _generate_worker_modal(
-        worker, device="cpu", autocast=autocast, torch_compile=torch_compile
+        worker,
+        device="cpu",
+        autocast=autocast,
+        torch_compile=torch_compile,
+        search_backend=search_backend,
     )
 
 
@@ -88,19 +100,31 @@ def generate_worker_modal(
     max_containers=SELF_PLAY_CONCURRENCY,
 )
 def generate_worker_modal_l4(
-    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+    worker: WorkerSpec,
+    autocast: bool = False,
+    torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> WorkerResult:
     """Generate one independently retryable worker invocation on an L4 GPU."""
 
     return _generate_worker_modal(
-        worker, device="cuda", autocast=autocast, torch_compile=torch_compile
+        worker,
+        device="cuda",
+        autocast=autocast,
+        torch_compile=torch_compile,
+        search_backend=search_backend,
     )
 
 
 def _generate_worker_modal(
-    worker: WorkerSpec, *, device: str, autocast: bool = False, torch_compile: bool = False
+    worker: WorkerSpec,
+    *,
+    device: str,
+    autocast: bool = False,
+    torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> WorkerResult:
-    """Load one worker evaluator on the selected compute device and commit its result."""
+    """Load one worker model on the selected compute device and commit its result."""
 
     configure_logging()
     log_event(
@@ -113,24 +137,31 @@ def _generate_worker_modal(
             "model_torch_compile": torch_compile,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
+            "search_backend": search_backend,
             "worker_id": worker.worker_id,
         },
     )
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     checkpoint_path = _mounted_checkpoint_path(worker.generation.checkpoint_volume_path)
-    evaluator = load_generation_evaluator(
-        checkpoint_path,
-        worker,
-        device=device,
-        autocast=autocast,
-        torch_compile=torch_compile,
-    )
-    with MultiprocessMCTSSearch(
-        evaluator,
-        SELF_PLAY_MCTS_PROCESS_COUNT,
-        trees_per_process=SELF_PLAY_MCTS_TREES_PER_PROCESS,
-    ) as process_search:
-        result = run_worker(worker, evaluator, output_root, process_search=process_search)
+    if search_backend == "native":
+        model = load_generation_model(
+            checkpoint_path, worker, device=device, torch_compile=torch_compile
+        )
+        result = run_native_worker(worker, model, output_root, device=device, autocast=autocast)
+    else:
+        evaluator = load_generation_evaluator(
+            checkpoint_path,
+            worker,
+            device=device,
+            autocast=autocast,
+            torch_compile=torch_compile,
+        )
+        with MultiprocessMCTSSearch(
+            evaluator,
+            SELF_PLAY_MCTS_PROCESS_COUNT,
+            trees_per_process=SELF_PLAY_MCTS_TREES_PER_PROCESS,
+        ) as process_search:
+            result = run_worker(worker, evaluator, output_root, process_search=process_search)
     self_play_volume.commit()
     log_event(
         logger,
@@ -302,6 +333,7 @@ def coordinate_generation_round(
     worker_gpu: str = SELF_PLAY_L4_GPU,
     autocast: bool = False,
     torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> RoundCompletion:
     """Keep map-and-seal orchestration alive in Modal, independent of the client."""
 
@@ -316,6 +348,7 @@ def coordinate_generation_round(
             "worker_gpu": worker_gpu,
             "model_autocast": autocast,
             "model_torch_compile": torch_compile,
+            "search_backend": search_backend,
         },
     )
     if worker_gpu not in {"cpu", SELF_PLAY_L4_GPU}:
@@ -344,7 +377,11 @@ def coordinate_generation_round(
         else tuple(
             worker_function.map(
                 missing_workers,
-                kwargs={"autocast": autocast, "torch_compile": torch_compile},
+                kwargs={
+                    "autocast": autocast,
+                    "torch_compile": torch_compile,
+                    "search_backend": search_backend,
+                },
             )
         )
     )
@@ -375,6 +412,7 @@ def launch_modal_generation_round(
     worker_gpu: str = SELF_PLAY_L4_GPU,
     autocast: bool = False,
     torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> RoundCompletion:
     """Submit one coordinated round and wait for its durable completion."""
 
@@ -396,6 +434,7 @@ def launch_modal_generation_round(
             worker_gpu,
             autocast,
             torch_compile,
+            search_backend,
         ).get()
     log_event(
         logger,
@@ -428,6 +467,7 @@ def main(
     worker_gpu: str = SELF_PLAY_L4_GPU,
     autocast: bool = False,
     torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> None:
     """Launch a round through ``modal run --detach`` for disconnect safety."""
 
@@ -456,6 +496,7 @@ def main(
         worker_gpu=worker_gpu,
         autocast=autocast,
         torch_compile=torch_compile,
+        search_backend=search_backend,
     ).get()
     print(json.dumps(completion.to_payload(), indent=2, sort_keys=True), flush=True)
 

@@ -6,14 +6,16 @@ import json
 import logging
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from random import Random
+from typing import Final
 
 import chess
 import numpy as np
+import pe_search
 import torch
 from torch import nn
 
@@ -33,6 +35,7 @@ from pink_elephant.mcts import (
 from pink_elephant.model import ModelOutput
 from pink_elephant.self_play.contracts import (
     WORKER_RESULT_SCHEMA_VERSION,
+    GameRecord,
     GameTableRef,
     ReplayShardRef,
     TerminationCount,
@@ -44,6 +47,12 @@ from pink_elephant.self_play.generation.game import (
     complete_game,
     make_root_dirichlet_modifier,
     select_action_from_summary,
+)
+from pink_elephant.self_play.generation.native_host import (
+    PENDING_BATCHES,
+    HostStats,
+    NativeSelfPlayHost,
+    adapt_completed_game,
 )
 from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.process_search import (
@@ -58,6 +67,9 @@ from pink_elephant.self_play.generation.shards import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Host-loop iterations between structured progress events.
+NATIVE_PROGRESS_INTERVAL: Final[int] = 2_000
 
 
 class ModelBatchEvaluator(BatchedPolicyValueEvaluator):
@@ -505,6 +517,42 @@ def run_worker(
                     next_progress_log += progress_interval
         start_games_if_needed()
 
+    return _publish_worker_result(
+        worker,
+        output_root,
+        invocation_root,
+        shard_builder=shard_builder,
+        completed_games=completed_games,
+        completed_position_count=completed_position_count,
+        termination_counts=termination_counts,
+        failed_game_count=failed_game_count,
+        started=started,
+        completion_fields=lambda result: _completion_log_fields(
+            result, evaluator, process_search=process_search
+        ),
+    )
+
+
+def _publish_worker_result(
+    worker: WorkerSpec,
+    output_root: Path,
+    invocation_root: Path,
+    *,
+    shard_builder: ReplayShardBuilder,
+    completed_games: list[GameRecord],
+    completed_position_count: int,
+    termination_counts: Counter[str],
+    failed_game_count: int,
+    started: float,
+    completion_fields: Callable[[WorkerResult], dict[str, float | int | str]],
+) -> WorkerResult:
+    """Seal shards, write the games table, and publish the worker result last.
+
+    The result file is the durable completion barrier, so it is written only
+    after every shard and the games table are on disk. This is shared by the
+    Python and native search paths, which differ only in how games are produced.
+    """
+
     if completed_position_count < worker.position_lower_bound or not completed_games:
         raise RuntimeError("worker produced no valid result satisfying its position lower bound")
     shards = shard_builder.finish()
@@ -539,11 +587,7 @@ def run_worker(
     result_path.write_text(
         json.dumps(result.to_payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    log_event(
-        logger,
-        "worker_completed",
-        _completion_log_fields(result, evaluator, process_search=process_search),
-    )
+    log_event(logger, "worker_completed", completion_fields(result))
     return result
 
 
@@ -675,3 +719,266 @@ def _process_search_request(game: _ActiveGame, worker: WorkerSpec) -> SearchRequ
             policy_temperature=worker.generation.root_policy_temperature,
         ),
     )
+
+
+def load_generation_model(
+    checkpoint_path: Path,
+    worker: WorkerSpec,
+    *,
+    device: torch.device | str = "cpu",
+    torch_compile: bool = False,
+) -> nn.Module:
+    """Validate the immutable checkpoint digest and return the bare model.
+
+    The native engine consumes a model rather than an evaluator, because it does
+    its own legal-action gathering and never asks Python for a per-position
+    prediction.
+    """
+
+    actual_digest = sha256_file(checkpoint_path)
+    if actual_digest != worker.generation.checkpoint_sha256:
+        raise ValueError(
+            "checkpoint SHA-256 does not match the generation contract; "
+            f"expected={worker.generation.checkpoint_sha256}, got={actual_digest}"
+        )
+    target_device = torch.device(device)
+    if torch_compile and target_device.type != "cuda":
+        raise ValueError("torch.compile inference requires a CUDA device")
+    loaded = load_checkpoint_model(checkpoint_path, device=target_device)
+    if loaded.model_spec != worker.generation.model_spec:
+        raise ValueError("checkpoint model specification does not match the generation contract")
+    model = loaded.model
+    if torch_compile:
+        model = torch.compile(model, dynamic=None)
+    log_event(
+        logger,
+        "checkpoint_validated",
+        {
+            "checkpoint_path": str(checkpoint_path),
+            "device": str(target_device),
+            "gpu_name": (
+                torch.cuda.get_device_name(target_device) if target_device.type == "cuda" else None
+            ),
+            "model_torch_compile": torch_compile,
+            "generation_id": worker.generation.generation_id,
+            "round_id": worker.round.round_id,
+            "search_backend": "native",
+            "worker_id": worker.worker_id,
+        },
+    )
+    return model
+
+
+def run_native_worker(
+    worker: WorkerSpec,
+    model: nn.Module,
+    output_root: Path,
+    *,
+    device: torch.device | str = "cpu",
+    autocast: bool = False,
+) -> WorkerResult:
+    """Generate games with the native engine and publish identical artifacts.
+
+    Only game production changes. Shard building, the games table, manifests,
+    sealing, and the snapshot barrier are untouched, because none of them ever
+    depended on how a search was executed.
+    """
+
+    configure_logging()
+    started = time.perf_counter()
+    engine = pe_search.SelfPlayEngine(
+        games=worker.round.active_games_per_worker,
+        seed=worker.seed_start,
+        game_id_prefix=(
+            f"{worker.generation.generation_id}-{worker.round.round_id}-"
+            f"{worker.worker_id}-{worker.invocation_id}-game"
+        ),
+        simulations=worker.generation.simulations_per_move,
+        pending_batches=PENDING_BATCHES,
+        exploration_constant=worker.generation.exploration_constant,
+        dirichlet_alpha=worker.generation.dirichlet_alpha,
+        dirichlet_fraction=worker.generation.dirichlet_fraction,
+        root_policy_temperature=worker.generation.root_policy_temperature,
+        opening_temperature=worker.generation.opening_temperature,
+        temperature_cutoff_ply=worker.generation.temperature_cutoff_ply,
+        max_plies=worker.max_plies_per_game,
+    )
+    host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
+    log_event(
+        logger,
+        "worker_started",
+        {
+            "active_games": worker.round.active_games_per_worker,
+            "generation_id": worker.generation.generation_id,
+            "inference_batch_rows": host.rows,
+            "invocation_id": worker.invocation_id,
+            "position_lower_bound": worker.position_lower_bound,
+            "round_id": worker.round.round_id,
+            "search_backend": "native",
+            "simulations_per_move": worker.generation.simulations_per_move,
+            "worker_id": worker.worker_id,
+        },
+    )
+
+    invocation_root = _invocation_root(output_root, worker)
+    if invocation_root.exists() and any(invocation_root.iterdir()):
+        raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
+    invocation_root.mkdir(parents=True, exist_ok=True)
+    shard_builder = ReplayShardBuilder(
+        invocation_root,
+        max_positions=worker.round.shard_position_limit,
+    )
+    completed_games: list[GameRecord] = []
+    termination_counts: Counter[str] = Counter()
+    failed_game_count = 0
+    completed_position_count = 0
+    progress_interval = max(1, min(100, worker.position_lower_bound // 10))
+    next_progress_log = progress_interval
+
+    def admit(game: pe_search.CompletedGame) -> None:
+        """Validate one engine game and admit it to the shard builder."""
+
+        nonlocal failed_game_count, completed_position_count, next_progress_log
+        try:
+            rows, record = adapt_completed_game(game)
+        except (RuntimeError, ValueError) as error:
+            # Row validation re-derives the encoding and legal actions from the
+            # stored FEN with the Python implementation, so a rejection here is
+            # a genuine cross-implementation disagreement and must be visible.
+            failed_game_count += 1
+            log_event(
+                logger,
+                "worker_game_rejected",
+                {
+                    "error": str(error),
+                    "failed_game_count": failed_game_count,
+                    "game_id": game.game_id,
+                    "ply_count": game.ply_count,
+                    "round_id": worker.round.round_id,
+                    "search_backend": "native",
+                    "worker_id": worker.worker_id,
+                },
+            )
+            return
+        shard_builder.add_game(rows)
+        completed_games.append(record)
+        completed_position_count += len(rows)
+        termination_counts[record.termination] += 1
+        log_event(
+            logger,
+            "worker_game_completed",
+            {
+                "completed_game_count": len(completed_games),
+                "game_id": record.game_id,
+                "ply_count": record.ply_count,
+                "position_count": completed_position_count,
+                "position_lower_bound": worker.position_lower_bound,
+                "round_id": worker.round.round_id,
+                "termination": record.termination,
+                "worker_id": worker.worker_id,
+            },
+        )
+        if completed_position_count >= next_progress_log:
+            log_event(
+                logger,
+                "worker_progress",
+                {
+                    "completed_game_count": len(completed_games),
+                    "failed_game_count": failed_game_count,
+                    "position_count": completed_position_count,
+                    "position_lower_bound": worker.position_lower_bound,
+                    "round_id": worker.round.round_id,
+                    "worker_id": worker.worker_id,
+                },
+            )
+            while next_progress_log <= completed_position_count:
+                next_progress_log += progress_interval
+
+    def report(stats: HostStats, recorded: int) -> None:
+        log_event(
+            logger, "worker_search_progress", _native_progress_fields(stats, engine, recorded)
+        )
+
+    stats = host.run(
+        position_quota=worker.position_lower_bound,
+        on_game=admit,
+        progress=report,
+        progress_interval=NATIVE_PROGRESS_INTERVAL,
+    )
+
+    return _publish_worker_result(
+        worker,
+        output_root,
+        invocation_root,
+        shard_builder=shard_builder,
+        completed_games=completed_games,
+        completed_position_count=completed_position_count,
+        termination_counts=termination_counts,
+        failed_game_count=failed_game_count,
+        started=started,
+        completion_fields=lambda result: _native_completion_log_fields(result, stats),
+    )
+
+
+def _native_progress_fields(
+    stats: HostStats, engine: pe_search.SelfPlayEngine, recorded: int
+) -> dict[str, float | int | str | bool]:
+    """Report leaves per second, not only positions per second.
+
+    The two differ by the simulation budget, so quoting positions alone hides
+    whether a change moved search throughput or game length.
+    """
+
+    engine_stats = dict(engine.stats())
+    return {
+        "accepting_new_games": engine.accepting_new_games(),
+        "active_game_count": engine.active_games(),
+        "average_model_batch_size": stats.average_batch_size,
+        "elapsed_seconds": stats.wall_seconds,
+        "engine_fill_seconds": engine_stats.get("fill_seconds", 0.0),
+        "engine_submit_seconds": engine_stats.get("submit_seconds", 0.0),
+        "games_truncated": engine_stats.get("games_truncated", 0),
+        "host_iterations": stats.iterations,
+        "leaves_evaluated": stats.leaves,
+        "leaves_per_second": stats.leaves_per_second,
+        "model_batch_count": stats.batches,
+        "model_forward_seconds": stats.forward_seconds,
+        "recorded_position_count": recorded,
+        "search_backend": "native",
+        "stall_seconds": stats.stall_seconds,
+    }
+
+
+def _native_completion_log_fields(
+    result: WorkerResult, stats: HostStats
+) -> dict[str, float | int | str]:
+    """Build throughput metrics comparable with the Python search path."""
+
+    fields: dict[str, float | int | str] = {
+        "average_model_batch_size": stats.average_batch_size,
+        "completed_game_count": result.completed_game_count,
+        "elapsed_seconds": result.elapsed_seconds,
+        "engine_fill_seconds": stats.engine.get("fill_seconds", 0.0),
+        "engine_submit_seconds": stats.engine.get("submit_seconds", 0.0),
+        "failed_game_count": result.failed_game_count,
+        "games_truncated": stats.engine.get("games_truncated", 0),
+        "leaves_evaluated": stats.leaves,
+        "leaves_per_second": stats.leaves_per_second,
+        "model_batch_count": stats.batches,
+        "model_forward_seconds": stats.forward_seconds,
+        "position_count": result.position_count,
+        "positions_per_second": result.position_count / result.elapsed_seconds,
+        "result_path": result.result_path,
+        "round_id": result.round_id,
+        "search_backend": "native",
+        "stall_seconds": stats.stall_seconds,
+        "submit_seconds": stats.submit_seconds,
+        "worker_id": result.worker_id,
+    }
+    if stats.leaves:
+        fields["engine_microseconds_per_leaf"] = (
+            (stats.engine.get("fill_seconds", 0.0) + stats.engine.get("submit_seconds", 0.0))
+            / stats.leaves
+            * 1e6
+        )
+    return fields

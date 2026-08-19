@@ -345,6 +345,47 @@ uv run python scripts/benchmark_native_search.py \
 Note that games finish atomically, so a small `--positions` quota still runs every
 active game to completion and overshoots heavily.
 
+### Running self-play on the native engine
+
+`--search-backend` selects the engine and defaults to `native`. The legacy Python
+path is retained so a round can be measured against it in the same image with
+every semantic search input held constant:
+
+```sh
+uv run modal run --detach --timestamps \
+  src/pink_elephant/self_play/generation/modal_app.py \
+  --generation-id generation-native-32sims-20260819 \
+  --round-id round-000001 \
+  --requested-positions 10000 \
+  --simulations 32 \
+  --active-games-per-worker 64 \
+  --search-backend native
+```
+
+`--active-games-per-worker` is now the throughput knob: the inference batch is
+half of it, because games are split into two disjoint groups so no tree ever has
+two outstanding leaves. Sixty-four games therefore means a batch of 32. Process
+count and trees-per-process no longer exist.
+
+Follow the run with `uv run modal app logs pink-elephant-self-play -f`. The
+`worker_search_progress` and `worker_completed` events report `leaves_per_second`,
+`engine_microseconds_per_leaf`, `average_model_batch_size`, `games_truncated`, and
+`stall_seconds` alongside the existing position counts.
+
+Locally, the same round runs on CPU:
+
+```sh
+uv run pe-self-play generation extend \
+  --backend local --search-backend native \
+  --checkpoint /path/to/generation-1.pt \
+  --round-id smoke-000001 --requested-positions 100
+```
+
+Every admitted row is re-validated by `ReplayRow`, which re-derives the encoding
+and legal actions from the stored FEN using the Python implementation. A
+non-zero `failed_game_count` therefore signals a genuine disagreement between the
+two encoders, not merely a schema problem.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The
