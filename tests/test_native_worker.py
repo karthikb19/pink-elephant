@@ -9,6 +9,7 @@ and the worker result those rows produce.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,13 +25,14 @@ from pink_elephant.encoding import encode_board
 from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
 from pink_elephant.model_adapter import chess_resnet_spec
 from pink_elephant.self_play.contracts import GameRecord, ReplayRow
+from pink_elephant.self_play.generation.admission import ReplayAdmissionWriter
 from pink_elephant.self_play.generation.config import (
     GenerationRoundSpec,
     generation_1_spec,
     plan_worker_specs,
 )
 from pink_elephant.self_play.generation.native_host import adapt_completed_game
-from pink_elephant.self_play.generation.shards import sha256_file
+from pink_elephant.self_play.generation.shards import ReplayShardBuilder, sha256_file
 from pink_elephant.self_play.generation.worker import (
     load_generation_model,
     run_native_worker,
@@ -260,3 +262,145 @@ def test_native_worker_game_ids_carry_the_full_worker_identity(tmp_path: Path) -
     game_ids = pq.read_table(tmp_path / result.games.path)["game_id"].to_pylist()
     assert game_ids
     assert all(game_id.startswith(prefix) for game_id in game_ids)
+
+
+# --- Background admission writer -------------------------------------------------
+#
+# The writer is the only concurrent component in the worker, so these tests
+# concentrate on what threading can break: lost games, reordered shards,
+# swallowed exceptions, and results read before the consumer has drained.
+
+
+def _completed_games(count: int) -> list[pe_search.CompletedGame]:
+    engine = pe_search.SelfPlayEngine(
+        games=8,
+        seed=5,
+        game_id_prefix="writer-test",
+        simulations=2,
+        dirichlet_fraction=0.0,
+        temperature_cutoff_ply=4,
+        max_plies=80,
+    )
+    rows = engine.group_size()
+    buffer = np.zeros((rows, 21, 8, 8), dtype=np.uint8)
+    logits = np.zeros((rows, POLICY_SIZE), dtype=np.float32)
+    values = np.zeros(rows, dtype=np.float32)
+    collected: list[pe_search.CompletedGame] = []
+    for _ in range(500_000):
+        batch_id, filled = engine.fill_batch(buffer.ctypes.data, rows)
+        if filled:
+            engine.submit(batch_id, logits[:filled], values[:filled])
+        collected.extend(engine.drain_finished())
+        if len(collected) >= count:
+            return collected[:count]
+    raise AssertionError("the engine produced too few completed games")
+
+
+def _writer(tmp_path: Path, **kwargs) -> ReplayAdmissionWriter:
+    builder = ReplayShardBuilder(tmp_path, max_positions=kwargs.pop("max_positions", 10_000))
+    return ReplayAdmissionWriter(
+        builder,
+        round_id="writer-round",
+        worker_id="worker-0000",
+        position_lower_bound=1,
+        **kwargs,
+    )
+
+
+def test_writer_admits_every_submitted_game(tmp_path: Path) -> None:
+    games = _completed_games(6)
+    writer = _writer(tmp_path)
+    with writer:
+        for game in games:
+            writer.submit(game)
+
+    results = writer.results
+    assert len(results.completed_games) == len(games)
+    assert results.failed_game_count == 0
+    assert results.position_count == sum(game.ply_count for game in games)
+    assert sum(results.termination_counts.values()) == len(games)
+
+
+def test_writer_preserves_submission_order(tmp_path: Path) -> None:
+    """Shard contents must not depend on consumer timing."""
+
+    games = _completed_games(6)
+    writer = _writer(tmp_path)
+    with writer:
+        for game in games:
+            writer.submit(game)
+
+    assert [record.game_id for record in writer.results.completed_games] == [
+        game.game_id for game in games
+    ]
+
+
+def test_writer_survives_backpressure(tmp_path: Path) -> None:
+    """A full queue must block the producer, never drop or reorder games."""
+
+    games = _completed_games(6)
+    writer = _writer(tmp_path, max_pending=1)
+    with writer:
+        for game in games:
+            writer.submit(game)
+
+    assert [record.game_id for record in writer.results.completed_games] == [
+        game.game_id for game in games
+    ]
+    assert writer.timings.queue_wait_seconds >= 0.0
+
+
+def test_writer_reports_split_timings(tmp_path: Path) -> None:
+    games = _completed_games(4)
+    writer = _writer(tmp_path)
+    with writer:
+        for game in games:
+            writer.submit(game)
+
+    timings = writer.timings
+    fields = timings.fields()
+    assert timings.adapt_seconds > 0
+    assert timings.shard_seconds > 0
+    assert timings.rows_adapted == sum(game.ply_count for game in games)
+    assert fields["admission_seconds"] == pytest.approx(
+        timings.adapt_seconds + timings.shard_seconds
+    )
+    assert fields["row_adapt_milliseconds_per_position"] > 0
+
+
+def test_writer_surfaces_consumer_failures_on_the_host_thread(tmp_path: Path) -> None:
+    """A crash in the consumer must fail the run, not be silently swallowed."""
+
+    class ExplodingBuilder(ReplayShardBuilder):
+        def add_game(self, rows) -> None:
+            raise RuntimeError("shard write failed")
+
+    writer = ReplayAdmissionWriter(
+        ExplodingBuilder(tmp_path, max_positions=10_000),
+        round_id="writer-round",
+        worker_id="worker-0000",
+        position_lower_bound=1,
+    )
+    game = _completed_games(1)[0]
+    with pytest.raises(RuntimeError, match="replay admission failed"), writer:
+        writer.submit(game)
+        # The failure surfaces on the next submit or at close, whichever
+        # comes first; both paths must raise rather than continue.
+        for _ in range(200):
+            time.sleep(0.005)
+            writer.submit(game)
+
+
+def test_writer_rejects_results_before_close(tmp_path: Path) -> None:
+    writer = _writer(tmp_path)
+    with writer, pytest.raises(RuntimeError, match="only final after close"):
+        _ = writer.results
+
+
+def test_writer_rejects_submission_after_close(tmp_path: Path) -> None:
+    games = _completed_games(1)
+    writer = _writer(tmp_path)
+    with writer:
+        writer.submit(games[0])
+    with pytest.raises(RuntimeError, match="closed admission writer"):
+        writer.submit(games[0])

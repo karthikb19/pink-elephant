@@ -386,8 +386,12 @@ end to end: `model_forward_seconds`, `stall_seconds`, `engine_fill_seconds`,
 `engine_microseconds_per_leaf`, `average_model_batch_size`, and `games_truncated`.
 
 `row_adapt_seconds` is the per-position replay-row revalidation and
-`shard_buffer_seconds` is Arrow/Parquet buffering. Both are serialized with the
-host loop, so the GPU is idle throughout them.
+`shard_buffer_seconds` is Arrow/Parquet buffering. Both run on a background
+admission thread so they overlap GPU work rather than blocking it, which means
+the phase timings legitimately sum to more than wall time; a sum above 100% is
+the signal that the overlap is working. `admission_queue_wait_seconds` is host
+time lost to backpressure and should stay near zero. If it grows, the writer is
+not keeping up and the run has degraded to the old serial behaviour.
 
 Locally, the same round runs on CPU:
 

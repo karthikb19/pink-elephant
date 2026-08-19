@@ -41,6 +41,10 @@ from pink_elephant.self_play.contracts import (
     TerminationCount,
     WorkerResult,
 )
+from pink_elephant.self_play.generation.admission import (
+    AdmissionTimings,
+    ReplayAdmissionWriter,
+)
 from pink_elephant.self_play.generation.config import WorkerSpec
 from pink_elephant.self_play.generation.game import (
     PendingPosition,
@@ -52,7 +56,6 @@ from pink_elephant.self_play.generation.native_host import (
     PENDING_BATCHES,
     HostStats,
     NativeSelfPlayHost,
-    adapt_completed_game,
 )
 from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.process_search import (
@@ -828,146 +831,53 @@ def run_native_worker(
         invocation_root,
         max_positions=worker.round.shard_position_limit,
     )
-    completed_games: list[GameRecord] = []
-    termination_counts: Counter[str] = Counter()
-    failed_game_count = 0
-    completed_position_count = 0
-    progress_interval = max(1, min(100, worker.position_lower_bound // 10))
-    next_progress_log = progress_interval
-    # Admission is serialized with the host loop, so the GPU idles throughout it.
-    # Time it separately from shard buffering: the first is per-position Python
-    # revalidation, the second is Arrow work, and they have different remedies.
-    admission = _AdmissionTimings()
-
-    def admit(game: pe_search.CompletedGame) -> None:
-        """Validate one engine game and admit it to the shard builder."""
-
-        nonlocal failed_game_count, completed_position_count, next_progress_log
-        adapt_started = time.perf_counter()
-        try:
-            rows, record = adapt_completed_game(game)
-        except (RuntimeError, ValueError) as error:
-            admission.adapt_seconds += time.perf_counter() - adapt_started
-            # Row validation re-derives the encoding and legal actions from the
-            # stored FEN with the Python implementation, so a rejection here is
-            # a genuine cross-implementation disagreement and must be visible.
-            failed_game_count += 1
-            log_event(
-                logger,
-                "worker_game_rejected",
-                {
-                    "error": str(error),
-                    "failed_game_count": failed_game_count,
-                    "game_id": game.game_id,
-                    "ply_count": game.ply_count,
-                    "round_id": worker.round.round_id,
-                    "search_backend": "native",
-                    "worker_id": worker.worker_id,
-                },
-            )
-            return
-        admission.adapt_seconds += time.perf_counter() - adapt_started
-        admission.rows_adapted += len(rows)
-        shard_started = time.perf_counter()
-        shard_builder.add_game(rows)
-        admission.shard_seconds += time.perf_counter() - shard_started
-        completed_games.append(record)
-        completed_position_count += len(rows)
-        termination_counts[record.termination] += 1
-        log_event(
-            logger,
-            "worker_game_completed",
-            {
-                "completed_game_count": len(completed_games),
-                "game_id": record.game_id,
-                "ply_count": record.ply_count,
-                "position_count": completed_position_count,
-                "position_lower_bound": worker.position_lower_bound,
-                "round_id": worker.round.round_id,
-                "termination": record.termination,
-                "worker_id": worker.worker_id,
-            },
-        )
-        if completed_position_count >= next_progress_log:
-            log_event(
-                logger,
-                "worker_progress",
-                {
-                    "completed_game_count": len(completed_games),
-                    "failed_game_count": failed_game_count,
-                    "position_count": completed_position_count,
-                    "position_lower_bound": worker.position_lower_bound,
-                    "round_id": worker.round.round_id,
-                    "worker_id": worker.worker_id,
-                },
-            )
-            while next_progress_log <= completed_position_count:
-                next_progress_log += progress_interval
+    writer = ReplayAdmissionWriter(
+        shard_builder,
+        round_id=worker.round.round_id,
+        worker_id=worker.worker_id,
+        position_lower_bound=worker.position_lower_bound,
+    )
 
     def report(stats: HostStats, recorded: int) -> None:
         log_event(
             logger,
             "worker_search_progress",
-            _native_progress_fields(stats, engine, recorded, admission),
+            _native_progress_fields(stats, engine, recorded, writer),
         )
 
-    stats = host.run(
-        position_quota=worker.position_lower_bound,
-        on_game=admit,
-        progress=report,
-        progress_interval=NATIVE_PROGRESS_INTERVAL,
-    )
+    # Admission runs on its own thread so it overlaps the GPU instead of blocking
+    # it. The writer is closed, drained, and joined before anything reads its
+    # results, so the publish step still sees a complete and ordered set.
+    with writer:
+        stats = host.run(
+            position_quota=worker.position_lower_bound,
+            on_game=writer.submit,
+            progress=report,
+            progress_interval=NATIVE_PROGRESS_INTERVAL,
+        )
+    results = writer.results
 
     return _publish_worker_result(
         worker,
         output_root,
         invocation_root,
         shard_builder=shard_builder,
-        completed_games=completed_games,
-        completed_position_count=completed_position_count,
-        termination_counts=termination_counts,
-        failed_game_count=failed_game_count,
+        completed_games=results.completed_games,
+        completed_position_count=results.position_count,
+        termination_counts=results.termination_counts,
+        failed_game_count=results.failed_game_count,
         started=started,
-        completion_fields=lambda result: _native_completion_log_fields(result, stats, admission),
+        completion_fields=lambda result: _native_completion_log_fields(
+            result, stats, writer.timings
+        ),
     )
-
-
-@dataclass(slots=True)
-class _AdmissionTimings:
-    """Wall time spent turning engine games into durable replay rows.
-
-    `adapt_seconds` is dominated by `ReplayRow.__post_init__`, which re-derives the
-    encoding and legal actions from each stored FEN with the Python implementation.
-    That revalidation is a genuine cross-implementation check, so its cost is
-    reported rather than assumed away.
-    """
-
-    adapt_seconds: float = 0.0
-    shard_seconds: float = 0.0
-    rows_adapted: int = 0
-
-    @property
-    def total_seconds(self) -> float:
-        return self.adapt_seconds + self.shard_seconds
-
-    def fields(self) -> dict[str, float | int]:
-        values: dict[str, float | int] = {
-            "admission_seconds": self.total_seconds,
-            "row_adapt_seconds": self.adapt_seconds,
-            "shard_buffer_seconds": self.shard_seconds,
-        }
-        if self.rows_adapted:
-            values["row_adapt_milliseconds_per_position"] = (
-                self.adapt_seconds / self.rows_adapted * 1_000
-            )
-        return values
 
 
 def _native_progress_fields(
     stats: HostStats,
     engine: pe_search.SelfPlayEngine,
     recorded: int,
-    admission: _AdmissionTimings,
+    writer: ReplayAdmissionWriter,
 ) -> dict[str, float | int | str | bool]:
     """Report leaves per second, not only positions per second.
 
@@ -977,8 +887,9 @@ def _native_progress_fields(
 
     engine_stats = dict(engine.stats())
     return {
-        **admission.fields(),
+        **writer.timings.fields(),
         "accepting_new_games": engine.accepting_new_games(),
+        "admission_pending_games": writer.pending(),
         "active_game_count": engine.active_games(),
         "average_model_batch_size": stats.average_batch_size,
         "elapsed_seconds": stats.wall_seconds,
@@ -997,7 +908,7 @@ def _native_progress_fields(
 
 
 def _native_completion_log_fields(
-    result: WorkerResult, stats: HostStats, admission: _AdmissionTimings
+    result: WorkerResult, stats: HostStats, admission: AdmissionTimings
 ) -> dict[str, float | int | str]:
     """Build throughput metrics comparable with the Python search path."""
 
