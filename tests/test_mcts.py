@@ -465,6 +465,10 @@ def test_terminal_positions_use_exact_outcomes_without_model_evaluation(
     assert evaluator_call_count == 0
 
 
+def test_config_defaults_to_the_tuned_puct_exploration_constant() -> None:
+    assert MCTSConfig().exploration_constant == 1.1
+
+
 def test_config_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="num_simulations"):
         MCTSConfig(num_simulations=0)

@@ -27,6 +27,7 @@ from pink_elephant.self_play.contracts import (
 from pink_elephant.self_play.generation.config import (
     GENERATION_1_DIRICHLET_FRACTION,
     GENERATION_1_OPENING_TEMPERATURE,
+    GENERATION_1_PUCT,
     GenerationRoundSpec,
     generation_1_spec,
 )
@@ -101,8 +102,15 @@ def _fools_mate_game() -> tuple[tuple[PendingPosition, ...], chess.Board, GameRe
 def test_generation_1_uses_increased_root_dirichlet_fraction() -> None:
     generation = generation_1_spec()
 
-    assert GENERATION_1_DIRICHLET_FRACTION == 0.2
-    assert generation.dirichlet_fraction == 0.2
+    assert GENERATION_1_DIRICHLET_FRACTION == 0.25
+    assert generation.dirichlet_fraction == 0.25
+
+
+def test_generation_1_uses_lowered_puct_exploration_constant() -> None:
+    generation = generation_1_spec()
+
+    assert GENERATION_1_PUCT == 1.1
+    assert generation.exploration_constant == 1.1
 
 
 def test_generation_1_uses_unit_opening_temperature() -> None:

@@ -32,7 +32,7 @@ class MCTSConfig:
     """Configuration for one tree search."""
 
     num_simulations: int = 32
-    exploration_constant: float = 1.25
+    exploration_constant: float = 1.1
 
     def __post_init__(self) -> None:
         if not isinstance(self.num_simulations, int) or isinstance(self.num_simulations, bool):

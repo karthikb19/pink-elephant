@@ -79,8 +79,8 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mcts-exploration",
         type=float,
-        default=1.25,
-        help="MCTS PUCT exploration constant (default: 1.25)",
+        default=1.1,
+        help="MCTS PUCT exploration constant (default: 1.1)",
     )
     parser.add_argument("--stockfish-depth", type=int, default=10, help="Stockfish depth")
     parser.add_argument(
