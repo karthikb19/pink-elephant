@@ -27,6 +27,7 @@ from pink_elephant.mcts import (
     MCTSNode,
     MCTSRootSummary,
     PolicyValuePrediction,
+    apply_root_policy_temperature,
     run_mcts_batch,
     summarize_root,
 )
@@ -38,6 +39,7 @@ class RootPriorNoise:
 
     probabilities: tuple[tuple[int, float], ...]
     fraction: float
+    policy_temperature: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +146,7 @@ def _apply_root_noise(root_node: MCTSNode, root_noise: RootPriorNoise) -> None:
     supplied_actions = tuple(action_index for action_index, _ in root_noise.probabilities)
     if supplied_actions != expected_actions:
         raise ValueError("root noise must contain exactly the root's legal actions")
+    apply_root_policy_temperature(root_node, root_noise.policy_temperature)
     for action_index, noise_probability in root_noise.probabilities:
         child = root_node.children_by_action_index[action_index]
         child.prior_probability = float(
@@ -403,6 +406,8 @@ def validate_root_noise(root_noise: RootPriorNoise) -> None:
 
     if not math.isfinite(root_noise.fraction) or not 0 <= root_noise.fraction <= 1:
         raise ValueError("root noise fraction must be finite and in [0, 1]")
+    if not math.isfinite(root_noise.policy_temperature) or root_noise.policy_temperature <= 0:
+        raise ValueError("root policy temperature must be finite and positive")
     if not root_noise.probabilities:
         raise ValueError("root noise probabilities must not be empty")
     probabilities: Mapping[int, float] = dict(root_noise.probabilities)

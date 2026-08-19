@@ -134,6 +134,7 @@ class GenerationSpec:
     exploration_constant: float
     dirichlet_alpha: float
     dirichlet_fraction: float
+    root_policy_temperature: float
     opening_temperature: float
     temperature_cutoff_ply: int
     base_seed: int
@@ -272,17 +273,21 @@ its request.
 
 ## Self-play exploration
 
-At each root, mix the legal model prior with seeded Dirichlet noise:
+At each root, rescale the legal model prior by a softmax temperature, then mix
+it with seeded Dirichlet noise:
 
 ```text
-P_noisy(a) = (1 - epsilon) * P(a) + epsilon * eta(a)
+P_tau(a) = P(a)^(1/tau) / sum_b P(b)^(1/tau)
+P_noisy(a) = (1 - epsilon) * P_tau(a) + epsilon * eta(a)
 eta ~ Dirichlet(alpha, ..., alpha)
 ```
 
-Initial chess settings are `epsilon = 0.2` and `alpha = 0.3`. Noise applies
-only at the root and is resampled for each played move. The larger fraction
-increases early-game exploration while retaining the model prior as the larger
-component of the mixed prior.
+Initial chess settings are `epsilon = 0.25`, `alpha = 0.3`, and `tau = 1.03`.
+Both apply only at the root; the noise is resampled for each played move, while
+the temperature is deterministic. The mixing fraction increases early-game
+exploration while retaining the model prior as the larger component, and the
+slightly-above-one temperature keeps near-zero priors from collapsing and
+stabilizes policy convergence.
 
 After search, store the normalized raw root visit counts as the policy target:
 

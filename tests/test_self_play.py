@@ -28,6 +28,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_DIRICHLET_FRACTION,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
+    GENERATION_1_ROOT_POLICY_TEMPERATURE,
     GenerationRoundSpec,
     generation_1_spec,
 )
@@ -104,6 +105,58 @@ def test_generation_1_uses_increased_root_dirichlet_fraction() -> None:
 
     assert GENERATION_1_DIRICHLET_FRACTION == 0.25
     assert generation.dirichlet_fraction == 0.25
+
+
+def test_generation_1_uses_katago_style_root_policy_temperature() -> None:
+    generation = generation_1_spec()
+
+    assert GENERATION_1_ROOT_POLICY_TEMPERATURE == 1.03
+    assert generation.root_policy_temperature == 1.03
+
+
+def test_root_modifier_applies_policy_temperature_before_mixing_noise() -> None:
+    board = chess.Board()
+    peaked_action = min(legal_policy_indices(board))
+
+    def peaked_prediction(current_board: chess.Board) -> PolicyValuePrediction:
+        return PolicyValuePrediction(
+            legal_policy_logits={
+                index: (4.0 if index == peaked_action else 0.0)
+                for index in legal_policy_indices(current_board)
+            },
+            value=0.0,
+        )
+
+    sharp = run_mcts(
+        board,
+        peaked_prediction,
+        MCTSConfig(num_simulations=1),
+        root_prior_modifier=make_root_dirichlet_modifier(
+            np.random.default_rng(5), alpha=0.3, fraction=0.0, policy_temperature=1.0
+        ),
+    )
+    flattened = run_mcts(
+        board,
+        peaked_prediction,
+        MCTSConfig(num_simulations=1),
+        root_prior_modifier=make_root_dirichlet_modifier(
+            np.random.default_rng(5), alpha=0.3, fraction=0.0, policy_temperature=1.03
+        ),
+    )
+
+    sharp_prior = sharp.children_by_action_index[peaked_action].prior_probability
+    flattened_prior = flattened.children_by_action_index[peaked_action].prior_probability
+    assert flattened_prior < sharp_prior
+    assert flattened_prior == pytest.approx(
+        sharp_prior ** (1 / 1.03)
+        / sum(
+            child.prior_probability ** (1 / 1.03)
+            for child in sharp.children_by_action_index.values()
+        )
+    )
+    assert sum(
+        child.prior_probability for child in flattened.children_by_action_index.values()
+    ) == pytest.approx(1.0)
 
 
 def test_generation_1_uses_lowered_puct_exploration_constant() -> None:

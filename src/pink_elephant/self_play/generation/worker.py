@@ -357,6 +357,7 @@ def run_worker(
                         game.noise_rng,
                         alpha=worker.generation.dirichlet_alpha,
                         fraction=worker.generation.dirichlet_fraction,
+                        policy_temperature=worker.generation.root_policy_temperature,
                     )
                     for game in active
                 ),
@@ -671,5 +672,6 @@ def _process_search_request(game: _ActiveGame, worker: WorkerSpec) -> SearchRequ
                 for action_index, probability in zip(action_indices, noise, strict=True)
             ),
             fraction=worker.generation.dirichlet_fraction,
+            policy_temperature=worker.generation.root_policy_temperature,
         ),
     )

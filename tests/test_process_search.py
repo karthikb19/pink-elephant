@@ -11,6 +11,7 @@ from pink_elephant.encoding import encode_model_input
 from pink_elephant.mcts import (
     EncodedBatchEvaluationRequest,
     MCTSConfig,
+    MCTSNode,
     PolicyValuePrediction,
     root_summary_visit_distribution,
 )
@@ -18,6 +19,8 @@ from pink_elephant.self_play.generation.process_search import (
     MultiprocessMCTSSearch,
     RootPriorNoise,
     SearchRequest,
+    _apply_root_noise,
+    validate_root_noise,
 )
 
 
@@ -54,6 +57,33 @@ def _uniform_search_request() -> SearchRequest:
             fraction=0.25,
         ),
     )
+
+
+def test_root_noise_rejects_a_non_positive_policy_temperature() -> None:
+    with pytest.raises(ValueError, match="root policy temperature"):
+        validate_root_noise(
+            RootPriorNoise(probabilities=((0, 1.0),), fraction=0.25, policy_temperature=0.0)
+        )
+
+
+def test_root_noise_applies_policy_temperature_before_mixing() -> None:
+    root_node = MCTSNode(board=chess.Board())
+    for action_index, prior in ((3, 0.8), (7, 0.2)):
+        root_node.children_by_action_index[action_index] = MCTSNode(
+            board=chess.Board(), prior_probability=prior, policy_action_index=action_index
+        )
+
+    _apply_root_noise(
+        root_node,
+        RootPriorNoise(probabilities=((3, 0.5), (7, 0.5)), fraction=0.0, policy_temperature=1.03),
+    )
+
+    priors = {
+        action_index: child.prior_probability
+        for action_index, child in root_node.children_by_action_index.items()
+    }
+    total = 0.8 ** (1 / 1.03) + 0.2 ** (1 / 1.03)
+    assert priors == pytest.approx({3: 0.8 ** (1 / 1.03) / total, 7: 0.2 ** (1 / 1.03) / total})
 
 
 def test_multiprocess_search_batches_one_leaf_from_each_process() -> None:

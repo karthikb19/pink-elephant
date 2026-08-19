@@ -26,6 +26,7 @@ GENERATION_1_SIMULATIONS: Final[int] = 128
 GENERATION_1_PUCT: Final[float] = 1.1
 GENERATION_1_DIRICHLET_ALPHA: Final[float] = 0.3
 GENERATION_1_DIRICHLET_FRACTION: Final[float] = 0.25
+GENERATION_1_ROOT_POLICY_TEMPERATURE: Final[float] = 1.03
 GENERATION_1_OPENING_TEMPERATURE: Final[float] = 1.0
 GENERATION_1_TEMPERATURE_CUTOFF_PLY: Final[int] = 30
 GENERATION_1_WORKER_COUNT: Final[int] = 1
@@ -48,6 +49,7 @@ class GenerationSpec:
     exploration_constant: float
     dirichlet_alpha: float
     dirichlet_fraction: float
+    root_policy_temperature: float
     opening_temperature: float
     temperature_cutoff_ply: int
     base_seed: int
@@ -62,6 +64,7 @@ class GenerationSpec:
         for name, value in (
             ("exploration_constant", self.exploration_constant),
             ("dirichlet_alpha", self.dirichlet_alpha),
+            ("root_policy_temperature", self.root_policy_temperature),
             ("opening_temperature", self.opening_temperature),
         ):
             if not math.isfinite(value) or value <= 0:
@@ -86,6 +89,7 @@ class GenerationSpec:
             "exploration_constant": self.exploration_constant,
             "dirichlet_alpha": self.dirichlet_alpha,
             "dirichlet_fraction": self.dirichlet_fraction,
+            "root_policy_temperature": self.root_policy_temperature,
             "opening_temperature": self.opening_temperature,
             "temperature_cutoff_ply": self.temperature_cutoff_ply,
             "base_seed": self.base_seed,
@@ -104,6 +108,7 @@ class GenerationSpec:
             "exploration_constant": self.exploration_constant,
             "dirichlet_alpha": self.dirichlet_alpha,
             "dirichlet_fraction": self.dirichlet_fraction,
+            "root_policy_temperature": self.root_policy_temperature,
             "opening_temperature": self.opening_temperature,
             "temperature_cutoff_ply": self.temperature_cutoff_ply,
             "base_seed": self.base_seed,
@@ -204,6 +209,7 @@ def generation_1_spec(*, base_seed: int = 0) -> GenerationSpec:
         exploration_constant=GENERATION_1_PUCT,
         dirichlet_alpha=GENERATION_1_DIRICHLET_ALPHA,
         dirichlet_fraction=GENERATION_1_DIRICHLET_FRACTION,
+        root_policy_temperature=GENERATION_1_ROOT_POLICY_TEMPERATURE,
         opening_temperature=GENERATION_1_OPENING_TEMPERATURE,
         temperature_cutoff_ply=GENERATION_1_TEMPERATURE_CUTOFF_PLY,
         base_seed=base_seed,

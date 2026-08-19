@@ -11,6 +11,7 @@ from pink_elephant.mcts import (
     TerminalStatus,
     _backup_value,
     _cached_terminal_value,
+    apply_root_policy_temperature,
     puct_score,
     root_visit_distribution,
     run_mcts,
@@ -463,6 +464,48 @@ def test_terminal_positions_use_exact_outcomes_without_model_evaluation(
     assert root_node.visit_count == 3
     assert root_node.mean_value == expected_value
     assert evaluator_call_count == 0
+
+
+def test_root_policy_temperature_flattens_priors_and_keeps_them_normalized() -> None:
+    root_node = MCTSNode(board=chess.Board())
+    for action_index, prior in ((3, 0.8), (7, 0.16), (11, 0.04)):
+        root_node.children_by_action_index[action_index] = MCTSNode(
+            board=chess.Board(), prior_probability=prior, policy_action_index=action_index
+        )
+
+    apply_root_policy_temperature(root_node, 1.03)
+
+    priors = {
+        action_index: child.prior_probability
+        for action_index, child in root_node.children_by_action_index.items()
+    }
+    expected_unnormalized = {
+        index: prior ** (1 / 1.03) for index, prior in ((3, 0.8), (7, 0.16), (11, 0.04))
+    }
+    total = sum(expected_unnormalized.values())
+    assert priors == pytest.approx(
+        {index: value / total for index, value in expected_unnormalized.items()}
+    )
+    assert sum(priors.values()) == pytest.approx(1.0)
+    assert priors[3] < 0.8
+    assert priors[11] > 0.04
+
+
+def test_root_policy_temperature_of_one_leaves_priors_unchanged() -> None:
+    root_node = MCTSNode(board=chess.Board())
+    root_node.children_by_action_index[3] = MCTSNode(
+        board=chess.Board(), prior_probability=0.75, policy_action_index=3
+    )
+
+    apply_root_policy_temperature(root_node, 1.0)
+
+    assert root_node.children_by_action_index[3].prior_probability == 0.75
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, math.nan, math.inf])
+def test_root_policy_temperature_rejects_invalid_values(temperature: float) -> None:
+    with pytest.raises(ValueError, match="root policy temperature"):
+        apply_root_policy_temperature(MCTSNode(board=chess.Board()), temperature)
 
 
 def test_config_defaults_to_the_tuned_puct_exploration_constant() -> None:
