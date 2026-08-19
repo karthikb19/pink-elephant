@@ -436,3 +436,100 @@ def test_end_to_end_real_board_model_training_and_checkpointing(tmp_path: Path) 
     assert metadata.metrics == results[-1][1]
     assert metadata.source_manifest == "fixture-manifest-sha256"
     assert metadata.git_revision == "test-revision"
+
+
+def _policy_only_trainer(seed: int = 11) -> Trainer:
+    model = ChessResNet(
+        ResNetConfig(channels=4, residual_blocks=1, policy_channels=1, value_hidden_channels=4)
+    )
+    return Trainer(
+        model,
+        TrainerConfig(
+            learning_rate=0.05,
+            weight_decay=0.0,
+            value_weight=0.0,
+            seed=seed,
+            policy_head_only=True,
+        ),
+    )
+
+
+def test_policy_head_only_training_leaves_value_predictions_untouched() -> None:
+    batch = _board_batch()
+    trainer = _policy_only_trainer()
+    trainer.model.eval()
+    with torch.no_grad():
+        value_before = trainer.model(batch.positions).value.clone()
+        policy_before = trainer.model(batch.positions).policy_logits.clone()
+
+    trainer.train_epoch([batch, batch, batch])
+
+    trainer.model.eval()
+    with torch.no_grad():
+        after = trainer.model(batch.positions)
+    assert torch.equal(after.value, value_before)
+    assert not torch.equal(after.policy_logits, policy_before)
+
+
+def test_policy_head_only_training_freezes_shared_batch_norm_statistics() -> None:
+    batch = _board_batch()
+    trainer = _policy_only_trainer()
+    buffers_before = {
+        name: buffer.detach().clone() for name, buffer in trainer.model.named_buffers()
+    }
+
+    trainer.train_epoch([batch, batch])
+
+    assert buffers_before
+    for name, buffer in trainer.model.named_buffers():
+        assert torch.equal(buffers_before[name], buffer.detach()), name
+
+
+def test_policy_head_only_optimizes_only_policy_head_parameters() -> None:
+    trainer = _policy_only_trainer()
+    trainable = {
+        name for name, parameter in trainer.model.named_parameters() if parameter.requires_grad
+    }
+
+    assert trainable
+    assert all(name.startswith("policy_head.") for name in trainable)
+    assert len(trainer.trainable_parameters()) == len(trainable)
+
+
+def test_policy_head_only_validation_does_not_thaw_frozen_modules() -> None:
+    batch = _board_batch()
+    trainer = _policy_only_trainer()
+
+    trainer.train_epoch([batch])
+    trainer.validate([batch])
+
+    assert all(not module.training for module in trainer.frozen_modules)
+    assert trainer.model.policy_head.training
+
+
+def test_policy_head_only_rejects_a_model_without_a_policy_head() -> None:
+    with pytest.raises(ValueError, match="policy_head"):
+        Trainer(TinyPolicyValueModel(), TrainerConfig(policy_head_only=True))
+
+
+def test_trainer_config_defaults_to_training_both_heads() -> None:
+    assert TrainerConfig().policy_head_only is False
+
+
+def test_trainer_config_round_trips_policy_head_only() -> None:
+    config = TrainerConfig(policy_head_only=True)
+
+    assert TrainerConfig.from_payload(config.to_payload()) == config
+
+
+def test_legacy_checkpoint_config_payloads_train_both_heads() -> None:
+    legacy = {
+        "learning_rate": 1e-3,
+        "weight_decay": 1e-4,
+        "value_weight": 1.0,
+        "device": "cpu",
+        "seed": None,
+        "grad_clip_norm": None,
+    }
+
+    assert TrainerConfig.from_payload(legacy).policy_head_only is False

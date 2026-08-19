@@ -58,6 +58,7 @@ DEFAULT_LEARNING_RATE: Final[float] = 1e-4
 DEFAULT_WEIGHT_DECAY: Final[float] = 1e-4
 DEFAULT_GRAD_CLIP_NORM: Final[float] = 1.0
 DEFAULT_VALUE_WEIGHT: Final[float] = 1.0
+DEFAULT_POLICY_HEAD_ONLY: Final[bool] = False
 DEFAULT_CHECKPOINT_INTERVAL: Final[int] = 1
 DEFAULT_PREFETCH_BATCHES: Final[int] = 4
 DEFAULT_PROGRESS_INTERVAL_BATCHES: Final[int] = 25
@@ -89,6 +90,7 @@ class SelfPlayTrainingConfig:
     weight_decay: float = DEFAULT_WEIGHT_DECAY
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM
     value_weight: float = DEFAULT_VALUE_WEIGHT
+    policy_head_only: bool = DEFAULT_POLICY_HEAD_ONLY
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES
     progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES
@@ -241,6 +243,7 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             device="cuda",
             seed=config.seed,
             grad_clip_norm=config.grad_clip_norm,
+            policy_head_only=config.policy_head_only,
         ),
         schema=replay.schema,
         model_spec=model_spec,
@@ -423,6 +426,8 @@ def main(
     replay_capacity: int = DEFAULT_REPLAY_CAPACITY,
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
     learning_rate: float = DEFAULT_LEARNING_RATE,
+    value_weight: float = DEFAULT_VALUE_WEIGHT,
+    policy_head_only: bool = DEFAULT_POLICY_HEAD_ONLY,
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES,
     progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES,
@@ -441,6 +446,8 @@ def main(
         replay_capacity=replay_capacity,
         validation_fraction=validation_fraction,
         learning_rate=learning_rate,
+        value_weight=value_weight,
+        policy_head_only=policy_head_only,
         checkpoint_interval=checkpoint_interval,
         prefetch_batches=prefetch_batches,
         progress_interval_batches=progress_interval_batches,
@@ -514,13 +521,20 @@ def _run_parameters(
                 "phase_timing_batches": config.phase_timing_batches,
                 "replay_capacity": config.replay_capacity,
                 "seed": config.seed,
-                "training_objective": "soft-mcts-policy-cross-entropy-plus-value-mse",
+                "policy_head_only": config.policy_head_only,
+                "training_objective": _training_objective(config),
                 "validation_fraction": config.validation_fraction,
                 "value_weight": config.value_weight,
                 "weight_decay": config.weight_decay,
             }.items()
         )
     )
+
+
+def _training_objective(config: SelfPlayTrainingConfig) -> str:
+    if config.policy_head_only:
+        return "soft-mcts-policy-cross-entropy-policy-head-only"
+    return "soft-mcts-policy-cross-entropy-plus-value-mse"
 
 
 def _sha256_file(path: Path) -> str:

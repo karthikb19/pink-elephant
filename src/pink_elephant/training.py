@@ -32,6 +32,7 @@ from pink_elephant.model_adapter import (
 CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v2"
 LEGACY_CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
 EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.01
+POLICY_HEAD_MODULE_NAME: Final[str] = "policy_head"
 
 
 class _ConfigPayload(TypedDict):
@@ -41,6 +42,7 @@ class _ConfigPayload(TypedDict):
     device: str
     seed: int | None
     grad_clip_norm: float | None
+    policy_head_only: NotRequired[bool]
 
 
 class _SchemaPayload(TypedDict):
@@ -79,6 +81,10 @@ class TrainerConfig:
 
     The default value weight follows AlphaGo Zero's supervised human-game
     pretraining setup; self-play training can explicitly use ``1.0``.
+
+    ``policy_head_only`` trains the policy head alone and leaves the shared
+    trunk and the value head exactly as the parent checkpoint stored them, so
+    value predictions are unchanged by the run.
     """
 
     learning_rate: float = 1e-3
@@ -87,6 +93,7 @@ class TrainerConfig:
     device: str = "cpu"
     seed: int | None = None
     grad_clip_norm: float | None = None
+    policy_head_only: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -119,6 +126,7 @@ class TrainerConfig:
             "device": self.device,
             "seed": self.seed,
             "grad_clip_norm": self.grad_clip_norm,
+            "policy_head_only": self.policy_head_only,
         }
 
     @classmethod
@@ -132,6 +140,7 @@ class TrainerConfig:
             device=payload["device"],
             seed=payload["seed"],
             grad_clip_norm=payload["grad_clip_norm"],
+            policy_head_only=payload.get("policy_head_only", False),
         )
 
 
@@ -390,6 +399,23 @@ def aggregate_validation_metrics(
     )
 
 
+def freeze_non_policy_modules(model: nn.Module) -> tuple[nn.Module, ...]:
+    """Freeze every module except the policy head and return the frozen ones."""
+
+    policy_head = getattr(model, POLICY_HEAD_MODULE_NAME, None)
+    if not isinstance(policy_head, nn.Module):
+        raise ValueError(f"policy-head-only training requires a {POLICY_HEAD_MODULE_NAME!r} module")
+    policy_parameter_ids = {id(parameter) for parameter in policy_head.parameters()}
+    if not policy_parameter_ids:
+        raise ValueError("policy head has no parameters to train")
+    for parameter in model.parameters():
+        if id(parameter) not in policy_parameter_ids:
+            parameter.requires_grad_(False)
+    return tuple(
+        module for name, module in model.named_children() if name != POLICY_HEAD_MODULE_NAME
+    )
+
+
 class Trainer:
     """A deterministic-friendly, single-process AdamW policy/value trainer."""
 
@@ -411,14 +437,29 @@ class Trainer:
         if model_spec is not None and described_model is not None and model_spec != described_model:
             raise ValueError("explicit model specification does not match the model adapter")
         self.model_spec = model_spec or described_model
+        self.frozen_modules = (
+            freeze_non_policy_modules(self.model) if self.config.policy_head_only else ()
+        )
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            self.trainable_parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
         self.epoch = 0
         self.step = 0
         self.last_validation_metrics: ValidationMetrics | None = None
+
+    def trainable_parameters(self) -> list[Tensor]:
+        """Return the parameters this trainer is allowed to update."""
+
+        return [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+
+    def _set_training_mode(self, training: bool) -> None:
+        """Frozen modules stay in eval so their batch-norm statistics never move."""
+
+        self.model.train(training)
+        for module in self.frozen_modules:
+            module.eval()
 
     def train_epoch(
         self,
@@ -433,7 +474,7 @@ class Trainer:
             raise ValueError("phase_timing_batches must be non-negative")
         if phase_timing_batches > 0 and phase_timing_observer is None:
             raise ValueError("phase timing requires an observer")
-        self.model.train()
+        self._set_training_mode(True)
         total_examples = 0
         loss_totals: Tensor | None = None
         batch_count = 0
@@ -476,7 +517,7 @@ class Trainer:
                 backward_seconds = time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
             if self.config.grad_clip_norm is not None:
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                nn.utils.clip_grad_norm_(self.trainable_parameters(), self.config.grad_clip_norm)
             self.optimizer.step()
             if measure_phases:
                 self._synchronize_device()
@@ -527,7 +568,7 @@ class Trainer:
                         _compute_validation_metric_tensors(self._model_output(batch), batch)
                     )
         finally:
-            self.model.train(was_training)
+            self._set_training_mode(was_training)
         metrics = _aggregate_validation_metric_tensors(batch_metrics)
         self.last_validation_metrics = metrics
         return metrics

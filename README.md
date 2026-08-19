@@ -406,6 +406,36 @@ Every admitted row is re-validated by `ReplayRow`, which re-derives the encoding
 and legal actions from the stored FEN using the Python implementation. A
 non-zero `failed_game_count` therefore signals a genuine disagreement between the
 two encoders, not merely a schema problem.
+## Self-play replay fine-tuning
+
+Fine-tune the parent checkpoint from the consolidated replay dataset on Modal:
+
+```sh
+uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
+  --run-name self-play-iteration-1 \
+  --replay-capacity 2000000
+```
+
+`--replay-capacity` clamps to the manifest total, so any value above it trains
+on every consolidated position instead of the newest million.
+
+Two flags control which heads learn. `--value-weight` scales the terminal
+outcome MSE, and `--policy-head-only` freezes the shared trunk and the value
+head so only the policy readout updates:
+
+```sh
+uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
+  --run-name policy-head-only-full-replay \
+  --replay-capacity 2000000 \
+  --value-weight 0.0 \
+  --policy-head-only
+```
+
+Under `--policy-head-only` the frozen modules stay in eval mode for the whole
+run, including batch-norm statistics, so the candidate's value predictions are
+bit-identical to the parent's. That isolates the policy targets: an arena loss
+can no longer be blamed on a drifting value head. The run manifest records
+`policy_head_only`, `value_weight`, and a matching `training_objective`.
 
 ## Checkpoint arena
 

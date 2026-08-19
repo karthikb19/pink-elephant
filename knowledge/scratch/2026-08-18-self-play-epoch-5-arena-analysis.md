@@ -87,3 +87,46 @@ approximately equal, so neither side starts with an objective advantage. It play
 once with each color under a shared seed and runs greedy from the position at 128 simulations,
 which removes the opening sampling confound, pairs the color assignment, and doubles search depth
 in one run. Follow it with an epoch sweep over the same 30 positions to test hypothesis 2.
+
+## Which head regressed
+
+Scored both checkpoints directly on 16,384 held-out rows of
+`v2-lichess-eval-next-25m-side-to-move/validation/validation-00000.parquet`, the supervised
+validation split the parent was trained against. No search, no games — just a forward pass.
+
+| Metric | parent (epoch 6) | candidate (self-play epoch 5) | change |
+|---|---|---|---|
+| policy top-1 | 0.4548 | 0.4399 | −0.0149 (−3.3% relative) |
+| policy top-5 | 0.8485 | 0.8369 | −0.0116 (−1.4% relative) |
+| policy cross-entropy | 1.7071 | 2.0012 | +0.2941 nats |
+| value MSE | 0.0753 | 0.2259 | **3.00×** |
+| value MAE | 0.1762 | 0.3462 | **1.96×** |
+
+The value head is the casualty. Policy accuracy moved a few percent; value error tripled. A value
+MAE of 0.35 on a `[-1, 1]` scale means MCTS leaf evaluations are off by about a third of the full
+range, which is enough to poison backup at every node.
+
+Caveat worth stating: this is the parent's own training distribution, so the parent has a home
+advantage on both heads. The asymmetry is the finding, not the absolute levels.
+
+The shape of the value regression is diagnostic. Targets on those rows have mean 0.042 and standard
+deviation 0.569. The parent predicts with standard deviation 0.509 and correlates 0.878 with the
+target. The candidate predicts with standard deviation 0.628 and correlates only 0.691. It became
+both more spread out and less informative: pushed toward the terminal `+1`/`-1` labels it was trained
+on while agreeing less with what the position is actually worth.
+
+The likely cause is in the objective, not the data volume. Expert pretraining used
+`value_weight=0.01` against deep Stockfish evaluations. The self-play objective used `value_weight=1.0`
+against 32-simulation game outcomes — a 100× weight increase applied to a much noisier target, for
+five epochs. That is the combination most likely to overwrite a well-calibrated value head.
+
+This also explains the arena pattern recorded above. A damaged value head hurts most when search is
+shallow and the position is unfamiliar, and least when the candidate is steering down a line its own
+replay buffer is saturated with, which is exactly what the greedy standard-start match measured.
+
+### Next run
+
+`--policy-head-only` (see the ADR of the same date) freezes the trunk and the value head so the
+candidate keeps the parent's value predictions bit-identical and only re-fits the policy readout. If
+that candidate still loses the arena, the self-play policy targets are themselves worse than the
+supervised policy, and the problem is upstream in generation rather than in the loss.

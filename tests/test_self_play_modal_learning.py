@@ -13,6 +13,7 @@ from pink_elephant.self_play.learning.modal_app import (
     SelfPlayTrainingConfig,
     _log_batch_progress,
     _PhaseTimingLogger,
+    _training_objective,
     _training_volume_path,
 )
 from pink_elephant.training import TrainingPhaseTimings
@@ -92,3 +93,17 @@ def test_phase_timing_logger_reports_samples_and_summary(
     ]
     assert records[-1]["sample_count"] == 2
     assert records[-1]["total_mean_seconds"] == pytest.approx(15)
+
+
+def test_self_play_modal_config_trains_both_heads_by_default() -> None:
+    config = SelfPlayTrainingConfig(run_id=RUN_ID)
+
+    assert config.policy_head_only is False
+    assert _training_objective(config) == "soft-mcts-policy-cross-entropy-plus-value-mse"
+
+
+def test_policy_head_only_config_records_a_distinct_training_objective() -> None:
+    config = SelfPlayTrainingConfig(run_id=RUN_ID, value_weight=0.0, policy_head_only=True)
+
+    assert config.value_weight == pytest.approx(0.0)
+    assert _training_objective(config) == "soft-mcts-policy-cross-entropy-policy-head-only"
