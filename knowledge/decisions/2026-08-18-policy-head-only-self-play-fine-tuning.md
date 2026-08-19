@@ -9,9 +9,11 @@ The first self-play fine-tune (`self-play-epoch-5`) lost to its supervised paren
 Elo across every arena protocol. Scoring both checkpoints on 16,384 held-out rows of
 `v2-lichess-eval-next-25m-side-to-move` separates the two heads: policy top-1 fell from 0.4548 to
 0.4399 while value MSE rose from 0.0753 to 0.2259 and value MAE from 0.1762 to 0.3462. The value
-head degraded three times as much as the policy head, which matches the objective change — expert
-pretraining weighted value at `0.01` against deep Stockfish evaluations, and the self-play objective
-weighted it at `1.0` against noisy 32-simulation game outcomes.
+head degraded three times as much as the policy head. The run manifests on the training Volume rule
+out a hyperparameter change: both the supervised parent and the self-play fine-tune recorded
+`value_weight=1.0`, `learning_rate=1e-4`, `weight_decay=1e-4`, and `grad_clip_norm=1.0`. What changed
+is the value target, from dense Stockfish centipawn evaluations to the terminal result of a
+32-simulation self-play game repeated across every position in that game.
 
 Setting `value_weight=0` alone does not isolate the policy. The value head shares the residual
 trunk, so an unconstrained policy-only run keeps moving the features underneath a value head that

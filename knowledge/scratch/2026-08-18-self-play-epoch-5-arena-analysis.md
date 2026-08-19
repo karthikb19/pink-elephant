@@ -115,10 +115,17 @@ target. The candidate predicts with standard deviation 0.628 and correlates only
 both more spread out and less informative: pushed toward the terminal `+1`/`-1` labels it was trained
 on while agreeing less with what the position is actually worth.
 
-The likely cause is in the objective, not the data volume. Expert pretraining used
-`value_weight=0.01` against deep Stockfish evaluations. The self-play objective used `value_weight=1.0`
-against 32-simulation game outcomes — a 100× weight increase applied to a much noisier target, for
-five epochs. That is the combination most likely to overwrite a well-calibrated value head.
+The cause is the value target, not the loss weighting. `runs/*/run.json` on the training Volume
+records `value_weight=1.0` for both the supervised parent and the self-play fine-tune, along with the
+same `learning_rate=1e-4`, `weight_decay=1e-4`, and `grad_clip_norm=1.0`. (`0.01` is only the local
+`TrainerConfig` default; no Modal run has ever used it.) The self-play run also already used the full
+replay dataset — `replay_capacity=1226456`, the exact manifest total.
+
+So the one thing that changed is what the value head was asked to predict. Supervised training
+regressed dense Stockfish centipawn evaluations, which vary position by position and are close to
+ground truth. Self-play training regressed the terminal result of a 32-simulation game, a single
+`+1`/`0`/`-1` label stamped on every position in that game. 5,685 steps of equally weighted MSE
+against that label was enough to pull the head from correlation 0.878 to 0.691.
 
 This also explains the arena pattern recorded above. A damaged value head hurts most when search is
 shallow and the position is unfamiliar, and least when the candidate is steering down a line its own
