@@ -324,10 +324,26 @@ uv run python scripts/benchmark_native_search.py --engine search-only
 uv run python scripts/benchmark_native_search.py --engine native --games 64
 ```
 
+The host loop prints progress to stderr every `--progress-interval` iterations
+(200 by default; `0` disables it) so stdout stays a clean JSON document. Watch
+`leaves` for liveness: `positions` stays at zero until the first game *ends*,
+because a position's value target is not known until then.
+
 Report `leaves_per_second` alongside `positions_per_second`: the two differ by the
 simulation budget, and quoting only positions hides whether a change moved search
 speed or game length. `stall_seconds` is the CPU-bound versus GPU-bound verdict —
 near zero means leaf production is limiting and another core is worth its cost.
+
+The defaults use production model dimensions, which are slow on CPU. For a quick
+local look, shrink the model and the game count:
+
+```sh
+uv run python scripts/benchmark_native_search.py \
+  --engine native --games 16 --positions 50 --channels 64 --residual-blocks 4
+```
+
+Note that games finish atomically, so a small `--positions` quota still runs every
+active game to completion and overshoots heavily.
 
 ## Checkpoint arena
 

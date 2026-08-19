@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 
 import chess
@@ -29,7 +30,7 @@ from pink_elephant.mcts import (
     run_mcts_batch,
 )
 from pink_elephant.model import ChessResNet, ResNetConfig
-from pink_elephant.self_play.generation.native_host import NativeSelfPlayHost
+from pink_elephant.self_play.generation.native_host import HostStats, NativeSelfPlayHost
 
 
 def build_model(channels: int, blocks: int, device: torch.device) -> ChessResNet:
@@ -67,7 +68,27 @@ def benchmark_native(args: argparse.Namespace, device: torch.device) -> dict[str
         games += 1
         positions += game.ply_count
 
-    stats = host.run(position_quota=args.positions, on_game=on_game)
+    def report(stats: HostStats, recorded: int) -> None:
+        """Print a progress line to stderr so stdout stays a clean JSON document."""
+
+        draining = "" if engine.accepting_new_games() else "  draining"
+        print(
+            f"[{stats.wall_seconds:7.1f}s] "
+            f"leaves {stats.leaves:>9,} ({stats.leaves_per_second:>8,.0f}/s)  "
+            f"batch {stats.average_batch_size:5.2f}  "
+            f"games {games:>4}  positions {recorded:>7,}/{args.positions:,}  "
+            f"active {engine.active_games():>3}  "
+            f"stall {stats.stall_seconds:6.1f}s{draining}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    stats = host.run(
+        position_quota=args.positions,
+        on_game=on_game,
+        progress=None if args.progress_interval <= 0 else report,
+        progress_interval=max(1, args.progress_interval),
+    )
     return {
         "engine": "native",
         "batch_rows": host.rows,
@@ -224,6 +245,12 @@ def main() -> None:
     parser.add_argument("--temperature-cutoff-ply", type=int, default=30)
     parser.add_argument("--max-plies", type=int, default=512)
     parser.add_argument("--seed", type=int, default=20260819)
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=200,
+        help="host-loop iterations between progress lines on stderr; 0 disables",
+    )
     parser.add_argument(
         "--repeats", type=int, default=40, help="search-only: repetitions per position"
     )
