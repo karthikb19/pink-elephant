@@ -404,3 +404,65 @@ def test_writer_rejects_submission_after_close(tmp_path: Path) -> None:
         writer.submit(games[0])
     with pytest.raises(RuntimeError, match="closed admission writer"):
         writer.submit(games[0])
+
+
+# --- Model microbenchmark --------------------------------------------------------
+
+
+def test_microbenchmark_measures_every_mode_and_batch_on_cpu() -> None:
+    """The sweep must run without a GPU so it can be smoke-tested locally.
+
+    CUDA-only modes are skipped rather than failing, so a CPU run still produces
+    the fp32 baseline the report compares against.
+    """
+
+    from pink_elephant.modal_benchmark import measure
+
+    results = measure(
+        channels=8,
+        residual_blocks=1,
+        batch_sizes=(4, 8),
+        modes=("fp32", "autocast", "compile"),
+        iterations=2,
+        warmup=1,
+        device_name="cpu",
+    )
+
+    assert [(row["mode"], row["batch"]) for row in results] == [("fp32", 4), ("fp32", 8)]
+    # Assert the shape of the measurement, not its timings: at two iterations the
+    # noise floor exceeds the difference between the two timed paths.
+    for row in results:
+        assert row["forward_ms"] > 0
+        assert row["roundtrip_ms"] > 0
+        assert row["forward_positions_per_second"] > 0
+        assert row["forward_microseconds_per_position"] > 0
+
+
+def test_microbenchmark_report_shows_speedups_against_fp32() -> None:
+    from pink_elephant.modal_benchmark import render
+
+    results = [
+        {
+            "mode": "fp32",
+            "batch": 64,
+            "forward_ms": 4.0,
+            "roundtrip_ms": 5.0,
+            "forward_positions_per_second": 16000.0,
+            "roundtrip_positions_per_second": 12800.0,
+            "forward_microseconds_per_position": 62.5,
+        },
+        {
+            "mode": "autocast",
+            "batch": 64,
+            "forward_ms": 2.0,
+            "roundtrip_ms": 2.5,
+            "forward_positions_per_second": 32000.0,
+            "roundtrip_positions_per_second": 25600.0,
+            "forward_microseconds_per_position": 31.25,
+        },
+    ]
+    report = render(results, simulations=32)
+    assert "autocast" in report
+    assert "2.00x" in report
+    # Moves per second is the self-play ceiling the throughput implies.
+    assert "800" in report
