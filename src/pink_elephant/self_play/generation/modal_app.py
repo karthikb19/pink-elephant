@@ -52,7 +52,12 @@ logger = logging.getLogger(__name__)
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
+# The native engine spends about 5% of one core's wall time on search, so the
+# eight cores the Python path needed are almost entirely idle. This stays at 8 as
+# the container's declared default because the retained Python backend still needs
+# one core per MCTS process; override it per run with `--worker-cpu`.
 SELF_PLAY_CPU: Final[float] = 8.0
+SELF_PLAY_NATIVE_CPU: Final[float] = 1.0
 SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(SELF_PLAY_CPU)
 SELF_PLAY_MCTS_TREES_PER_PROCESS: Final[int] = 2
 SELF_PLAY_L4_GPU: Final[str] = "L4"
@@ -331,6 +336,7 @@ def coordinate_generation_round(
     round_spec: GenerationRoundSpec,
     invocation_id: str = "invocation-0001",
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    worker_cpu: float | None = None,
     autocast: bool = False,
     torch_compile: bool = False,
     search_backend: str = "native",
@@ -349,6 +355,7 @@ def coordinate_generation_round(
             "model_autocast": autocast,
             "model_torch_compile": torch_compile,
             "search_backend": search_backend,
+            "worker_cpu": worker_cpu,
         },
     )
     if worker_gpu not in {"cpu", SELF_PLAY_L4_GPU}:
@@ -371,6 +378,13 @@ def coordinate_generation_round(
     worker_function = (
         generate_worker_modal_l4 if worker_gpu == SELF_PLAY_L4_GPU else generate_worker_modal
     )
+    if worker_cpu is None:
+        # The Python backend derives its MCTS process count from the declared CPU
+        # count, so only the native backend gets the reduced default.
+        worker_cpu = SELF_PLAY_NATIVE_CPU if search_backend == "native" else SELF_PLAY_CPU
+    if worker_cpu != SELF_PLAY_CPU:
+        # Invocation-time override; runs in its own container pool.
+        worker_function = worker_function.with_options(cpu=worker_cpu)
     generated_results = (
         ()
         if not missing_workers
@@ -410,6 +424,7 @@ def launch_modal_generation_round(
     *,
     invocation_id: str = "invocation-0001",
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    worker_cpu: float | None = None,
     autocast: bool = False,
     torch_compile: bool = False,
     search_backend: str = "native",
@@ -427,14 +442,17 @@ def launch_modal_generation_round(
         },
     )
     with app.run():
+        # Keyword arguments only: this signature has grown, and positional
+        # arguments would silently shift when a parameter is inserted.
         completion = coordinate_generation_round.spawn(
             generation,
             round_spec,
-            invocation_id,
-            worker_gpu,
-            autocast,
-            torch_compile,
-            search_backend,
+            invocation_id=invocation_id,
+            worker_gpu=worker_gpu,
+            worker_cpu=worker_cpu,
+            autocast=autocast,
+            torch_compile=torch_compile,
+            search_backend=search_backend,
         ).get()
     log_event(
         logger,
@@ -465,6 +483,7 @@ def main(
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    worker_cpu: float | None = None,
     autocast: bool = False,
     torch_compile: bool = False,
     search_backend: str = "native",
@@ -494,6 +513,7 @@ def main(
         generation,
         round_spec,
         worker_gpu=worker_gpu,
+        worker_cpu=worker_cpu,
         autocast=autocast,
         torch_compile=torch_compile,
         search_backend=search_backend,

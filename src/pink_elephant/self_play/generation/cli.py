@@ -51,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     extend.add_argument("--requested-positions", type=int, required=True)
     extend.add_argument("--backend", choices=("local", "modal"), default="local")
     extend.add_argument(
+        "--worker-cpu",
+        type=float,
+        default=None,
+        help="Modal CPU request per worker; defaults to 1 for native, 8 for python",
+    )
+    extend.add_argument(
         "--search-backend",
         choices=("native", "python"),
         default="native",
@@ -139,6 +145,7 @@ def _extend_generation(args: argparse.Namespace) -> int:
             generation,
             round_spec,
             worker_gpu=args.worker_gpu,
+            worker_cpu=args.worker_cpu,
             search_backend=args.search_backend,
         )
     print(json.dumps(completion.to_payload(), indent=2, sort_keys=True))

@@ -367,10 +367,27 @@ half of it, because games are split into two disjoint groups so no tree ever has
 two outstanding leaves. Sixty-four games therefore means a batch of 32. Process
 count and trees-per-process no longer exist.
 
+`--worker-cpu` overrides the container's CPU request per run. The native engine
+spends about 5% of one core on search, so it defaults to 1 CPU; the retained
+Python backend still derives its MCTS process count from the CPU count and
+defaults to 8. Sweep it to find the cost-optimal point.
+
+`--autocast` enables CUDA FP16 autocast and `--torch-compile` compiles the model.
+Both apply to the native path and are off by default. They were last evaluated
+when the model was 27.7% of wall time; it is now roughly 68%, so that verdict
+should be re-measured rather than carried forward. Note that `torch.compile` sees
+a shrinking batch during the drain tail, which can trigger recompilation.
+
 Follow the run with `uv run modal app logs pink-elephant-self-play -f`. The
-`worker_search_progress` and `worker_completed` events report `leaves_per_second`,
-`engine_microseconds_per_leaf`, `average_model_batch_size`, `games_truncated`, and
-`stall_seconds` alongside the existing position counts.
+`worker_search_progress` and `worker_completed` events account for wall time
+end to end: `model_forward_seconds`, `stall_seconds`, `engine_fill_seconds`,
+`engine_submit_seconds`, `row_adapt_seconds`, `shard_buffer_seconds`, and the
+`unattributed_seconds` remainder, alongside `leaves_per_second`,
+`engine_microseconds_per_leaf`, `average_model_batch_size`, and `games_truncated`.
+
+`row_adapt_seconds` is the per-position replay-row revalidation and
+`shard_buffer_seconds` is Arrow/Parquet buffering. Both are serialized with the
+host loop, so the GPU is idle throughout them.
 
 Locally, the same round runs on CPU:
 

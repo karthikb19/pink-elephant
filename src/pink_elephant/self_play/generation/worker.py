@@ -834,14 +834,20 @@ def run_native_worker(
     completed_position_count = 0
     progress_interval = max(1, min(100, worker.position_lower_bound // 10))
     next_progress_log = progress_interval
+    # Admission is serialized with the host loop, so the GPU idles throughout it.
+    # Time it separately from shard buffering: the first is per-position Python
+    # revalidation, the second is Arrow work, and they have different remedies.
+    admission = _AdmissionTimings()
 
     def admit(game: pe_search.CompletedGame) -> None:
         """Validate one engine game and admit it to the shard builder."""
 
         nonlocal failed_game_count, completed_position_count, next_progress_log
+        adapt_started = time.perf_counter()
         try:
             rows, record = adapt_completed_game(game)
         except (RuntimeError, ValueError) as error:
+            admission.adapt_seconds += time.perf_counter() - adapt_started
             # Row validation re-derives the encoding and legal actions from the
             # stored FEN with the Python implementation, so a rejection here is
             # a genuine cross-implementation disagreement and must be visible.
@@ -860,7 +866,11 @@ def run_native_worker(
                 },
             )
             return
+        admission.adapt_seconds += time.perf_counter() - adapt_started
+        admission.rows_adapted += len(rows)
+        shard_started = time.perf_counter()
         shard_builder.add_game(rows)
+        admission.shard_seconds += time.perf_counter() - shard_started
         completed_games.append(record)
         completed_position_count += len(rows)
         termination_counts[record.termination] += 1
@@ -896,7 +906,9 @@ def run_native_worker(
 
     def report(stats: HostStats, recorded: int) -> None:
         log_event(
-            logger, "worker_search_progress", _native_progress_fields(stats, engine, recorded)
+            logger,
+            "worker_search_progress",
+            _native_progress_fields(stats, engine, recorded, admission),
         )
 
     stats = host.run(
@@ -916,12 +928,46 @@ def run_native_worker(
         termination_counts=termination_counts,
         failed_game_count=failed_game_count,
         started=started,
-        completion_fields=lambda result: _native_completion_log_fields(result, stats),
+        completion_fields=lambda result: _native_completion_log_fields(result, stats, admission),
     )
 
 
+@dataclass(slots=True)
+class _AdmissionTimings:
+    """Wall time spent turning engine games into durable replay rows.
+
+    `adapt_seconds` is dominated by `ReplayRow.__post_init__`, which re-derives the
+    encoding and legal actions from each stored FEN with the Python implementation.
+    That revalidation is a genuine cross-implementation check, so its cost is
+    reported rather than assumed away.
+    """
+
+    adapt_seconds: float = 0.0
+    shard_seconds: float = 0.0
+    rows_adapted: int = 0
+
+    @property
+    def total_seconds(self) -> float:
+        return self.adapt_seconds + self.shard_seconds
+
+    def fields(self) -> dict[str, float | int]:
+        values: dict[str, float | int] = {
+            "admission_seconds": self.total_seconds,
+            "row_adapt_seconds": self.adapt_seconds,
+            "shard_buffer_seconds": self.shard_seconds,
+        }
+        if self.rows_adapted:
+            values["row_adapt_milliseconds_per_position"] = (
+                self.adapt_seconds / self.rows_adapted * 1_000
+            )
+        return values
+
+
 def _native_progress_fields(
-    stats: HostStats, engine: pe_search.SelfPlayEngine, recorded: int
+    stats: HostStats,
+    engine: pe_search.SelfPlayEngine,
+    recorded: int,
+    admission: _AdmissionTimings,
 ) -> dict[str, float | int | str | bool]:
     """Report leaves per second, not only positions per second.
 
@@ -931,6 +977,7 @@ def _native_progress_fields(
 
     engine_stats = dict(engine.stats())
     return {
+        **admission.fields(),
         "accepting_new_games": engine.accepting_new_games(),
         "active_game_count": engine.active_games(),
         "average_model_batch_size": stats.average_batch_size,
@@ -950,11 +997,12 @@ def _native_progress_fields(
 
 
 def _native_completion_log_fields(
-    result: WorkerResult, stats: HostStats
+    result: WorkerResult, stats: HostStats, admission: _AdmissionTimings
 ) -> dict[str, float | int | str]:
     """Build throughput metrics comparable with the Python search path."""
 
     fields: dict[str, float | int | str] = {
+        **admission.fields(),
         "average_model_batch_size": stats.average_batch_size,
         "completed_game_count": result.completed_game_count,
         "elapsed_seconds": result.elapsed_seconds,
@@ -981,4 +1029,19 @@ def _native_completion_log_fields(
             / stats.leaves
             * 1e6
         )
+    # Report the remainder so wall time is fully accounted for and nobody has to
+    # subtract by hand. What is left over is container startup, checkpoint load,
+    # and result publication.
+    accounted = (
+        stats.forward_seconds
+        + stats.stall_seconds
+        + stats.engine.get("fill_seconds", 0.0)
+        + stats.engine.get("submit_seconds", 0.0)
+        + admission.total_seconds
+    )
+    if result.elapsed_seconds > 0:
+        fields["unattributed_seconds"] = result.elapsed_seconds - accounted
+        fields["unattributed_fraction"] = (
+            result.elapsed_seconds - accounted
+        ) / result.elapsed_seconds
     return fields

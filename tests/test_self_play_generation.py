@@ -772,11 +772,12 @@ def test_cli_passes_l4_worker_selection_to_modal_launcher(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_launch(generation, round_spec, *, worker_gpu, search_backend):
+    def fake_launch(generation, round_spec, *, worker_gpu, worker_cpu, search_backend):
         captured.update(
             generation=generation,
             round_spec=round_spec,
             worker_gpu=worker_gpu,
+            worker_cpu=worker_cpu,
             search_backend=search_backend,
         )
         return RoundCompletion(
