@@ -11,6 +11,7 @@ from typing import Final
 
 import modal
 
+from pink_elephant.modal_image import build_image
 from pink_elephant.self_play.contracts import RoundCompletion, SnapshotManifest, WorkerResult
 from pink_elephant.self_play.generation.config import (
     GENERATION_1_ACTIVE_GAMES_PER_WORKER,
@@ -54,11 +55,7 @@ SELF_PLAY_MEMORY_MB: Final[int] = 16 * 1024
 SELF_PLAY_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
 SELF_PLAY_CONCURRENCY: Final[int] = 16
 
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .uv_sync()
-    .add_local_python_source("pink_elephant")
-)
+image = build_image()
 app = modal.App(name="pink-elephant-self-play", image=image)
 self_play_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
 

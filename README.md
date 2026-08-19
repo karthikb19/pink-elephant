@@ -271,6 +271,64 @@ Worker artifacts live below `data/self-play/generation-000001/` locally or
 manifest is the durable completion barrier; later rounds append new shards and
 never modify earlier snapshots.
 
+## Native search engine
+
+Tree search lives in a Rust crate, `rust/pe-search`, embedded as a PyO3 extension
+module. Python keeps the model, checkpoints, shard writing, and Modal
+orchestration; Rust owns tree state, chess rules, board encoding, and the action
+mapping. See
+[the decision record](knowledge/decisions/2026-08-19-native-rust-mcts-engine.md)
+for the design and its measured results.
+
+`uv sync` builds the extension automatically, so a Rust toolchain is required for
+local development:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+uv sync
+```
+
+Run the Rust tests alongside the Python suite:
+
+```sh
+cargo test --manifest-path rust/pe-search/Cargo.toml
+uv run pytest
+```
+
+### Conformance corpus
+
+`tests/conformance/encoding-action-corpus.jsonl` pins the encoder and action
+schema across both implementations. Each record is a position reached by replaying
+a move list, so history-dependent features such as the repetition planes are
+reproducible from the record alone. The Python suite checks the corpus against
+`encoding.py` and `action_mapping.py`; the Rust suite checks it against the crate.
+Nothing else prevents the two from drifting, and a drifted plane produces
+well-formed replay shards that quietly teach the network a wrong move.
+
+Regenerate it after any deliberate schema change, then bump the version markers:
+
+```sh
+uv run python scripts/build_conformance_corpus.py
+```
+
+Generation fails if the corpus stops reaching all 73 action planes from both
+orientations.
+
+### Throughput benchmarks
+
+```sh
+# Per-leaf search cost, no model: the cleanest native-versus-Python comparison.
+uv run python scripts/benchmark_native_search.py --engine search-only
+
+# End-to-end host loop with the double-buffered pinned-staging pipeline.
+uv run python scripts/benchmark_native_search.py --engine native --games 64
+```
+
+Report `leaves_per_second` alongside `positions_per_second`: the two differ by the
+simulation budget, and quoting only positions hides whether a change moved search
+speed or game length. `stall_seconds` is the CPU-bound versus GPU-bound verdict —
+near zero means leaf production is limiting and another core is worth its cost.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The

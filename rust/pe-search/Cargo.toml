@@ -1,0 +1,33 @@
+[package]
+name = "pe-search"
+version = "0.1.0"
+edition = "2021"
+description = "Native Monte Carlo tree search and board encoding for pink-elephant self-play."
+license = "MIT"
+
+[lib]
+name = "pe_search"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shakmaty = "0.27"
+pyo3 = { version = "0.29" }
+numpy = "0.29"
+rand = "0.8"
+rand_distr = "0.4"
+rand_chacha = "0.3"
+
+[features]
+default = []
+# Enabled by maturin when building the wheel. Left off for `cargo test` so test
+# binaries link libpython instead of deferring symbols to a host interpreter.
+extension-module = ["pyo3/extension-module"]
+
+[dev-dependencies]
+serde_json = "1"
+base64 = "0.22"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

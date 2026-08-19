@@ -17,6 +17,7 @@ import torch
 from pink_elephant.artifacts import RunIdentity, RunLayout, RunParameter, RunStore
 from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.dataset import ExpertBatchLoader
+from pink_elephant.modal_image import build_image
 from pink_elephant.model import ChessResNet, ResNetConfig
 from pink_elephant.model_adapter import ModelSpec
 from pink_elephant.shards import MANIFEST_FILENAME, load_dataset_manifest
@@ -50,11 +51,7 @@ MODAL_FUNCTION_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
 MODAL_LOADER_WORKERS: Final[int] = 0
 MODAL_PREFETCH_BATCHES: Final[int] = 4
 
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .uv_sync()
-    .add_local_python_source("pink_elephant")
-)
+image = build_image()
 app = modal.App(name="pink-elephant-training", image=image)
 training_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
 

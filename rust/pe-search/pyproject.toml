@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pe-search"
+version = "0.1.0"
+description = "Native Monte Carlo tree search and board encoding for pink-elephant self-play."
+requires-python = ">=3.11"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+module-name = "pe_search"
+# The cdylib leaves CPython symbols to be resolved by the interpreter at load
+# time, which is only correct for an extension module, never for `cargo test`.
+features = ["pyo3/extension-module"]
+strip = true
