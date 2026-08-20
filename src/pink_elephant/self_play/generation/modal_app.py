@@ -63,13 +63,17 @@ DEFAULT_START_MIX: Final[StartPositionMix] = StartPositionMix()
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
-# The native engine spends about 5% of one core's wall time on search, so the
-# eight cores the Python path needed are almost entirely idle. This stays at 8 as
-# the container's declared default because the retained Python backend still needs
-# one core per MCTS process; override it per run with `--worker-cpu`.
-SELF_PLAY_CPU: Final[float] = 8.0
+# Generation runs on the native engine, which spends about 5% of one core's wall
+# time on search and waits on the GPU for the rest, so the declared reservation is
+# small. It used to be 8 because the Python backend derives one MCTS process per
+# core from PYTHON_BACKEND_CPU, and the two were the same constant; that made a
+# four-worker round declare 32 cores while reserving 2 each through --worker-cpu.
+# They are separate now so the declared number matches what the default backend
+# actually uses.
+SELF_PLAY_CPU: Final[float] = 2.0
 SELF_PLAY_NATIVE_CPU: Final[float] = 1.0
-SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(SELF_PLAY_CPU)
+PYTHON_BACKEND_CPU: Final[float] = 8.0
+SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(PYTHON_BACKEND_CPU)
 SELF_PLAY_MCTS_TREES_PER_PROCESS: Final[int] = 2
 SELF_PLAY_L4_GPU: Final[str] = "L4"
 SELF_PLAY_MEMORY_MB: Final[int] = 16 * 1024
@@ -392,7 +396,7 @@ def coordinate_generation_round(
     if worker_cpu is None:
         # The Python backend derives its MCTS process count from the declared CPU
         # count, so only the native backend gets the reduced default.
-        worker_cpu = SELF_PLAY_NATIVE_CPU if search_backend == "native" else SELF_PLAY_CPU
+        worker_cpu = SELF_PLAY_NATIVE_CPU if search_backend == "native" else PYTHON_BACKEND_CPU
     if worker_cpu != SELF_PLAY_CPU:
         # Invocation-time override; runs in its own container pool.
         worker_function = worker_function.with_options(cpu=worker_cpu)

@@ -53,6 +53,7 @@ from pink_elephant.self_play.generation.manifests import (
     seal_round,
 )
 from pink_elephant.self_play.generation.modal_app import (
+    PYTHON_BACKEND_CPU,
     SELF_PLAY_CPU,
     SELF_PLAY_L4_GPU,
     SELF_PLAY_MCTS_PROCESS_COUNT,
@@ -843,7 +844,10 @@ def test_modal_generation_defaults_to_one_l4_worker_with_eight_cpus_and_sixteen_
     assert args.generation_id == "generation-000001"
     assert args.worker_count == GENERATION_1_WORKER_COUNT == 1
     assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 16
-    assert SELF_PLAY_CPU == 8.0
+    # The declared reservation follows the native backend, which generation uses;
+    # the Python backend's process count is derived separately.
+    assert SELF_PLAY_CPU == 2.0
+    assert PYTHON_BACKEND_CPU == 8.0
     assert SELF_PLAY_MCTS_PROCESS_COUNT == 8
 
 
