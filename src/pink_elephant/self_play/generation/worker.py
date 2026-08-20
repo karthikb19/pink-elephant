@@ -445,6 +445,7 @@ def run_worker(
                 temperature=temperature,
                 rng=game.temperature_rng,
                 greedy=game.board.ply() >= worker.generation.temperature_cutoff_ply,
+                min_visit_fraction=worker.generation.min_visit_fraction,
             )
             selected_move = _move_for_action(game.board, selected_action_index)
             game.pending_positions.append(
@@ -816,6 +817,7 @@ def run_native_worker(
         max_plies=worker.max_plies_per_game,
         start_fens=list(worker.generation.start_fens()),
         forced_playout_k=worker.generation.forced_playout_k,
+        min_visit_fraction=worker.generation.min_visit_fraction,
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(

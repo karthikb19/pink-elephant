@@ -30,6 +30,9 @@ pub struct SearchConfig {
     /// KataGo's forced-playout constant. Zero disables forced playouts and the
     /// matching policy target pruning.
     pub forced_playout_k: f64,
+    /// Never play a move holding less than this share of the most visited move's
+    /// visits. Zero keeps every move eligible.
+    pub min_visit_fraction: f64,
 }
 
 impl Default for SearchConfig {
@@ -44,6 +47,7 @@ impl Default for SearchConfig {
             temperature_cutoff_ply: 30,
             max_plies: 512,
             forced_playout_k: 0.0,
+            min_visit_fraction: 0.0,
         }
     }
 }
@@ -64,6 +68,11 @@ impl SearchConfig {
         }
         if !self.forced_playout_k.is_finite() || self.forced_playout_k < 0.0 {
             return Err("forced_playout_k must be finite and non-negative".into());
+        }
+        if !self.min_visit_fraction.is_finite()
+            || !(0.0..=1.0).contains(&self.min_visit_fraction)
+        {
+            return Err("min_visit_fraction must be finite and in [0, 1]".into());
         }
         if !self.root_policy_temperature.is_finite() || self.root_policy_temperature <= 0.0 {
             return Err("root_policy_temperature must be finite and positive".into());
@@ -313,9 +322,29 @@ impl SelfPlayGame {
 
     /// Select a root action from visit counts, retaining raw visits as the target.
     fn select_action(&mut self, temperature: f64, greedy: bool) -> Result<u32, String> {
-        let statistics = self.tree.root_statistics();
+        let mut statistics = self.tree.root_statistics();
         if statistics.is_empty() {
             return Err("cannot select an action from an unexpanded root".into());
+        }
+        // Sampling proportional to visits gives every one-visit move a ticket, and
+        // a position has dozens of them, so the tail is played often even though
+        // search rejected each one. The policy target keeps the full distribution.
+        if !greedy && self.config.min_visit_fraction > 0.0 {
+            let most_visits = statistics
+                .iter()
+                .map(|&(_, visits, _)| visits)
+                .max()
+                .unwrap_or(0);
+            let floor = self.config.min_visit_fraction * most_visits as f64;
+            let eligible: Vec<(u32, u32, f64)> = statistics
+                .iter()
+                .copied()
+                .filter(|&(_, visits, _)| visits as f64 >= floor)
+                .collect();
+            // An unexpanded root leaves every count at zero; keep every action then.
+            if !eligible.is_empty() {
+                statistics = eligible;
+            }
         }
         if greedy {
             // Highest visits, then highest prior, then lowest action index.

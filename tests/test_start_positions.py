@@ -143,3 +143,27 @@ def test_archive_loading_rejects_a_non_integer_evaluation(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="centipawns must be an integer"):
         load_archive_positions(path)
+
+
+def test_default_mix_favours_the_human_opening_book() -> None:
+    mix = StartPositionMix()
+
+    weights = mix.as_weights()
+    assert weights["opening_book"] == pytest.approx(0.50)
+    assert weights["opening_book"] > weights["startpos"]
+    assert sum(weights.values()) == pytest.approx(1.0)
+
+
+def test_default_mix_still_reaches_every_archive_band() -> None:
+    pool = build_start_position_pool(
+        mix=StartPositionMix(),
+        opening_fens=(MODERATE_FEN,),
+        archive_positions=_archive(),
+        size=1000,
+        seed=0,
+    )
+
+    assert pool.fens.count(STARTPOS_FEN) == 200
+    assert pool.fens.count(MODERATE_FEN) >= 500
+    assert BALANCED_FEN in pool.fens
+    assert DECISIVE_FEN in pool.fens

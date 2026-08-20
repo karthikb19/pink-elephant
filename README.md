@@ -461,6 +461,39 @@ of 20 moves from the target and lifts the best move's share from 0.231 to 0.284.
 
 Set `--forced-playout-k 0` to disable both halves.
 
+## Move selection: the visit floor
+
+Self-play samples the played move from the root visit distribution, so a move
+holding a single visit out of 200 is played 0.5% of the time. A position offers
+dozens of them, so the tail is played often even though search rejected every
+one individually, and those are the moves that hang material.
+
+`--min-visit-fraction` drops moves below that share of the most visited move's
+visits before the temperature draw, defaulting to `0.10`. The threshold is
+relative rather than absolute so it adapts to the position: where search is
+confident the floor is high and almost everything is excluded, and where search
+genuinely cannot separate the moves the floor is low and real alternatives
+survive. **The policy target keeps the full distribution; only the played move
+is constrained.**
+
+Measured over three games at 200 simulations, the lowest visit share ever
+played:
+
+| `min_visit_fraction` | lowest share played | moves played under 5% |
+| --- | --- | --- |
+| 0.0 | 0.5% | 13 |
+| 0.10 | 3.0% | 3 |
+| 0.25 | 6.5% | 0 |
+
+KataGo solves the same problem with `chosenMovePrune` and `chosenMoveSubtract`,
+which are absolute visit thresholds rather than relative ones, paired with a
+much sharper `chosenMoveTemperature` of 0.10.
+
+Variety is better bought from the start position than from playing a move the
+search dislikes: a different opening costs nothing, while a 0.5% move costs a
+blunder. The default start mix therefore weights the human opening book most
+heavily, at 50%, against 20% for the standard position.
+
 ## Value targets
 
 Self-play value targets blend the terminal outcome with the search-averaged root

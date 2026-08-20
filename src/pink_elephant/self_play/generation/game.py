@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from random import Random
 
@@ -19,6 +19,7 @@ from pink_elephant.mcts import (
     MCTSRootSummary,
     apply_root_policy_temperature,
     pruned_root_visit_distribution,
+    root_visit_distribution,
     run_mcts_batch,
     summarize_root,
 )
@@ -89,11 +90,16 @@ def select_action_from_root(
     temperature: float,
     rng: Random,
     greedy: bool = False,
+    min_visit_fraction: float = 0.0,
 ) -> int:
     """Select an action from visits while retaining raw visits as the target."""
 
     return select_action_from_summary(
-        summarize_root(root_node), temperature=temperature, rng=rng, greedy=greedy
+        summarize_root(root_node),
+        temperature=temperature,
+        rng=rng,
+        greedy=greedy,
+        min_visit_fraction=min_visit_fraction,
     )
 
 
@@ -103,14 +109,31 @@ def select_action_from_summary(
     temperature: float,
     rng: Random,
     greedy: bool = False,
+    min_visit_fraction: float = 0.0,
 ) -> int:
-    """Select an action from compact root statistics."""
+    """Select an action from compact root statistics.
+
+    ``min_visit_fraction`` drops moves holding less than that share of the most
+    visited move's visits before the temperature draw. Sampling proportional to
+    visits gives every one-visit move a ticket, and a position has dozens of
+    them, so the tail is played often even though search rejected each of them.
+    The policy target keeps the full distribution; only the played move changes.
+    """
 
     if not summary.actions:
         raise ValueError("cannot select an action from an unexpanded root")
     if not greedy and (not math.isfinite(temperature) or temperature <= 0):
         raise ValueError("temperature must be finite and positive")
+    if not math.isfinite(min_visit_fraction) or not 0 <= min_visit_fraction <= 1:
+        raise ValueError("min_visit_fraction must be finite and in [0, 1]")
     actions = tuple(sorted(summary.actions, key=lambda action: action.action_index))
+    if min_visit_fraction > 0 and not greedy:
+        most_visits = max(action.visit_count for action in actions)
+        floor = min_visit_fraction * most_visits
+        eligible = tuple(action for action in actions if action.visit_count >= floor)
+        # An unexpanded root leaves every count at zero; keep every action then.
+        if eligible:
+            actions = eligible
     if greedy:
         return max(
             actions,
@@ -261,8 +284,14 @@ def run_self_play_game(
     game_id: str,
     seed: int,
     max_plies: int = 512,
+    on_move: Callable[[int, chess.Board, chess.Move, Mapping[int, float]], None] | None = None,
 ) -> CompletedSelfPlayGame:
-    """Run one game through the same batched-search interface as workers."""
+    """Run one game through the same batched-search interface as workers.
+
+    ``on_move`` is called with the ply index, the board before the move, the move,
+    and the raw root visit distribution, so a caller can stream a game as it is
+    played and see which choices the search actually considered.
+    """
 
     if max_plies < 1:
         raise ValueError("max_plies must be positive")
@@ -314,6 +343,7 @@ def run_self_play_game(
             temperature=temperature,
             rng=temperature_rng,
             greedy=current_board.ply() >= generation.temperature_cutoff_ply,
+            min_visit_fraction=generation.min_visit_fraction,
         )
         selected_move = policy_index_to_move(current_board, selected_action_index)
         pending_positions.append(
@@ -328,6 +358,13 @@ def run_self_play_game(
                 ply_index=current_board.ply(),
             )
         )
+        if on_move is not None:
+            on_move(
+                current_board.ply(),
+                current_board,
+                selected_move,
+                root_visit_distribution(root),
+            )
         moves_uci.append(selected_move.uci())
         current_board.push(selected_move)
 

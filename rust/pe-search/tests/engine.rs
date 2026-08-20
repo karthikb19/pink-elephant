@@ -178,3 +178,51 @@ fn games_must_divide_evenly_into_batch_slots() {
     assert!(SelfPlayEngine::new(config(5, 2, 4)).is_err());
     assert!(SelfPlayEngine::new(config(0, 1, 4)).is_err());
 }
+
+#[test]
+fn a_visit_floor_never_plays_a_move_below_its_share() {
+    // Sampling proportional to visits otherwise plays the one-visit tail, which
+    // is where self-play blunders come from. The recorded policy keeps every
+    // move; only the played move is constrained.
+    let mut settings = config(8, 2, 64);
+    settings.search.min_visit_fraction = 0.25;
+    settings.search.temperature_cutoff_ply = 512;
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    let games = run(&mut engine, 4, 200_000);
+    assert!(!games.is_empty(), "the engine produced no completed games");
+
+    for game in &games {
+        for recorded in &game.positions {
+            let most = recorded
+                .policy
+                .iter()
+                .map(|&(_, share)| share)
+                .fold(0.0_f64, f64::max);
+            let played = recorded
+                .policy
+                .iter()
+                .find(|&&(action, _)| action == recorded.selected_action_index)
+                .map(|&(_, share)| share)
+                .expect("the played action must appear in the policy");
+            assert!(
+                played >= 0.25 * most - 1e-9,
+                "played {played} is below the floor of 0.25 * {most}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_zero_visit_floor_leaves_selection_unchanged() {
+    let mut settings = config(8, 2, 32);
+    settings.search.min_visit_fraction = 0.0;
+    let mut baseline = SelfPlayEngine::new(settings.clone()).expect("engine");
+    let expected = run(&mut baseline, 4, 200_000);
+
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    let actual = run(&mut engine, 4, 200_000);
+
+    let expected_moves: Vec<&Vec<String>> = expected.iter().map(|game| &game.moves_uci).collect();
+    let actual_moves: Vec<&Vec<String>> = actual.iter().map(|game| &game.moves_uci).collect();
+    assert_eq!(expected_moves, actual_moves);
+}

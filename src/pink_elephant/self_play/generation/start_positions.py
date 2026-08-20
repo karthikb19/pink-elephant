@@ -73,10 +73,14 @@ class StartPositionMix:
     Archive weights are split across evaluation bands rather than filtered to
     balanced play: balanced positions carry the most outcome entropy per game,
     but decisive positions keep the value head calibrated where it already is.
+
+    The book carries the largest share. Variety bought by starting somewhere new
+    is free, while variety bought by sampling a move the search dislikes costs a
+    blunder, and the book positions are human lines an engine judged balanced.
     """
 
-    startpos: float = 0.4
-    opening_book: float = 0.3
+    startpos: float = 0.20
+    opening_book: float = 0.50
     archive_balanced: float = 0.18
     archive_moderate: float = 0.075
     archive_decisive: float = 0.045

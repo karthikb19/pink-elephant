@@ -170,6 +170,7 @@ impl PySelfPlayEngine {
         max_plies = 512,
         start_fens = Vec::new(),
         forced_playout_k = 0.0,
+        min_visit_fraction = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -187,6 +188,7 @@ impl PySelfPlayEngine {
         max_plies: u32,
         start_fens: Vec<String>,
         forced_playout_k: f64,
+        min_visit_fraction: f64,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -204,6 +206,7 @@ impl PySelfPlayEngine {
                 temperature_cutoff_ply,
                 max_plies,
                 forced_playout_k,
+                min_visit_fraction,
             },
         };
         SelfPlayEngine::new(config)
