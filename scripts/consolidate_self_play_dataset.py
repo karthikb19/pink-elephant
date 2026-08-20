@@ -2,10 +2,19 @@
 
 Run with:
 
-    uv run modal run scripts/consolidate_self_play_dataset.py
+    uv run modal run scripts/consolidate_self_play_dataset.py \
+      --sources "blended=generation-blended-20260819-official-run-1"
+
+``--sources`` is a comma-separated list of ``label=generation_id`` pairs, so one
+run produces one complete, deterministic dataset from one or more generations.
+Pass ``--dry-run`` to print the plan without copying anything.
 
 The destination Volume is created on the first non-dry run. Only replay
 ``shard-*.parquet`` files are copied; ``games.parquet`` is intentionally excluded.
+
+Every selected shard must carry the same replay schema version. Mixing versions
+is rejected here rather than at training time, because a v1 shard has no
+``root_value`` column and the blended value target would fail mid-epoch.
 """
 
 from __future__ import annotations
@@ -22,11 +31,12 @@ import modal
 import pyarrow.parquet as pq
 
 SOURCE_VOLUME_NAME = "pink-elephant-training"
-DESTINATION_VOLUME_NAME = "pink-elephant-self-play-datasets"
+DESTINATION_VOLUME_NAME = "pink-elephant-self-play-datasets-v2"
 SOURCE_MOUNT = Path("/source")
 DESTINATION_MOUNT = Path("/dataset")
 DATASET_MANIFEST_NAME = "dataset-manifest.json"
 DATASET_SCHEMA_VERSION = "pink-elephant/self-play-dataset/v1"
+REQUIRED_REPLAY_SCHEMA_VERSION = "self-play/replay/v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,19 +47,28 @@ class SourceSpec:
     generation_id: str
 
 
-SOURCES = (
-    SourceSpec(
-        label="official",
-        generation_id="generation-l4-0006-8x2-32sims-20260817-500k-autocast-compile-official",
-    ),
-    SourceSpec(
-        label="dirichlet_noise_diversity",
-        generation_id=(
-            "generation-l4-8x2-32sims-20260817-500k-autocast-compile-official-"
-            "dirichlet-noise-run-diversity"
-        ),
-    ),
-)
+def parse_sources(raw: str) -> tuple[SourceSpec, ...]:
+    """Parse a ``label=generation_id`` comma-separated list into ordered sources."""
+
+    sources: list[SourceSpec] = []
+    seen_labels: set[str] = set()
+    for chunk in raw.split(","):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        label, separator, generation_id = entry.partition("=")
+        label, generation_id = label.strip(), generation_id.strip()
+        if not separator or not label or not generation_id:
+            raise ValueError(f"source must look like label=generation_id, got {entry!r}")
+        if any(character in label for character in "/\\ "):
+            raise ValueError(f"source label must not contain path separators: {label!r}")
+        if label in seen_labels:
+            raise ValueError(f"duplicate source label: {label!r}")
+        seen_labels.add(label)
+        sources.append(SourceSpec(label=label, generation_id=generation_id))
+    if not sources:
+        raise ValueError("at least one label=generation_id source is required")
+    return tuple(sources)
 
 
 class DatasetSourceEntry(TypedDict):
@@ -108,7 +127,11 @@ class SelectedShard:
         return PurePosixPath("sources") / self.source.label / self.destination_name
 
 
-image = modal.Image.debian_slim(python_version="3.11").uv_sync()
+# This script imports only modal and pyarrow, never pink_elephant, so it skips
+# the shared image: uv_sync() would have to install a Rust toolchain and compile
+# the pe-search path dependency purely to copy parquet files.
+PYARROW_VERSION = "25.0.0"
+image = modal.Image.debian_slim(python_version="3.11").pip_install(f"pyarrow=={PYARROW_VERSION}")
 app = modal.App(name="pink-elephant-self-play-dataset-consolidation", image=image)
 source_volume = modal.Volume.from_name(SOURCE_VOLUME_NAME)
 destination_volume = modal.Volume.from_name(DESTINATION_VOLUME_NAME, create_if_missing=True)
@@ -118,12 +141,12 @@ destination_volume = modal.Volume.from_name(DESTINATION_VOLUME_NAME, create_if_m
     volumes={SOURCE_MOUNT: source_volume, DESTINATION_MOUNT: destination_volume},
     timeout=24 * 60 * 60,
 )
-def consolidate() -> DatasetManifest:
+def consolidate(sources: str, dry_run: bool = False) -> DatasetManifest:
     """Copy selected replay shards and seal a deterministic dataset manifest."""
 
     selected: list[SelectedShard] = []
     source_entries: list[DatasetSourceEntry] = []
-    for source in SOURCES:
+    for source in parse_sources(sources):
         generation_root = SOURCE_MOUNT / "self-play" / source.generation_id
         generation = _read_json_object(generation_root / "generation.json")
         selection, shards = _select_shards(generation_root, source)
@@ -140,6 +163,8 @@ def consolidate() -> DatasetManifest:
     _validate_unique_destinations(selected)
     manifest = _build_manifest(source_entries, selected)
     manifest_path = DESTINATION_MOUNT / DATASET_MANIFEST_NAME
+    if dry_run:
+        return manifest
     _assert_manifest_compatible(manifest_path, manifest)
     for shard in selected:
         _copy_and_verify(shard)
@@ -149,11 +174,20 @@ def consolidate() -> DatasetManifest:
 
 
 @app.local_entrypoint()
-def main() -> None:
-    """Run consolidation for every immutable replay shard currently present."""
+def main(sources: str, dry_run: bool = False) -> None:
+    """Consolidate every immutable replay shard of the named generations."""
 
-    manifest = consolidate.remote()
-    print(json.dumps(manifest, indent=2, sort_keys=True))
+    parsed = parse_sources(sources)
+    manifest = consolidate.remote(sources, dry_run)
+    summary = {
+        "dry_run": dry_run,
+        "destination_volume": DESTINATION_VOLUME_NAME,
+        "sources": [f"{item.label}={item.generation_id}" for item in parsed],
+        "shard_count": len(manifest["shards"]),
+        "total_position_count": manifest["total_position_count"],
+        "total_game_count": manifest["total_game_count"],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 def _select_shards(
@@ -168,6 +202,7 @@ def _select_shards(
         metadata = pq.ParquetFile(path).metadata
         if metadata is None or metadata.num_rows < 1:
             raise ValueError(f"replay shard has no rows: {path}")
+        _assert_replay_schema_version(path)
         game_ids = pq.read_table(path, columns=["game_id"])["game_id"].to_pylist()
         if not game_ids or any(not isinstance(game_id, str) or not game_id for game_id in game_ids):
             raise ValueError(f"replay shard has invalid game IDs: {path}")
@@ -249,6 +284,18 @@ def _copy_and_verify(shard: SelectedShard) -> None:
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source_path, destination_path)
     _validate_file(destination_path, shard)
+
+
+def _assert_replay_schema_version(path: Path) -> None:
+    """Reject a shard whose replay schema differs from the version this dataset needs."""
+
+    metadata = pq.ParquetFile(path).schema_arrow.metadata or {}
+    version = metadata.get(b"schema_version", b"").decode()
+    if version != REQUIRED_REPLAY_SCHEMA_VERSION:
+        raise ValueError(
+            f"replay shard schema is {version!r}, expected "
+            f"{REQUIRED_REPLAY_SCHEMA_VERSION!r}: {path}"
+        )
 
 
 def _validate_file(path: Path, shard: SelectedShard) -> None:

@@ -29,6 +29,7 @@ import torch
 
 from pink_elephant.artifacts import RunIdentity, RunParameter, RunStore
 from pink_elephant.contracts import TrainingBatch
+from pink_elephant.modal_image import build_image
 from pink_elephant.model_adapter import build_model
 from pink_elephant.self_play.learning.replay import (
     DEFAULT_REPLAY_CAPACITY,
@@ -45,7 +46,8 @@ from pink_elephant.training import (
 )
 
 APP_NAME: Final[str] = "pink-elephant-self-play-training"
-DATASET_VOLUME_NAME: Final[str] = "pink-elephant-self-play-datasets"
+# v2 replay shards carry root_value; the v1 volume is kept intact and unread.
+DATASET_VOLUME_NAME: Final[str] = "pink-elephant-self-play-datasets-v2"
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
 DATASET_MOUNT: Final[Path] = Path("/replay")
 TRAINING_MOUNT: Final[Path] = Path("/training")
@@ -70,11 +72,9 @@ FUNCTION_TIMEOUT_SECONDS: Final[int] = 24 * 60 * 60
 METRICS_FILENAME: Final[str] = "self-play-metrics.json"
 METRICS_HISTORY_FILENAME: Final[str] = "self-play-metrics-history.jsonl"
 
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .uv_sync()
-    .add_local_python_source("pink_elephant")
-)
+# uv_sync() alone cannot resolve the pe-search path dependency, so this shares
+# the image that stages the crate and a Rust toolchain, as generation does.
+image = build_image()
 app = modal.App(APP_NAME, image=image)
 dataset_volume = modal.Volume.from_name(DATASET_VOLUME_NAME)
 training_volume = modal.Volume.from_name(TRAINING_VOLUME_NAME, create_if_missing=True)
