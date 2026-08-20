@@ -57,6 +57,9 @@ from pink_elephant.self_play.generation.worker import (
 
 logger = logging.getLogger(__name__)
 
+# One source of truth for the mix; the entrypoint's flag defaults derive from it.
+DEFAULT_START_MIX: Final[StartPositionMix] = StartPositionMix()
+
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
@@ -494,11 +497,11 @@ def main(
     forced_playout_k: float = GENERATION_1_FORCED_PLAYOUT_K,
     min_visit_fraction: float = GENERATION_1_MIN_VISIT_FRACTION,
     start_pool_size: int = DEFAULT_START_POOL_SIZE,
-    startpos_weight: float = 0.4,
-    opening_book_weight: float = 0.3,
-    archive_balanced_weight: float = 0.18,
-    archive_moderate_weight: float = 0.075,
-    archive_decisive_weight: float = 0.045,
+    startpos_weight: float = DEFAULT_START_MIX.startpos,
+    opening_book_weight: float = DEFAULT_START_MIX.opening_book,
+    archive_balanced_weight: float = DEFAULT_START_MIX.archive_balanced,
+    archive_moderate_weight: float = DEFAULT_START_MIX.archive_moderate,
+    archive_decisive_weight: float = DEFAULT_START_MIX.archive_decisive,
     opening_book_path: str = "",
     start_archive_path: str = "",
     worker_gpu: str = SELF_PLAY_L4_GPU,
