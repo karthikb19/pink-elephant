@@ -1,52 +1,40 @@
-"""Play a checkpoint match on Modal, sharded across GPU workers.
+"""Run a paired checkpoint match on one Modal GPU, batching every game at once.
 
-The local match plays every game in one process, so a 60-game book match at 200
-simulations takes over an hour on CPU. This schedules the same colour-balanced
-pairings across several L4 workers, each playing a disjoint slice, and merges the
-results. Pairings, seeds, and openings are resolved once on the client, so a run
-is reproducible and a shard boundary cannot change which games are played.
+The Python match plays one game at a time through `run_mcts`, evaluating a single
+leaf per forward pass, so 60 games at 200 simulations costs over an hour. This
+drives the native engine the way generation does: every game runs concurrently
+and contributes one leaf per batch, with one forward pass per model over the rows
+that model owns.
 
-Run with:
+Openings are resolved on the client and each is listed twice in the start pool,
+so `paired_starts` plays it once from each side. Checkpoints are read from the
+training Volume by path, so nothing is uploaded.
 
     uv run modal run src/pink_elephant/checkpoint_match_modal.py \\
       --checkpoint-a runs/<run>/checkpoints/<candidate>.pt \\
       --checkpoint-b runs/<run>/checkpoints/<parent>.pt \\
-      --games 60 --simulations 200 --shards 6
-
-Checkpoint paths are relative to the training Volume, so nothing is uploaded.
+      --positions 256 --simulations 200
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from random import Random
 from typing import Final
 
 import modal
 
-from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_players
-from pink_elephant.checkpoint_match_cli import (
-    MatchGame,
-    MatchPairing,
-    VariedModelPlayer,
-    build_pairings,
-    score_games,
-)
-from pink_elephant.mcts import MCTSConfig
 from pink_elephant.modal_image import build_image
-from pink_elephant.opening_book import (
-    load_opening_book,
-    playable_openings,
-    select_openings,
-)
+from pink_elephant.opening_book import load_opening_book, playable_openings, select_openings
 
 APP_NAME: Final[str] = "pink-elephant-checkpoint-match"
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
 TRAINING_MOUNT: Final[Path] = Path("/data")
 MATCH_GPU: Final[str] = "L4"
+MATCH_CPU: Final[float] = 2.0
 MATCH_TIMEOUT_SECONDS: Final[int] = 6 * 60 * 60
 
 image = build_image()
@@ -55,114 +43,105 @@ training_volume = modal.Volume.from_name(TRAINING_VOLUME_NAME)
 
 
 @dataclass(frozen=True, slots=True)
-class MatchShard:
-    """One worker's slice of a match: its pairings and the shared settings."""
+class MatchRequest:
+    """Everything one match run needs, resolved on the client."""
 
     checkpoint_a: str
     checkpoint_b: str
-    name_a: str
-    name_b: str
-    pairings: tuple[MatchPairing, ...]
+    start_fens: tuple[str, ...]
     simulations: int
     exploration: float
-    opening_temperature: float
-    temperature_cutoff_ply: int
     max_plies: int
+    seed: int
+    pending_batches: int
 
     def __post_init__(self) -> None:
-        if not self.pairings:
-            raise ValueError("a match shard must contain at least one pairing")
+        if len(self.start_fens) < 2 or len(self.start_fens) % 2:
+            raise ValueError("a paired match needs an even number of at least two games")
         if self.simulations < 1 or self.max_plies < 1:
             raise ValueError("simulations and max_plies must be positive")
+        if self.pending_batches < 1 or len(self.start_fens) % self.pending_batches:
+            raise ValueError("games must divide evenly into pending_batches")
 
 
 @app.function(
     gpu=MATCH_GPU,
-    cpu=2.0,
-    memory=8 * 1024,
+    cpu=MATCH_CPU,
+    memory=16 * 1024,
     volumes={TRAINING_MOUNT: training_volume},
     timeout=MATCH_TIMEOUT_SECONDS,
-    retries=1,
+    retries=0,
 )
-def play_shard(shard: MatchShard) -> list[MatchGame]:
-    """Play one slice of the pairings and return its games."""
+def play_match(request: MatchRequest) -> dict[str, object]:
+    """Play every game concurrently on one GPU and return the scored result."""
 
+    import pe_search
     import torch
 
+    from pink_elephant.arena import load_checkpoint_model
+    from pink_elephant.match_host import BatchedMatchHost, score_match
+    from pink_elephant.self_play.generation.observability import configure_logging, log_event
+
+    configure_logging()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    loaded_a = load_checkpoint_model(TRAINING_MOUNT / shard.checkpoint_a, device=device)
-    loaded_b = load_checkpoint_model(TRAINING_MOUNT / shard.checkpoint_b, device=device)
-    search = MCTSConfig(num_simulations=shard.simulations, exploration_constant=shard.exploration)
-    evaluator_a = CheckpointEvaluator(loaded_a.model, device)
-    evaluator_b = CheckpointEvaluator(loaded_b.model, device)
+    loaded_a = load_checkpoint_model(TRAINING_MOUNT / request.checkpoint_a, device=device)
+    loaded_b = load_checkpoint_model(TRAINING_MOUNT / request.checkpoint_b, device=device)
+    engine = pe_search.SelfPlayEngine(
+        games=len(request.start_fens),
+        seed=request.seed,
+        game_id_prefix="match",
+        simulations=request.simulations,
+        pending_batches=request.pending_batches,
+        exploration_constant=request.exploration,
+        # A match measures strength, so no exploration noise and no sampling.
+        dirichlet_fraction=0.0,
+        temperature_cutoff_ply=0,
+        max_plies=request.max_plies,
+        start_fens=list(request.start_fens),
+        paired_starts=True,
+    )
+    host = BatchedMatchHost(loaded_a.model, loaded_b.model, engine, device=device, autocast=False)
 
-    import chess
+    import logging
 
-    def build_player(
-        evaluator: CheckpointEvaluator, game_seed: int, start_ply: int
-    ) -> VariedModelPlayer:
-        return VariedModelPlayer(
-            evaluator=evaluator,
-            config=search,
-            opening_temperature=shard.opening_temperature,
-            temperature_cutoff_ply=shard.temperature_cutoff_ply,
-            rng=Random(game_seed),
-            start_ply=start_ply,
+    logger = logging.getLogger(__name__)
+
+    def report(stats, completed: int) -> None:
+        log_event(
+            logger,
+            "match_progress",
+            {
+                "completed_games": completed,
+                "total_games": len(request.start_fens),
+                "leaves": stats.leaves,
+                "leaves_per_second": round(stats.leaves_per_second, 1),
+            },
         )
 
-    games: list[MatchGame] = []
-    for pairing in shard.pairings:
-        start_board = chess.Board() if pairing.opening is None else pairing.opening.board()
-        start_ply = start_board.ply()
-        player_a = build_player(evaluator_a, pairing.seed, start_ply)
-        player_b = build_player(evaluator_b, pairing.seed, start_ply)
-        white, black = (player_a, player_b) if pairing.a_is_white else (player_b, player_a)
-        white_name, black_name = (
-            (shard.name_a, shard.name_b) if pairing.a_is_white else (shard.name_b, shard.name_a)
-        )
-        result = play_players(
-            white,
-            black,
-            white_name=white_name,
-            black_name=black_name,
-            event="Pink Elephant checkpoint match",
-            max_plies=shard.max_plies,
-            start_fen=None if pairing.opening is None else start_board.fen(),
-        )
-        games.append(
-            MatchGame(
-                game=pairing.game_index + 1,
-                model_a_color="white" if pairing.a_is_white else "black",
-                result=result.result,
-                termination=result.termination,
-                plies=result.plies,
-                seconds=0.0,
-                # The PGN travels inline; a shard has no durable directory of its own.
-                pgn=result.pgn,
-                seed=pairing.seed,
-                opening_hash=None if pairing.opening is None else pairing.opening.position_hash,
-                opening_fen=None if pairing.opening is None else start_board.fen(),
-            )
-        )
-    return games
+    outcomes, stats = host.run(progress=report, progress_interval=500)
+    score = score_match(outcomes)
+    return {
+        "score": score,
+        "leaves": stats.leaves,
+        "leaves_per_second": round(stats.leaves_per_second, 1),
+        "wall_seconds": round(stats.wall_seconds, 1),
+        "leaves_by_model": list(stats.leaves_by_model),
+        "epoch_a": loaded_a.epoch,
+        "epoch_b": loaded_b.epoch,
+        "games": [asdict(outcome) for outcome in outcomes],
+    }
 
 
-def shard_pairings(
-    pairings: tuple[MatchPairing, ...], shards: int
-) -> tuple[tuple[MatchPairing, ...], ...]:
-    """Split pairings into contiguous slices, keeping colour pairs together.
+def confidence_interval(wins: int, draws: int, losses: int) -> tuple[float, float]:
+    """Return the 95% interval on the per-game score."""
 
-    Paired games share a seed and an opening, so a split that separated them
-    would still be correct but would make a partial run colour-imbalanced.
-    """
-
-    if shards < 1:
-        raise ValueError("shards must be positive")
-    pairs = [pairings[index : index + 2] for index in range(0, len(pairings), 2)]
-    buckets: list[list[MatchPairing]] = [[] for _ in range(min(shards, len(pairs)))]
-    for index, pair in enumerate(pairs):
-        buckets[index % len(buckets)].extend(pair)
-    return tuple(tuple(bucket) for bucket in buckets if bucket)
+    total = wins + draws + losses
+    if total == 0:
+        return (0.0, 0.0)
+    score = (wins + 0.5 * draws) / total
+    variance = (wins + 0.25 * draws) / total - score * score
+    error = 1.96 * math.sqrt(max(variance, 0.0) / total)
+    return (max(score - error, 0.0), min(score + error, 1.0))
 
 
 @app.local_entrypoint()
@@ -171,14 +150,12 @@ def main(
     checkpoint_b: str,
     name_a: str = "model-a",
     name_b: str = "model-b",
-    games: int = 60,
+    positions: int = 256,
     simulations: int = 200,
     exploration: float = 1.25,
-    opening_temperature: float = 1.0,
-    temperature_cutoff_ply: int = 0,
+    max_plies: int = 300,
     seed: int = 0,
-    max_plies: int = 256,
-    shards: int = 6,
+    pending_batches: int = 2,
     openings: str = "data/openings/members_2025-10.jsonl",
     opening_seed: int = 0,
     min_opening_count: int = 500,
@@ -186,73 +163,74 @@ def main(
     max_opening_ply: int = 12,
     output: str = "",
 ) -> None:
-    """Schedule a colour-balanced match across Modal workers and merge the result."""
+    """Resolve the openings, run the match, and print the scored summary."""
 
-    selected = None
-    if openings:
-        book = load_opening_book(Path(openings))
-        usable = playable_openings(
-            book,
-            min_total_count=min_opening_count,
-            min_ply=min_opening_ply,
-            max_ply=max_opening_ply,
-        )
-        selected = select_openings(usable, games // 2, seed=opening_seed)
-    pairings = build_pairings(games, seed, selected)
-    slices = shard_pairings(pairings, shards)
+    book = load_opening_book(Path(openings))
+    usable = playable_openings(
+        book,
+        min_total_count=min_opening_count,
+        min_ply=min_opening_ply,
+        max_ply=max_opening_ply,
+    )
+    selected = select_openings(usable, positions, seed=opening_seed)
+    # Each opening twice: paired_starts gives ordinal 2k white and 2k+1 black.
+    start_fens = tuple(position.fen for position in selected for _ in range(2))
     print(
-        f"{games} games over {len(slices)} shards "
-        f"({', '.join(str(len(part)) for part in slices)} games each), "
-        f"{simulations} simulations",
+        f"{positions} openings -> {len(start_fens)} games at {simulations} simulations",
         flush=True,
     )
 
-    shard_specs = [
-        MatchShard(
+    result = play_match.remote(
+        MatchRequest(
             checkpoint_a=checkpoint_a,
             checkpoint_b=checkpoint_b,
-            name_a=name_a,
-            name_b=name_b,
-            pairings=part,
+            start_fens=start_fens,
             simulations=simulations,
             exploration=exploration,
-            opening_temperature=opening_temperature,
-            temperature_cutoff_ply=temperature_cutoff_ply,
             max_plies=max_plies,
+            seed=seed,
+            pending_batches=pending_batches,
         )
-        for part in slices
-    ]
-    played: list[MatchGame] = []
-    for shard_games in play_shard.map(shard_specs):
-        played.extend(shard_games)
-    played.sort(key=lambda game: game.game)
-
-    score = score_games(played)
-    print(
-        f"\nMatch summary ({name_a}): wins={score.wins}, draws={score.draws}, "
-        f"losses={score.losses}, unfinished={score.unfinished}, score={score.score:.3f}"
     )
-    payload = {
-        "format_version": "checkpoint-match/v1",
-        "recorded_at": datetime.now(UTC).isoformat(),
-        "model_a": {"name": name_a, "source": checkpoint_a},
-        "model_b": {"name": name_b, "source": checkpoint_b},
-        "parameters": {
-            "games": games,
-            "simulations": simulations,
-            "exploration": exploration,
-            "opening_temperature": opening_temperature,
-            "temperature_cutoff_ply": temperature_cutoff_ply,
-            "seed": seed,
-            "max_plies": max_plies,
-            "shards": len(slices),
-            "openings": openings or None,
-            "opening_seed": opening_seed,
-        },
-        "score_from_model_a_perspective": asdict(score),
-        "games": [asdict(game) for game in played],
-    }
-    destination = Path(output) if output else Path("data/checkpoint-arena/modal-latest.json")
+    score = result["score"]
+    low, high = confidence_interval(score["wins"], score["draws"], score["losses"])
+    elo = lambda value: -400 * math.log10(1 / value - 1) if 0 < value < 1 else float("nan")  # noqa: E731
+    print(
+        f"\n{name_a} vs {name_b}: {score['wins']}W {score['draws']}D {score['losses']}L "
+        f"over {score['games']} games"
+    )
+    print(f"  score      {score['score']:.4f}   (~{elo(score['score']):+.0f} Elo)")
+    print(f"  95% CI     [{low:.3f}, {high:.3f}]")
+    print(f"  decisive   {'yes' if low > 0.5 or high < 0.5 else 'no, the interval includes 0.500'}")
+    print(
+        f"  throughput {result['leaves']:,} leaves in {result['wall_seconds']}s "
+        f"({result['leaves_per_second']:,.0f}/s), split {result['leaves_by_model']}"
+    )
+    destination = Path(output) if output else Path("data/checkpoint-arena/modal-match.json")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    destination.write_text(
+        json.dumps(
+            {
+                "recorded_at": datetime.now(UTC).isoformat(),
+                "model_a": {"name": name_a, "source": checkpoint_a, "epoch": result["epoch_a"]},
+                "model_b": {"name": name_b, "source": checkpoint_b, "epoch": result["epoch_b"]},
+                "parameters": {
+                    "positions": positions,
+                    "games": len(start_fens),
+                    "simulations": simulations,
+                    "exploration": exploration,
+                    "max_plies": max_plies,
+                    "seed": seed,
+                    "openings": openings,
+                    "opening_seed": opening_seed,
+                },
+                "score": score,
+                "confidence_interval": [low, high],
+                "games": result["games"],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     print(f"Results saved: {destination}")

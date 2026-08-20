@@ -541,6 +541,33 @@ bit-identical to the parent's. That isolates the policy targets: an arena loss
 can no longer be blamed on a drifting value head. The run manifest records
 `policy_head_only`, `value_weight`, and a matching `training_objective`.
 
+## Batched checkpoint matches
+
+The local match plays one game at a time through the Python search, evaluating a
+single leaf per forward pass, so 60 games at 200 simulations costs over an hour.
+`checkpoint_match_modal.py` drives the native engine the way generation does:
+every game runs at once and contributes one leaf per batch.
+
+```sh
+uv run modal run src/pink_elephant/checkpoint_match_modal.py \
+  --checkpoint-a runs/<run>/checkpoints/<candidate>.pt \
+  --checkpoint-b runs/<run>/checkpoints/<parent>.pt \
+  --name-a candidate --name-b parent \
+  --positions 256 --simulations 200
+```
+
+One move's whole search belongs to the model to move at its root, so every row of
+a filled batch has one owner and the host runs a forward pass per model over its
+own rows. `--positions 256` plays 512 games, since `paired_starts` puts ordinals
+2k and 2k+1 on one opening with the colours swapped; that pairing is what keeps
+White's advantage out of the result. Noise is off and play is greedy from move
+one, because a match measures strength rather than producing training data.
+
+Checkpoint paths are relative to the training Volume, so nothing is uploaded. The
+summary reports the score, its 95% interval, and whether that interval clears
+parity: 60 games resolve about +/-0.10, which is too coarse to separate a 40 Elo
+edge from noise, while 512 games resolve about +/-0.035.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The
