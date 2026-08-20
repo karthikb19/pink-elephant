@@ -1,0 +1,13 @@
+{
+  "boards_sha256": "8528aceff55a682ee120e00a61bf03c831b404eb76194adef4541c22694db917",
+  "dataset_identity": "sha256:5c54f59f4b519dc5813013e9360b0abf1d6bf1ed35d253df4db7262eeacf3224",
+  "dataset_manifest_sha256": "0389934982725fa0583d123bd33ce92526b68ab8df0868049f5cc33290f941c8",
+  "duplicate_positions_dropped": 0,
+  "encoder_version": "v2",
+  "position_count": 20000,
+  "requested_positions": 20000,
+  "schema_version": "value-anchor/v1",
+  "seed": 20260819,
+  "split": "validation",
+  "targets_sha256": "a5a073f6f78949327404450acfbca03751972f04eb628fad103e560b358d9168"
+}
