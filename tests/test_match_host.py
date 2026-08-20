@@ -110,6 +110,7 @@ def test_match_request_rejects_impossible_shapes(
             checkpoint_b="b.pt",
             start_fens=fens,
             simulations=8,
+            simulations_b=0,
             exploration=1.25,
             max_plies=100,
             seed=0,
@@ -124,6 +125,7 @@ def test_match_request_rejects_a_zero_simulation_budget() -> None:
             checkpoint_b="b.pt",
             start_fens=("a", "b"),
             simulations=0,
+            simulations_b=0,
             exploration=1.25,
             max_plies=100,
             seed=0,
@@ -137,3 +139,35 @@ def test_identical_models_score_one_half_by_construction() -> None:
     outcomes = [_outcome("1-0", index % 2 == 0) for index in range(20)]
 
     assert math.isclose(score_match(outcomes)["score"], 0.5)
+
+
+def test_match_request_rejects_a_negative_second_budget() -> None:
+    with pytest.raises(ValueError, match="simulations_b"):
+        MatchRequest(
+            checkpoint_a="a.pt",
+            checkpoint_b="b.pt",
+            start_fens=("a", "b"),
+            simulations=8,
+            simulations_b=-1,
+            exploration=1.25,
+            max_plies=100,
+            seed=0,
+            pending_batches=2,
+        )
+
+
+def test_match_request_accepts_asymmetric_search_depth() -> None:
+    request = MatchRequest(
+        checkpoint_a="a.pt",
+        checkpoint_b="b.pt",
+        start_fens=("a", "b"),
+        simulations=800,
+        simulations_b=200,
+        exploration=1.25,
+        max_plies=100,
+        seed=0,
+        pending_batches=2,
+    )
+
+    assert request.simulations == 800
+    assert request.simulations_b == 200

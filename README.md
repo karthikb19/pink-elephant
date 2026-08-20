@@ -563,6 +563,11 @@ own rows. `--positions 256` plays 512 games, since `paired_starts` puts ordinals
 White's advantage out of the result. Noise is off and play is greedy from move
 one, because a match measures strength rather than producing training data.
 
+`--simulations-b` gives model B a different per-move budget, so the same net can
+play itself at two depths. That measures what search alone is worth on a given
+checkpoint, which bounds how much a self-play target can ever improve on the
+policy it was distilled from. Zero means both sides share `--simulations`.
+
 Checkpoint paths are relative to the training Volume, so nothing is uploaded. The
 summary reports the score, its 95% interval, and whether that interval clears
 parity: 60 games resolve about +/-0.10, which is too coarse to separate a 40 Elo

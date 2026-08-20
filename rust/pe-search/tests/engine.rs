@@ -281,3 +281,42 @@ fn unpaired_starts_keep_model_a_on_white() {
     assert!(!games.is_empty());
     assert!(games.iter().all(|game| game.a_is_white));
 }
+
+#[test]
+fn model_b_can_search_to_a_different_depth() {
+    // Measuring what search alone is worth means giving one side more
+    // simulations per move while both play the same net.
+    let mut settings = config(4, 2, 8);
+    settings.paired_starts = true;
+    settings.search.simulations_b = 32;
+    settings.start_fens = vec![
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+    ];
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    engine.stop_starting_new_games();
+    let games = run(&mut engine, 2, 200_000);
+    assert!(!games.is_empty(), "no game completed");
+}
+
+#[test]
+fn a_zero_second_budget_keeps_both_models_on_one_depth() {
+    let mut paired = config(4, 2, 8);
+    paired.paired_starts = true;
+    paired.search.simulations_b = 0;
+    paired.start_fens = vec![
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+    ];
+    let mut matching = paired.clone();
+    matching.search.simulations_b = matching.search.simulations;
+
+    let mut left = SelfPlayEngine::new(paired).expect("engine");
+    left.stop_starting_new_games();
+    let mut right = SelfPlayEngine::new(matching).expect("engine");
+    right.stop_starting_new_games();
+
+    let a: Vec<Vec<String>> = run(&mut left, 4, 200_000).into_iter().map(|g| g.moves_uci).collect();
+    let b: Vec<Vec<String>> = run(&mut right, 4, 200_000).into_iter().map(|g| g.moves_uci).collect();
+    assert_eq!(a, b, "zero must behave exactly like an equal budget");
+}

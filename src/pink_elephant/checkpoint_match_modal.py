@@ -50,6 +50,7 @@ class MatchRequest:
     checkpoint_b: str
     start_fens: tuple[str, ...]
     simulations: int
+    simulations_b: int
     exploration: float
     max_plies: int
     seed: int
@@ -60,6 +61,8 @@ class MatchRequest:
             raise ValueError("a paired match needs an even number of at least two games")
         if self.simulations < 1 or self.max_plies < 1:
             raise ValueError("simulations and max_plies must be positive")
+        if self.simulations_b < 0:
+            raise ValueError("simulations_b must be non-negative; zero matches model A")
         if self.pending_batches < 1 or len(self.start_fens) % self.pending_batches:
             raise ValueError("games must divide evenly into pending_batches")
 
@@ -91,6 +94,7 @@ def play_match(request: MatchRequest) -> dict[str, object]:
         seed=request.seed,
         game_id_prefix="match",
         simulations=request.simulations,
+        simulations_b=request.simulations_b,
         pending_batches=request.pending_batches,
         exploration_constant=request.exploration,
         # A match measures strength, so no exploration noise and no sampling.
@@ -152,6 +156,7 @@ def main(
     name_b: str = "model-b",
     positions: int = 256,
     simulations: int = 200,
+    simulations_b: int = 0,
     exploration: float = 1.25,
     max_plies: int = 300,
     seed: int = 0,
@@ -175,8 +180,10 @@ def main(
     selected = select_openings(usable, positions, seed=opening_seed)
     # Each opening twice: paired_starts gives ordinal 2k white and 2k+1 black.
     start_fens = tuple(position.fen for position in selected for _ in range(2))
+    budget_b = simulations_b or simulations
     print(
-        f"{positions} openings -> {len(start_fens)} games at {simulations} simulations",
+        f"{positions} openings -> {len(start_fens)} games; "
+        f"{name_a} at {simulations} simulations, {name_b} at {budget_b}",
         flush=True,
     )
 
@@ -186,6 +193,7 @@ def main(
             checkpoint_b=checkpoint_b,
             start_fens=start_fens,
             simulations=simulations,
+            simulations_b=simulations_b,
             exploration=exploration,
             max_plies=max_plies,
             seed=seed,
@@ -218,6 +226,7 @@ def main(
                     "positions": positions,
                     "games": len(start_fens),
                     "simulations": simulations,
+                    "simulations_b": budget_b,
                     "exploration": exploration,
                     "max_plies": max_plies,
                     "seed": seed,

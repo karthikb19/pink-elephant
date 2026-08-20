@@ -20,6 +20,9 @@ use crate::tree::Tree;
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
     pub simulations: u32,
+    /// Model B's per-move budget. Zero means it matches `simulations`, which is
+    /// every case except a match that varies search depth between the two nets.
+    pub simulations_b: u32,
     pub exploration_constant: f64,
     pub dirichlet_alpha: f64,
     pub dirichlet_fraction: f64,
@@ -39,6 +42,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simulations: 32,
+            simulations_b: 0,
             exploration_constant: 1.1,
             dirichlet_alpha: 0.3,
             dirichlet_fraction: 0.25,
@@ -173,6 +177,18 @@ impl SelfPlayGame {
         }
     }
 
+    /// The per-move simulation budget for whichever model owns this search.
+    ///
+    /// A match can give the two nets different depths, which is how the Elo that
+    /// search alone buys gets measured.
+    fn simulation_budget(&self) -> u32 {
+        if self.model_index() == 1 && self.config.simulations_b > 0 {
+            self.config.simulations_b
+        } else {
+            self.config.simulations
+        }
+    }
+
     /// Side to move at the root of the search currently in progress.
     ///
     /// One move's whole search belongs to one model, so this decides which net
@@ -216,7 +232,7 @@ impl SelfPlayGame {
             if self.ply() >= self.config.max_plies {
                 return Ok(Advance::Truncated);
             }
-            if self.simulations_done >= self.config.simulations {
+            if self.simulations_done >= self.simulation_budget() {
                 self.finish_move()?;
                 continue;
             }

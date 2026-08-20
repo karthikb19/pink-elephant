@@ -164,6 +164,7 @@ impl PySelfPlayEngine {
         seed,
         game_id_prefix,
         simulations = 32,
+        simulations_b = 0,
         pending_batches = 2,
         exploration_constant = 1.1,
         dirichlet_alpha = 0.3,
@@ -183,6 +184,7 @@ impl PySelfPlayEngine {
         seed: u64,
         game_id_prefix: String,
         simulations: u32,
+        simulations_b: u32,
         pending_batches: usize,
         exploration_constant: f64,
         dirichlet_alpha: f64,
@@ -205,6 +207,7 @@ impl PySelfPlayEngine {
             paired_starts,
             search: SearchConfig {
                 simulations,
+                simulations_b,
                 exploration_constant,
                 dirichlet_alpha,
                 dirichlet_fraction,
