@@ -116,6 +116,13 @@ def measure(
                     torch.cuda.Event(enable_timing=True),
                 )
                 inputs = _prepare(staging, batch, device)
+                # Warm up on this exact tensor. `torch.compile` specializes on the
+                # input it traced, so timing a tensor the warmup never saw captures
+                # a recompilation inside the event window and reports a forward
+                # slower than the round trip that contains it.
+                with torch.inference_mode(), _autocast_context(autocast, device):
+                    for _ in range(warmup):
+                        _forward(model, inputs)
                 torch.cuda.synchronize(device)
                 start.record()
                 with torch.inference_mode(), _autocast_context(autocast, device):
