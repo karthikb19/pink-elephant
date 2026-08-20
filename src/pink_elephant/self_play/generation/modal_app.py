@@ -217,7 +217,7 @@ def load_committed_worker_results(workers: tuple[WorkerSpec, ...]) -> tuple[Work
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     results: list[WorkerResult] = []
     for worker in workers:
-        result_path = (
+        invocations = (
             output_root
             / worker.generation.generation_id
             / "rounds"
@@ -225,11 +225,18 @@ def load_committed_worker_results(workers: tuple[WorkerSpec, ...]) -> tuple[Work
             / "workers"
             / worker.worker_id
             / "invocations"
-            / worker.invocation_id
-            / "worker-result.json"
         )
-        if result_path.is_file():
-            results.append(load_worker_result(result_path))
+        if not invocations.is_dir():
+            continue
+        # Every attempt gets its own invocation directory, so recovery searches all
+        # of them rather than the one this launch happens to be using. A worker that
+        # finished wrote worker-result.json; an interrupted one left only shards, and
+        # is skipped so a fresh invocation can retry it.
+        for invocation in sorted(invocations.iterdir(), reverse=True):
+            result_path = invocation / "worker-result.json"
+            if result_path.is_file():
+                results.append(load_worker_result(result_path))
+                break
     return tuple(results)
 
 
@@ -553,9 +560,14 @@ def main(
         active_games_per_worker=active_games_per_worker,
         shard_position_limit=shard_position_limit,
     )
+    # A distinct invocation per launch: an interrupted attempt leaves a partial
+    # directory behind, and reusing its identity would trip the non-empty guard
+    # that keeps two runs' artifacts from landing in one place.
+    invocation_id = f"invocation-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     completion = coordinate_generation_round.spawn(
         generation,
         round_spec,
+        invocation_id,
         worker_gpu=worker_gpu,
         worker_cpu=worker_cpu,
         autocast=autocast,

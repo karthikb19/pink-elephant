@@ -1064,3 +1064,84 @@ def test_sealing_reads_each_shard_once(tmp_path: Path, monkeypatch: pytest.Monke
     shards_module.audit_replay_shard(path)
 
     assert reads == 1
+
+
+def _worker_for_recovery(tmp_path: Path, invocation_id: str) -> object:
+    from pink_elephant.self_play.generation.config import GenerationRoundSpec, WorkerSpec
+
+    generation = generation_1_spec()
+    round_spec = GenerationRoundSpec(
+        generation_id=generation.generation_id,
+        round_id="round-000001",
+        requested_cumulative_positions=10,
+    )
+    return WorkerSpec(
+        generation=generation,
+        round=round_spec,
+        worker_id="worker-0000",
+        invocation_id=invocation_id,
+        seed_start=0,
+        seed_end=100,
+        position_lower_bound=10,
+    )
+
+
+def _write_committed_result(root: Path, worker, invocation_id: str) -> None:
+    directory = (
+        root
+        / worker.generation.generation_id
+        / "rounds"
+        / worker.round.round_id
+        / "workers"
+        / worker.worker_id
+        / "invocations"
+        / invocation_id
+    )
+    directory.mkdir(parents=True)
+    (directory / "worker-result.json").write_text("{}", encoding="utf-8")
+
+
+def test_recovery_finds_a_result_written_under_a_different_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry gets a new invocation id, so recovery cannot assume its own."""
+
+    from pink_elephant.self_play.generation import modal_app
+
+    root = tmp_path / "self-play"
+    worker = _worker_for_recovery(tmp_path, "invocation-20260820T120000Z")
+    _write_committed_result(root, worker, "invocation-0001")
+    monkeypatch.setattr(modal_app, "MODAL_VOLUME_MOUNT", tmp_path)
+    monkeypatch.setattr(modal_app, "SELF_PLAY_VOLUME_ROOT", "self-play")
+    monkeypatch.setattr(modal_app, "load_worker_result", lambda path: f"loaded:{path.parent.name}")
+
+    recovered = modal_app.load_committed_worker_results.local((worker,))
+
+    assert recovered == ("loaded:invocation-0001",)
+
+
+def test_recovery_ignores_an_invocation_with_no_committed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted attempt leaves shards but no result; it must be retried."""
+
+    from pink_elephant.self_play.generation import modal_app
+
+    root = tmp_path / "self-play"
+    worker = _worker_for_recovery(tmp_path, "invocation-20260820T120000Z")
+    partial = (
+        root
+        / worker.generation.generation_id
+        / "rounds"
+        / worker.round.round_id
+        / "workers"
+        / worker.worker_id
+        / "invocations"
+        / "invocation-0001"
+    )
+    partial.mkdir(parents=True)
+    (partial / "shard-00000.parquet").write_bytes(b"partial")
+    monkeypatch.setattr(modal_app, "MODAL_VOLUME_MOUNT", tmp_path)
+    monkeypatch.setattr(modal_app, "SELF_PLAY_VOLUME_ROOT", "self-play")
+
+    assert modal_app.load_committed_worker_results.local((worker,)) == ()
