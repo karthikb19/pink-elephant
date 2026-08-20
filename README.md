@@ -541,6 +541,27 @@ bit-identical to the parent's. That isolates the policy targets: an arena loss
 can no longer be blamed on a drifting value head. The run manifest records
 `policy_head_only`, `value_weight`, and a matching `training_objective`.
 
+## What the self-play loop is measured against
+
+Three measurements decide whether a generation and fine-tune were worth running,
+and each answers a question the others cannot.
+
+`scripts/value_anchor.py` scores a checkpoint against 20,000 frozen held-out
+engine evaluations. Watch `scale`, the predicted spread over the target spread:
+hard `{-1, 0, 1}` targets push it above one long before mean squared error looks
+alarming. The supervised parent sits at correlation 0.878 and scale 0.903.
+
+`scripts/inspect_self_play_games.py` reports a corpus's blunder rate by material
+swing, and the result distribution. White scoring near 0.500 from the balanced
+book positions is the sign the corpus is not biased.
+
+`checkpoint_match_modal.py` plays the candidate against its parent. Sixty games
+resolve about +/-0.10, which cannot separate a 40 Elo edge from noise; 512 games
+resolve about +/-0.035. A 60-game match in this repository once read 0.558 and
+the 512-game rerun of the same pairing read 0.484.
+
+The decision record for 2026-08-20 has the numbers and what they implied.
+
 ## Batched checkpoint matches
 
 The local match plays one game at a time through the Python search, evaluating a
