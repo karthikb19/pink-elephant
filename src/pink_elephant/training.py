@@ -32,6 +32,7 @@ from pink_elephant.model_adapter import (
 CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v2"
 LEGACY_CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
 EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.01
+POLICY_HEAD_MODULE_NAME: Final[str] = "policy_head"
 
 
 class _ConfigPayload(TypedDict):
@@ -41,6 +42,7 @@ class _ConfigPayload(TypedDict):
     device: str
     seed: int | None
     grad_clip_norm: float | None
+    policy_head_only: NotRequired[bool]
 
 
 class _SchemaPayload(TypedDict):
@@ -79,6 +81,10 @@ class TrainerConfig:
 
     The default value weight follows AlphaGo Zero's supervised human-game
     pretraining setup; self-play training can explicitly use ``1.0``.
+
+    ``policy_head_only`` trains the policy head alone and leaves the shared
+    trunk and the value head exactly as the parent checkpoint stored them, so
+    value predictions are unchanged by the run.
     """
 
     learning_rate: float = 1e-3
@@ -87,6 +93,7 @@ class TrainerConfig:
     device: str = "cpu"
     seed: int | None = None
     grad_clip_norm: float | None = None
+    policy_head_only: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -119,6 +126,7 @@ class TrainerConfig:
             "device": self.device,
             "seed": self.seed,
             "grad_clip_norm": self.grad_clip_norm,
+            "policy_head_only": self.policy_head_only,
         }
 
     @classmethod
@@ -132,6 +140,7 @@ class TrainerConfig:
             device=payload["device"],
             seed=payload["seed"],
             grad_clip_norm=payload["grad_clip_norm"],
+            policy_head_only=payload.get("policy_head_only", False),
         )
 
 
@@ -245,6 +254,28 @@ def mask_policy_logits(policy_logits: Tensor, legal_mask: Tensor) -> Tensor:
     return policy_logits.masked_fill(~legal_mask, -torch.inf)
 
 
+def _policy_cross_entropy(masked_logits: Tensor, batch: TrainingBatch) -> Tensor:
+    """Return hard-label or soft-target policy cross-entropy for one batch."""
+
+    if batch.policy_targets is None:
+        return F.cross_entropy(masked_logits, batch.played_actions)
+    if batch.policy_targets.device != masked_logits.device:
+        raise ValueError("policy logits and targets must be on the same device")
+    log_probabilities = F.log_softmax(masked_logits, dim=1)
+    target_values = batch.policy_targets.masked_select(batch.legal_mask)
+    legal_log_probabilities = log_probabilities.masked_select(batch.legal_mask)
+    legal_terms = target_values * legal_log_probabilities
+    return -legal_terms.sum() / batch.positions.shape[0]
+
+
+def _policy_labels(batch: TrainingBatch) -> Tensor:
+    """Return the reference action used only by top-k validation metrics."""
+
+    if batch.policy_targets is None:
+        return batch.played_actions
+    return batch.policy_targets.argmax(dim=1)
+
+
 def compute_joint_loss(
     output: ModelOutput,
     batch: TrainingBatch,
@@ -264,7 +295,7 @@ def compute_joint_loss(
         raise ValueError("value predictions and outcomes must be on the same device")
     if not bool(torch.isfinite(value_predictions).all()):
         raise ValueError("value predictions must contain only finite values")
-    policy_loss = F.cross_entropy(masked_logits, batch.played_actions)
+    policy_loss = _policy_cross_entropy(masked_logits, batch)
     value_loss = F.mse_loss(value_predictions, batch.outcomes)
     total_loss = policy_loss + value_weight * value_loss
     return JointLoss(total=total_loss, policy=policy_loss, value=value_loss)
@@ -299,11 +330,12 @@ def _compute_validation_metric_tensors(
         raise ValueError("value predictions must contain only finite values")
 
     legal_action_counts = batch.legal_mask.sum(dim=1).to(dtype=masked_logits.dtype)
-    policy_loss = F.cross_entropy(masked_logits, batch.played_actions)
+    policy_loss = _policy_cross_entropy(masked_logits, batch)
     uniform_policy_loss = torch.log(legal_action_counts).mean()
     top_actions = masked_logits.topk(k=min(5, POLICY_SIZE), dim=1).indices
-    top1 = top_actions[:, 0].eq(batch.played_actions).float().mean()
-    top5 = top_actions.eq(batch.played_actions.unsqueeze(1)).any(dim=1).float().mean()
+    policy_labels = _policy_labels(batch)
+    top1 = top_actions[:, 0].eq(policy_labels).float().mean()
+    top5 = top_actions.eq(policy_labels.unsqueeze(1)).any(dim=1).float().mean()
     value_errors = value_predictions - batch.outcomes
     value_mse = value_errors.square().mean()
     value_mae = value_errors.abs().mean()
@@ -367,6 +399,23 @@ def aggregate_validation_metrics(
     )
 
 
+def freeze_non_policy_modules(model: nn.Module) -> tuple[nn.Module, ...]:
+    """Freeze every module except the policy head and return the frozen ones."""
+
+    policy_head = getattr(model, POLICY_HEAD_MODULE_NAME, None)
+    if not isinstance(policy_head, nn.Module):
+        raise ValueError(f"policy-head-only training requires a {POLICY_HEAD_MODULE_NAME!r} module")
+    policy_parameter_ids = {id(parameter) for parameter in policy_head.parameters()}
+    if not policy_parameter_ids:
+        raise ValueError("policy head has no parameters to train")
+    for parameter in model.parameters():
+        if id(parameter) not in policy_parameter_ids:
+            parameter.requires_grad_(False)
+    return tuple(
+        module for name, module in model.named_children() if name != POLICY_HEAD_MODULE_NAME
+    )
+
+
 class Trainer:
     """A deterministic-friendly, single-process AdamW policy/value trainer."""
 
@@ -388,14 +437,29 @@ class Trainer:
         if model_spec is not None and described_model is not None and model_spec != described_model:
             raise ValueError("explicit model specification does not match the model adapter")
         self.model_spec = model_spec or described_model
+        self.frozen_modules = (
+            freeze_non_policy_modules(self.model) if self.config.policy_head_only else ()
+        )
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            self.trainable_parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
         self.epoch = 0
         self.step = 0
         self.last_validation_metrics: ValidationMetrics | None = None
+
+    def trainable_parameters(self) -> list[Tensor]:
+        """Return the parameters this trainer is allowed to update."""
+
+        return [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+
+    def _set_training_mode(self, training: bool) -> None:
+        """Frozen modules stay in eval so their batch-norm statistics never move."""
+
+        self.model.train(training)
+        for module in self.frozen_modules:
+            module.eval()
 
     def train_epoch(
         self,
@@ -410,7 +474,7 @@ class Trainer:
             raise ValueError("phase_timing_batches must be non-negative")
         if phase_timing_batches > 0 and phase_timing_observer is None:
             raise ValueError("phase timing requires an observer")
-        self.model.train()
+        self._set_training_mode(True)
         total_examples = 0
         loss_totals: Tensor | None = None
         batch_count = 0
@@ -453,7 +517,7 @@ class Trainer:
                 backward_seconds = time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
             if self.config.grad_clip_norm is not None:
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                nn.utils.clip_grad_norm_(self.trainable_parameters(), self.config.grad_clip_norm)
             self.optimizer.step()
             if measure_phases:
                 self._synchronize_device()
@@ -504,7 +568,7 @@ class Trainer:
                         _compute_validation_metric_tensors(self._model_output(batch), batch)
                     )
         finally:
-            self.model.train(was_training)
+            self._set_training_mode(was_training)
         metrics = _aggregate_validation_metric_tensors(batch_metrics)
         self.last_validation_metrics = metrics
         return metrics
@@ -633,8 +697,11 @@ class Trainer:
 
         payload = _load_checkpoint_payload(path, map_location=self.device)
         checkpoint_schema = _schema_from_payload(payload["schema"])
-        if checkpoint_schema != self.schema:
-            raise ValueError("checkpoint dataset schema does not match this trainer")
+        if (
+            checkpoint_schema.encoder_version != self.schema.encoder_version
+            or checkpoint_schema.action_schema_version != self.schema.action_schema_version
+        ):
+            raise ValueError("checkpoint encoder or action schema does not match this trainer")
         checkpoint_model_spec = self._checkpoint_model_spec(payload)
         if (
             checkpoint_model_spec is not None
@@ -670,13 +737,9 @@ class Trainer:
         return output
 
     def _on_device(self, batch: TrainingBatch) -> TrainingBatch:
-        if batch.positions.device == self.device:
-            return batch
-        return TrainingBatch(
-            positions=batch.positions.to(self.device),
-            legal_mask=batch.legal_mask.to(self.device),
-            played_actions=batch.played_actions.to(self.device),
-            outcomes=batch.outcomes.to(self.device),
+        return batch.to(
+            self.device,
+            non_blocking=batch.positions.device.type == "cpu" and batch.positions.is_pinned(),
         )
 
     def _synchronize_device(self) -> None:

@@ -78,6 +78,7 @@ class TrainingBatch:
     legal_mask: Tensor
     played_actions: Tensor
     outcomes: Tensor
+    policy_targets: Tensor | None = None
 
     def __post_init__(self) -> None:
         for name, tensor in self._tensors_with_names():
@@ -137,21 +138,98 @@ class TrainingBatch:
             raise ValueError("outcomes must contain only finite values")
         if bool(((self.outcomes < -1) | (self.outcomes > 1)).any()):
             raise ValueError("outcomes must be in [-1, 1]")
+        if self.policy_targets is not None:
+            if not isinstance(self.policy_targets, Tensor):
+                raise TypeError("policy_targets must be a torch.Tensor")
+            if not torch.is_floating_point(self.policy_targets):
+                raise TypeError("policy_targets must be floating-point")
+            if self.policy_targets.shape != self.legal_mask.shape:
+                raise ValueError(
+                    "policy_targets must have shape "
+                    f"{tuple(self.legal_mask.shape)}, got {tuple(self.policy_targets.shape)}"
+                )
+            if self.policy_targets.device != self.positions.device:
+                raise ValueError("policy_targets must be on the same device as the batch")
+            if not bool(torch.isfinite(self.policy_targets).all()):
+                raise ValueError("policy_targets must contain only finite values")
+            if bool((self.policy_targets < 0).any()):
+                raise ValueError("policy_targets must be non-negative")
+            if bool((self.policy_targets.masked_select(~self.legal_mask) != 0).any()):
+                raise ValueError("policy_targets must assign zero probability to illegal actions")
+            totals = self.policy_targets.sum(dim=1)
+            if not bool(torch.allclose(totals, torch.ones_like(totals), atol=1e-5, rtol=0)):
+                raise ValueError("each policy target must sum to one")
 
     def _tensors(self) -> tuple[Tensor, ...]:
         """Return tensors whose device must agree."""
 
-        return (self.positions, self.legal_mask, self.played_actions, self.outcomes)
+        tensors = (self.positions, self.legal_mask, self.played_actions, self.outcomes)
+        if self.policy_targets is None:
+            return tensors
+        return (*tensors, self.policy_targets)
 
     def _tensors_with_names(self) -> tuple[tuple[str, Tensor], ...]:
         """Return named batch tensors for contract validation."""
 
-        return (
+        tensors = (
             ("positions", self.positions),
             ("legal_mask", self.legal_mask),
             ("played_actions", self.played_actions),
             ("outcomes", self.outcomes),
         )
+        if self.policy_targets is None:
+            return tensors
+        return (*tensors, ("policy_targets", self.policy_targets))
+
+    def to(self, device: torch.device, *, non_blocking: bool = False) -> TrainingBatch:
+        """Move an already validated batch without synchronizing to revalidate it."""
+
+        if self.positions.device == device:
+            return self
+        return self._from_validated_tensors(
+            positions=self.positions.to(device, non_blocking=non_blocking),
+            legal_mask=self.legal_mask.to(device, non_blocking=non_blocking),
+            played_actions=self.played_actions.to(device, non_blocking=non_blocking),
+            outcomes=self.outcomes.to(device, non_blocking=non_blocking),
+            policy_targets=(
+                None
+                if self.policy_targets is None
+                else self.policy_targets.to(device, non_blocking=non_blocking)
+            ),
+        )
+
+    def pin_memory(self) -> TrainingBatch:
+        """Copy an already validated CPU batch into page-locked transfer memory."""
+
+        if self.positions.device.type != "cpu":
+            raise ValueError("only CPU training batches can be pinned")
+        return self._from_validated_tensors(
+            positions=self.positions.pin_memory(),
+            legal_mask=self.legal_mask.pin_memory(),
+            played_actions=self.played_actions.pin_memory(),
+            outcomes=self.outcomes.pin_memory(),
+            policy_targets=(
+                None if self.policy_targets is None else self.policy_targets.pin_memory()
+            ),
+        )
+
+    @classmethod
+    def _from_validated_tensors(
+        cls,
+        *,
+        positions: Tensor,
+        legal_mask: Tensor,
+        played_actions: Tensor,
+        outcomes: Tensor,
+        policy_targets: Tensor | None,
+    ) -> TrainingBatch:
+        batch = object.__new__(cls)
+        object.__setattr__(batch, "positions", positions)
+        object.__setattr__(batch, "legal_mask", legal_mask)
+        object.__setattr__(batch, "played_actions", played_actions)
+        object.__setattr__(batch, "outcomes", outcomes)
+        object.__setattr__(batch, "policy_targets", policy_targets)
+        return batch
 
 
 @dataclass(frozen=True)

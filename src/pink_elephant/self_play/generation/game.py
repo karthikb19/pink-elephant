@@ -38,6 +38,7 @@ class PendingPosition:
     fen: str
     policy: tuple[SparsePolicyEntry, ...]
     selected_action_index: int
+    root_value: float
     side_to_move: chess.Color
     game_id: str
     ply_index: int
@@ -139,6 +140,29 @@ def select_action_from_summary(
     return actions[-1].action_index
 
 
+def subsample_replay_rows(
+    rows: Sequence[ReplayRow], *, stride: int, seed: int
+) -> tuple[ReplayRow, ...]:
+    """Keep one position per stride window, offset randomly within each game.
+
+    Every position in a game shares one outcome, so consecutive rows are close to
+    duplicates of a single label. A randomized offset avoids the side-to-move bias
+    a fixed stride would introduce, since a fixed offset keeps only one colour's
+    turn at even strides.
+    """
+
+    if stride < 1:
+        raise ValueError("stride must be positive")
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+    if stride == 1 or not rows:
+        return tuple(rows)
+    offset = Random(seed).randrange(stride)
+    kept = tuple(row for index, row in enumerate(rows) if (index - offset) % stride == 0)
+    # A game shorter than one stride window would otherwise contribute nothing.
+    return kept if kept else (rows[offset % len(rows)],)
+
+
 def complete_game(
     *,
     game_id: str,
@@ -174,6 +198,7 @@ def complete_game(
                 policy=pending.policy,
                 selected_action_index=pending.selected_action_index,
                 outcome=position_outcome,
+                root_value=pending.root_value,
                 game_id=pending.game_id,
                 ply_index=pending.ply_index,
             )
@@ -267,6 +292,7 @@ def run_self_play_game(
             mcts_config,
             root_prior_modifiers=(root_noise,),
         )[0]
+        root_value = root.mean_value
         policy = tuple(
             SparsePolicyEntry(action_index=action_index, probability=probability)
             for action_index, probability in sorted(root_visit_distribution(root).items())
@@ -289,6 +315,7 @@ def run_self_play_game(
                 fen=current_board.fen(en_passant="fen"),
                 policy=policy,
                 selected_action_index=selected_action_index,
+                root_value=root_value,
                 side_to_move=current_board.turn,
                 game_id=game_id,
                 ply_index=current_board.ply(),

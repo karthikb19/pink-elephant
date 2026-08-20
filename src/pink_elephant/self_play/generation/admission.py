@@ -102,14 +102,18 @@ class ReplayAdmissionWriter:
         round_id: str,
         worker_id: str,
         position_lower_bound: int,
+        replay_stride: int = 1,
         max_pending: int = DEFAULT_MAX_PENDING,
     ) -> None:
         if max_pending < 1:
             raise ValueError("max_pending must be positive")
+        if replay_stride < 1:
+            raise ValueError("replay_stride must be positive")
         self._shard_builder = shard_builder
         self._round_id = round_id
         self._worker_id = worker_id
         self._position_lower_bound = position_lower_bound
+        self._replay_stride = replay_stride
         self._queue: queue.Queue[pe_search.CompletedGame | _Stop] = queue.Queue(maxsize=max_pending)
         self._thread = threading.Thread(target=self._consume, name="replay-admission", daemon=True)
         self._lock = threading.Lock()
@@ -213,7 +217,7 @@ class ReplayAdmissionWriter:
     def _admit(self, game: pe_search.CompletedGame) -> None:
         adapt_started = time.perf_counter()
         try:
-            rows, record = adapt_completed_game(game)
+            rows, record = adapt_completed_game(game, replay_stride=self._replay_stride)
         except (RuntimeError, ValueError) as error:
             elapsed = time.perf_counter() - adapt_started
             with self._lock:

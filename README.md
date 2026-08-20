@@ -407,6 +407,83 @@ and legal actions from the stored FEN using the Python implementation. A
 non-zero `failed_game_count` therefore signals a genuine disagreement between the
 two encoders, not merely a schema problem.
 
+## Self-play start positions and stride subsampling
+
+Games no longer all begin from the standard start. `StartPositionMix` weights a
+pool across the standard start, the human opening book, and archived
+engine-evaluated positions banded by evaluation magnitude, so the value head
+keeps seeing decisive positions instead of only balanced ones:
+
+```sh
+uv run scripts/build_start_archive.py \
+  --source data/lichess-eval-1m.jsonl \
+  --output data/openings/start-archive-v1.jsonl \
+  --per-band 4000 --seed 20260819
+```
+
+The weighted mix is expanded once into a fixed pool of FENs whose digest enters
+`search_config_sha256`, so two rounds that claim the same generation identity
+really did draw from the same positions. Archive FENs often omit the move
+counters, so a game started from one begins at ply zero and the temperature
+cutoff is measured from the generated game, not the original.
+
+`--replay-stride` keeps one position per stride window with a per-game random
+offset, and defaults to 1, meaning off. It exists because every position in a
+game shares one outcome, but measured self-play games run about 32 plies and the
+blended value target already gives each position its own signal, so discarding
+rows would cost proportionally more search for redundancy that is no longer
+there. Raise it only if game length grows a lot. When set above one, the native
+path subsamples before building rows, skipping the FEN re-derivation for
+discarded plies, and a random offset avoids the side-to-move bias a fixed offset
+would introduce.
+
+## Value targets
+
+Self-play value targets blend the terminal outcome with the search-averaged root
+value, following Leela's `q_ratio`:
+
+```text
+target = q_ratio * root_value + (1 - q_ratio) * outcome
+```
+
+The outcome is constant across a game and carries about one bit however many
+positions it labels; the root value varies per position. The default of 0.5
+suits 200-simulation searches, and a shallower search makes the root value a
+weaker teacher and wants a lower ratio. Track the effect with
+`scripts/value_anchor.py evaluate`, which scores a checkpoint against a frozen
+held-out set of engine evaluations.
+
+## Self-play replay fine-tuning
+
+Fine-tune the parent checkpoint from the consolidated replay dataset on Modal:
+
+```sh
+uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
+  --run-name self-play-iteration-1 \
+  --replay-capacity 2000000
+```
+
+`--replay-capacity` clamps to the manifest total, so any value above it trains
+on every consolidated position instead of the newest million.
+
+Two flags control which heads learn. `--value-weight` scales the terminal
+outcome MSE, and `--policy-head-only` freezes the shared trunk and the value
+head so only the policy readout updates:
+
+```sh
+uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
+  --run-name policy-head-only-full-replay \
+  --replay-capacity 2000000 \
+  --value-weight 0.0 \
+  --policy-head-only
+```
+
+Under `--policy-head-only` the frozen modules stay in eval mode for the whole
+run, including batch-norm statistics, so the candidate's value predictions are
+bit-identical to the parent's. That isolates the policy targets: an arena loss
+can no longer be blamed on a drifting value head. The run manifest records
+`policy_head_only`, `value_weight`, and a matching `training_objective`.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The
@@ -443,6 +520,82 @@ To download Stockfish without playing:
 ```
 
 An existing executable can be supplied with `--stockfish-binary`.
+
+### Checkpoint versus checkpoint
+
+Run a reproducible, color-balanced match between two local or Modal Volume
+checkpoints:
+
+```sh
+uv run play-checkpoints \
+  'modal://pink-elephant-training/runs/<candidate-run>/checkpoints/<candidate>.pt?environment=main' \
+  'modal://pink-elephant-training/runs/<parent-run>/checkpoints/<parent>.pt?environment=main' \
+  --name-a self-play-candidate \
+  --name-b parent \
+  --games 2 \
+  --simulations 32 \
+  --exploration 1.25 \
+  --opening-temperature 1.0 \
+  --temperature-cutoff-ply 12 \
+  --seed 0 \
+  --max-plies 256 \
+  --device cpu \
+  --torch-threads 4
+```
+
+Either positional checkpoint may instead be an existing local path or a full
+`https://modal.com/storage/.../volumes/.../<checkpoint>.pt` URL. A remote
+checkpoint is downloaded only on a cache miss, using an atomic partial file,
+and is then reused from `data/modal-checkpoints/cache/`. The default result
+directory is timestamped under `data/checkpoint-arena/`; it contains one PGN
+per game and `results.json` with both checkpoint hashes, epochs, steps, all
+match parameters, timings, and the score from model A's perspective. Model A
+plays White first and the colors alternate, so `--games` must be even. During
+the match, every move is printed live in SAN notation; each complete PGN and
+its saved path are printed immediately after its game. The first 12 plies use
+seeded sampling from MCTS visit counts at temperature 1.0, then selection
+becomes greedy. Each game receives a distinct seed derived from `--seed`; the
+seed and variation settings are recorded in `results.json`, so a varied match
+can still be replayed exactly.
+
+The executable entry point and `scripts/play_checkpoints.py` share the same
+implementation; the script can also be invoked directly with `uv run python
+scripts/play_checkpoints.py ...`.
+
+### Human opening books
+
+Standard-start matches spend most of their variation budget on sampled opening
+moves, which measures opening policy noise more than playing strength. Pin a
+book of real human positions instead, then replay each position with both
+colors:
+
+```sh
+uv run pe-openings data/openings/members_2025-10.jsonl data/openings/human-2025-10-30.jsonl \
+  --count 30 --seed 0 --min-count 500 --min-ply 4 --max-ply 12
+```
+
+The source is any JSON Lines file of `position_hash`, `fen`, `disc_count`, and
+`conf_count` records, such as `members_2025-10.jsonl` from
+[engine-equal-human-unequal](https://github.com/jesung/engine-equal-human-unequal):
+1,661 positions that Stockfish deep-verified as approximately equal, with
+`disc_count` and `conf_count` counting how often October 2025 Lichess games
+reached each one before and after 2025-10-15. Engine-equal starting positions
+suit a match book because neither side begins with an objective advantage.
+Selection drops illegal, finished, and transposed positions, applies the
+occurrence and ply filters, and then samples reproducibly from `--seed`.
+
+Pass the book to a match with `--openings`; it must hold exactly `--games / 2`
+positions, because each position is played once with each color under a shared
+game seed. `--temperature-cutoff-ply` is then measured from the book position
+rather than the standard start, so `--temperature-cutoff-ply 0` plays every
+game greedily from the book and removes opening sampling noise entirely:
+
+```sh
+SIMULATIONS=128 ./scripts/run_book_match.sh
+```
+
+`results.json` records the selected book and each game's `opening_hash` and
+`opening_fen`, and every PGN carries `FEN`/`SetUp` headers.
 
 ## Development
 

@@ -67,6 +67,11 @@ class MCTSRootSummary:
     """The root-only MCTS result needed for policy targets and move selection."""
 
     actions: tuple[RootActionStatistics, ...]
+    root_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.root_value) or not -1 <= self.root_value <= 1:
+            raise ValueError(f"root_value must be finite and in [-1, 1], got {self.root_value}")
 
 
 class PolicyValueEvaluator(Protocol):
@@ -363,7 +368,8 @@ def summarize_root(root_node: MCTSNode) -> MCTSRootSummary:
                 prior_probability=child.prior_probability,
             )
             for action_index, child in sorted(root_node.children_by_action_index.items())
-        )
+        ),
+        root_value=root_node.mean_value,
     )
 
 

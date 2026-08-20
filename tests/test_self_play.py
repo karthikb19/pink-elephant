@@ -83,6 +83,7 @@ def _fools_mate_game() -> tuple[tuple[PendingPosition, ...], chess.Board, GameRe
                 fen=board.fen(en_passant="fen"),
                 policy=policy,
                 selected_action_index=move_to_policy_index(board, move),
+                root_value=0.0,
                 side_to_move=board.turn,
                 game_id="fools-mate",
                 ply_index=ply,

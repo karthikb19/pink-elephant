@@ -43,6 +43,7 @@ from pink_elephant.self_play.generation.game import (
     PendingPosition,
     complete_game,
     run_self_play_game,
+    subsample_replay_rows,
 )
 from pink_elephant.self_play.generation.manifests import (
     latest_snapshot,
@@ -66,6 +67,10 @@ from pink_elephant.self_play.generation.shards import (
     validate_replay_shard,
     write_games_table,
     write_replay_shard,
+)
+from pink_elephant.self_play.generation.start_positions import (
+    StartPositionMix,
+    build_start_position_pool,
 )
 from pink_elephant.self_play.generation.worker import (
     ModelBatchEvaluator,
@@ -190,6 +195,7 @@ def _valid_replay_row() -> ReplayRow:
         ),
         selected_action_index=legal_actions[0],
         outcome=0,
+        root_value=0.0,
         game_id="test-game",
         ply_index=0,
     )
@@ -213,6 +219,7 @@ def _repetition_game_inputs() -> tuple[chess.Board, tuple[PendingPosition, ...]]
                     for action_index in legal_actions
                 ),
                 selected_action_index=move_to_policy_index(board, move),
+                root_value=0.0,
                 side_to_move=board.turn,
                 game_id="repetition-game",
                 ply_index=board.ply(),
@@ -931,3 +938,89 @@ def test_generation_1_checkpoint_digest_matches_the_pinned_volume_artifact() -> 
     assert GENERATION_1_CHECKPOINT_SHA256 == (
         "9e1f7bb15cc042357e1e4a0afea18c89f01e25aada7497be83c91f29f62a0229"
     )
+
+
+def test_replay_row_rejects_a_root_value_outside_the_value_range() -> None:
+    board = chess.Board()
+    legal_actions = tuple(sorted(legal_policy_indices(board)))
+    with pytest.raises(ValueError, match="root_value must be in"):
+        ReplayRow(
+            board=encode_board(board),
+            fen=board.fen(en_passant="fen"),
+            policy=tuple(
+                SparsePolicyEntry(action_index=action_index, probability=1 / len(legal_actions))
+                for action_index in legal_actions
+            ),
+            selected_action_index=legal_actions[0],
+            outcome=0,
+            root_value=1.5,
+            game_id="test-game",
+            ply_index=0,
+        )
+
+
+def test_replay_shards_round_trip_the_root_value(tmp_path: Path) -> None:
+    row = _valid_replay_row()
+    searched = replace(row, root_value=-0.375)
+    path = tmp_path / "replay-00000.parquet"
+
+    write_replay_shard(path, (searched,))
+    restored = list(iter_replay_rows(path))
+
+    assert len(restored) == 1
+    assert restored[0].root_value == pytest.approx(-0.375)
+    assert restored[0].outcome == searched.outcome
+
+
+def test_subsampling_keeps_one_position_per_stride_window() -> None:
+    rows = tuple(replace(_valid_replay_row(), ply_index=index) for index in range(40))
+
+    kept = subsample_replay_rows(rows, stride=4, seed=11)
+
+    assert len(kept) == 10
+    positions = [row.ply_index for row in kept]
+    gaps = zip(positions[:-1], positions[1:], strict=True)
+    assert all(later - earlier == 4 for earlier, later in gaps)
+
+
+def test_subsampling_offsets_differ_across_games_so_no_colour_is_favoured() -> None:
+    rows = tuple(replace(_valid_replay_row(), ply_index=index) for index in range(40))
+
+    offsets = {subsample_replay_rows(rows, stride=4, seed=seed)[0].ply_index for seed in range(40)}
+
+    assert offsets == {0, 1, 2, 3}
+
+
+def test_subsampling_keeps_a_game_shorter_than_one_stride_window() -> None:
+    rows = (_valid_replay_row(),)
+
+    assert len(subsample_replay_rows(rows, stride=8, seed=3)) == 1
+
+
+def test_a_unit_stride_keeps_every_position() -> None:
+    rows = tuple(replace(_valid_replay_row(), ply_index=index) for index in range(7))
+
+    assert subsample_replay_rows(rows, stride=1, seed=0) == rows
+
+
+def test_generation_identity_covers_the_start_pool_and_stride() -> None:
+    base = generation_1_spec()
+    strided = replace(base, replay_stride=4)
+    pooled = replace(
+        base,
+        start_pool=build_start_position_pool(
+            mix=StartPositionMix(
+                startpos=1.0,
+                opening_book=0.0,
+                archive_balanced=0.0,
+                archive_moderate=0.0,
+                archive_decisive=0.0,
+            ),
+            size=8,
+        ),
+    )
+
+    assert base.search_config_sha256 != strided.search_config_sha256
+    assert base.search_config_sha256 != pooled.search_config_sha256
+    assert base.start_pool_sha256 == "startpos"
+    assert base.start_fens() == ()

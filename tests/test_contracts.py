@@ -81,6 +81,38 @@ def test_training_batch_is_the_model_training_contract() -> None:
     assert batch.played_actions.dtype == torch.int64
 
 
+def test_training_batch_accepts_a_legal_soft_policy_target() -> None:
+    values = _batch().__dict__
+    targets = torch.zeros((2, POLICY_SIZE), dtype=torch.float32)
+    targets[0, [0, 2]] = torch.tensor([0.25, 0.75])
+    targets[1, 1] = 1.0
+    values["policy_targets"] = targets
+
+    batch = TrainingBatch(**values)
+
+    assert batch.policy_targets is not None
+    assert torch.allclose(batch.policy_targets.sum(dim=1), torch.ones(2))
+
+
+def test_training_batch_rejects_policy_mass_on_an_illegal_action() -> None:
+    values = _batch().__dict__
+    targets = torch.zeros((2, POLICY_SIZE), dtype=torch.float32)
+    targets[0, 1] = 1.0
+    targets[1, 1] = 1.0
+    values["policy_targets"] = targets
+
+    with pytest.raises(ValueError, match="zero probability to illegal"):
+        TrainingBatch(**values)
+
+
+def test_training_batch_reuses_validated_storage_on_the_same_device() -> None:
+    batch = _batch()
+
+    moved = batch.to(torch.device("cpu"))
+
+    assert moved is batch
+
+
 def test_training_batch_rejects_a_played_illegal_action() -> None:
     values = _batch().__dict__
     values["played_actions"] = torch.tensor([1, 1], dtype=torch.int64)

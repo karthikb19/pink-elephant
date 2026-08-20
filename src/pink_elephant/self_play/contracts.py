@@ -20,7 +20,7 @@ from pink_elephant.encoding import (
     encode_board,
 )
 
-REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v1"
+REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v2"
 GAME_SCHEMA_VERSION: Final[str] = "self-play/games/v1"
 WORKER_RESULT_SCHEMA_VERSION: Final[str] = "self-play/worker-result/v1"
 ROUND_SCHEMA_VERSION: Final[str] = "self-play/round/v1"
@@ -52,6 +52,7 @@ class ReplayRow:
     policy: tuple[SparsePolicyEntry, ...]
     selected_action_index: int
     outcome: int
+    root_value: float
     game_id: str
     ply_index: int
 
@@ -103,6 +104,10 @@ class ReplayRow:
             )
         ):
             raise ValueError("outcome must be -1, 0, or 1")
+        if not isinstance(self.root_value, float) or not math.isfinite(self.root_value):
+            raise ValueError("root_value must be a finite float")
+        if not -1 <= self.root_value <= 1:
+            raise ValueError("root_value must be in [-1, 1]")
         if isinstance(self.ply_index, bool) or self.ply_index < 0:
             raise ValueError("ply_index must be non-negative")
 
@@ -118,6 +123,7 @@ class ReplayRow:
             ],
             "selected_action_index": self.selected_action_index,
             "outcome": self.outcome,
+            "root_value": self.root_value,
             "game_id": self.game_id,
             "ply_index": self.ply_index,
         }
@@ -143,8 +149,12 @@ class GameRecord:
             raise ValueError("seed must be an unsigned 64-bit integer")
         if self.result not in {"1-0", "0-1", "1/2-1/2"}:
             raise ValueError("completed game result must be 1-0, 0-1, or 1/2-1/2")
-        if self.ply_count != len(self.moves_uci) or self.replay_position_count != self.ply_count:
+        if self.ply_count != len(self.moves_uci):
             raise ValueError("game counts must match the recorded move sequence")
+        # Stride subsampling admits a subset of a game's plies, so replay rows may
+        # be fewer than moves; the game itself is still reconstructed from all of them.
+        if not 1 <= self.replay_position_count <= self.ply_count:
+            raise ValueError("replay position count must be between one and the ply count")
         if self.ply_count < 1:
             raise ValueError("a completed replay game must contain at least one move")
         board = _board_from_fen(self.initial_fen)

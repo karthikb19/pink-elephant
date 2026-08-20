@@ -22,6 +22,8 @@ pub struct EngineConfig {
     pub pending_batches: usize,
     pub seed: u64,
     pub game_id_prefix: String,
+    /// Start positions games are drawn from. Empty means the standard start.
+    pub start_fens: Vec<String>,
     pub search: SearchConfig,
 }
 
@@ -38,6 +40,9 @@ impl EngineConfig {
                 "games ({}) must divide evenly into pending_batches ({})",
                 self.games, self.pending_batches
             ));
+        }
+        for fen in &self.start_fens {
+            GamePosition::from_fen(fen)?;
         }
         self.search.validate()
     }
@@ -131,10 +136,18 @@ impl SelfPlayEngine {
         self.next_game_ordinal += 1;
         let seed = splitmix64(self.config.seed.wrapping_add(ordinal));
         let game_id = format!("{}-{:08}", self.config.game_id_prefix, ordinal);
+        let start = match self.config.start_fens.len() {
+            0 => GamePosition::starting(),
+            count => {
+                let index = (splitmix64(seed) % count as u64) as usize;
+                GamePosition::from_fen(&self.config.start_fens[index])
+                    .expect("start fens are validated when the engine is configured")
+            }
+        };
         self.slots[slot] = Some(SelfPlayGame::new(
             game_id,
             seed,
-            GamePosition::starting(),
+            start,
             self.config.search.clone(),
         ));
     }

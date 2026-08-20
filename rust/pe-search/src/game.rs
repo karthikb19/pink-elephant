@@ -78,6 +78,7 @@ pub struct RecordedPosition {
     pub fen: String,
     pub policy: Vec<(u32, f64)>,
     pub selected_action_index: u32,
+    pub root_value: f64,
     pub side_to_move: Color,
     pub ply_index: u32,
 }
@@ -262,6 +263,7 @@ impl SelfPlayGame {
         if policy.is_empty() {
             return Err("cannot finish a move from an unexpanded root".into());
         }
+        let root_value = self.tree.root_mean_value();
         let ply = self.ply();
         let greedy = ply >= self.config.temperature_cutoff_ply;
         let temperature = if greedy {
@@ -282,6 +284,7 @@ impl SelfPlayGame {
             fen: self.position.fen(),
             policy,
             selected_action_index: selected,
+            root_value,
             side_to_move: self.position.turn(),
             ply_index: ply,
         });

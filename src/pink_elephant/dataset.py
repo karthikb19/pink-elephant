@@ -232,7 +232,7 @@ class PrefetchIterator(Iterator[TrainingBatch]):
         self._closed = False
         self._worker = threading.Thread(
             target=self._produce,
-            name="expert-batch-prefetch",
+            name="training-batch-prefetch",
             daemon=True,
         )
         self._worker.start()

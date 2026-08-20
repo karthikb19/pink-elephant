@@ -3,11 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import chess
+import pytest
 import torch
 from torch import nn
 
 from pink_elephant.action_mapping import legal_policy_indices
-from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game
+from pink_elephant.arena import CheckpointEvaluator, load_checkpoint_model, play_game, play_players
 from pink_elephant.arena_cli import ArenaGame, ArenaSummary, _persist_evaluation, build_parser
 from pink_elephant.artifacts import RunStore
 from pink_elephant.model import ChessResNet, ModelOutput, ResNetConfig
@@ -93,6 +94,25 @@ def test_play_game_stops_at_move_limit_and_emits_pgn() -> None:
     assert "1." in result.pgn
 
 
+def test_play_players_uses_checkpoint_names_in_pgn() -> None:
+    class FirstLegalMovePlayer:
+        def choose_move(self, board: chess.Board) -> chess.Move:
+            return next(iter(board.legal_moves))
+
+    result = play_players(
+        FirstLegalMovePlayer(),
+        FirstLegalMovePlayer(),
+        white_name="candidate",
+        black_name="parent",
+        event="Checkpoint match",
+        max_plies=2,
+    )
+
+    assert '[Event "Checkpoint match"]' in result.pgn
+    assert '[White "candidate"]' in result.pgn
+    assert '[Black "parent"]' in result.pgn
+
+
 def test_arena_defaults_to_ten_games_against_1500_stockfish() -> None:
     args = build_parser().parse_args(["--checkpoint", "checkpoint.pt"])
 
@@ -132,3 +152,41 @@ def test_run_arena_results_are_persisted_below_the_run(tmp_path: Path) -> None:
 def _write_and_return(path: Path) -> Path:
     _write_checkpoint(path)
     return path
+
+
+def test_play_players_starts_from_a_book_position_and_records_it() -> None:
+    class FirstLegalMovePlayer:
+        def choose_move(self, board: chess.Board) -> chess.Move:
+            return next(iter(board.legal_moves))
+
+    start_fen = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+
+    result = play_players(
+        FirstLegalMovePlayer(),
+        FirstLegalMovePlayer(),
+        white_name="candidate",
+        black_name="parent",
+        event="Checkpoint match",
+        max_plies=3,
+        start_fen=start_fen,
+    )
+
+    assert f'[FEN "{start_fen}"]' in result.pgn
+    assert '[SetUp "1"]' in result.pgn
+    assert result.plies == 3
+
+
+def test_play_players_rejects_an_unplayable_start_position() -> None:
+    class FirstLegalMovePlayer:
+        def choose_move(self, board: chess.Board) -> chess.Move:
+            return next(iter(board.legal_moves))
+
+    with pytest.raises(ValueError, match="not playable"):
+        play_players(
+            FirstLegalMovePlayer(),
+            FirstLegalMovePlayer(),
+            white_name="candidate",
+            black_name="parent",
+            event="Checkpoint match",
+            start_fen="8/8/8/8/8/8/8/8 w - - 0 1",
+        )
