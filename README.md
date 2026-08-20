@@ -437,6 +437,30 @@ path subsamples before building rows, skipping the FEN re-derivation for
 discarded plies, and a random offset avoids the side-to-move bias a fixed offset
 would introduce.
 
+## Forced playouts and policy target pruning
+
+Root Dirichlet noise makes a self-play game explore, but the policy target is the
+root visit distribution, so every visit spent on a noise move teaches the policy
+to predict that move. `--forced-playout-k` implements KataGo's fix in two halves.
+
+During search, each root child that has any playouts is guaranteed a minimum:
+
+```text
+n_forced(c) = sqrt(k * P(c) * sum_c' N(c'))
+```
+
+The one-half exponent lets the floor grow with search while decaying to a
+vanishing share of it, so a good noise move is explored enough to be discovered
+and a bad one never dominates. `k = 2` is the paper's value and the default.
+
+When the move is recorded, each non-best child gives those playouts back, subject
+to keeping its PUCT below the most-visited child's, and a child left with a single
+playout is dropped entirely. Move selection still uses the raw visits; only the
+stored target is pruned. On the standard position at 200 simulations this drops 6
+of 20 moves from the target and lifts the best move's share from 0.231 to 0.284.
+
+Set `--forced-playout-k 0` to disable both halves.
+
 ## Value targets
 
 Self-play value targets blend the terminal outcome with the search-averaged root

@@ -27,6 +27,9 @@ pub struct SearchConfig {
     pub opening_temperature: f64,
     pub temperature_cutoff_ply: u32,
     pub max_plies: u32,
+    /// KataGo's forced-playout constant. Zero disables forced playouts and the
+    /// matching policy target pruning.
+    pub forced_playout_k: f64,
 }
 
 impl Default for SearchConfig {
@@ -40,6 +43,7 @@ impl Default for SearchConfig {
             opening_temperature: 1.0,
             temperature_cutoff_ply: 30,
             max_plies: 512,
+            forced_playout_k: 0.0,
         }
     }
 }
@@ -57,6 +61,9 @@ impl SearchConfig {
         }
         if !self.dirichlet_fraction.is_finite() || !(0.0..=1.0).contains(&self.dirichlet_fraction) {
             return Err("dirichlet_fraction must be finite and in [0, 1]".into());
+        }
+        if !self.forced_playout_k.is_finite() || self.forced_playout_k < 0.0 {
+            return Err("forced_playout_k must be finite and non-negative".into());
         }
         if !self.root_policy_temperature.is_finite() || self.root_policy_temperature <= 0.0 {
             return Err("root_policy_temperature must be finite and positive".into());
@@ -184,7 +191,11 @@ impl SelfPlayGame {
 
             let leaf = self
                 .tree
-                .select_leaf(&self.position, self.config.exploration_constant);
+                .select_leaf(
+                    &self.position,
+                    self.config.exploration_constant,
+                    self.config.forced_playout_k,
+                );
             if let Some(value) = leaf.terminal_value {
                 self.tree.backup(&leaf.path, value);
                 self.simulations_done += 1;
@@ -259,7 +270,10 @@ impl SelfPlayGame {
 
     /// Record the completed search as a training row and play the chosen move.
     fn finish_move(&mut self) -> Result<(), String> {
-        let policy = self.tree.root_visit_distribution();
+        let policy = self.tree.pruned_root_visit_distribution(
+            self.config.exploration_constant,
+            self.config.forced_playout_k,
+        );
         if policy.is_empty() {
             return Err("cannot finish a move from an unexpanded root".into());
         }

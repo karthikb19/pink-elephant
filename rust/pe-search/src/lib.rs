@@ -169,6 +169,7 @@ impl PySelfPlayEngine {
         temperature_cutoff_ply = 30,
         max_plies = 512,
         start_fens = Vec::new(),
+        forced_playout_k = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -185,6 +186,7 @@ impl PySelfPlayEngine {
         temperature_cutoff_ply: u32,
         max_plies: u32,
         start_fens: Vec<String>,
+        forced_playout_k: f64,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -201,6 +203,7 @@ impl PySelfPlayEngine {
                 opening_temperature,
                 temperature_cutoff_ply,
                 max_plies,
+                forced_playout_k,
             },
         };
         SelfPlayEngine::new(config)
@@ -321,14 +324,20 @@ pub struct PyRootSearch {
     simulations: u32,
     completed: u32,
     exploration_constant: f64,
+    forced_playout_k: f64,
     pending: Option<(Vec<u32>, Vec<(u32, Move)>)>,
 }
 
 #[pymethods]
 impl PyRootSearch {
     #[new]
-    #[pyo3(signature = (fen, *, simulations = 32, exploration_constant = 1.1))]
-    fn new(fen: &str, simulations: u32, exploration_constant: f64) -> PyResult<Self> {
+    #[pyo3(signature = (fen, *, simulations = 32, exploration_constant = 1.1, forced_playout_k = 0.0))]
+    fn new(
+        fen: &str,
+        simulations: u32,
+        exploration_constant: f64,
+        forced_playout_k: f64,
+    ) -> PyResult<Self> {
         if simulations < 1 {
             return Err(value_error("simulations must be positive".into()));
         }
@@ -338,6 +347,7 @@ impl PyRootSearch {
             simulations,
             completed: 0,
             exploration_constant,
+            forced_playout_k,
             pending: None,
         })
     }
@@ -357,6 +367,7 @@ impl PyRootSearch {
             return Err(value_error("buffer_ptr must not be null".into()));
         }
         let exploration_constant = self.exploration_constant;
+        let forced_playout_k = self.forced_playout_k;
         let position = &self.position;
         let tree = &mut self.tree;
         let simulations = self.simulations;
@@ -365,7 +376,7 @@ impl PyRootSearch {
 
         py.detach(move || -> Result<bool, String> {
             while *completed < simulations {
-                let leaf = tree.select_leaf(position, exploration_constant);
+                let leaf = tree.select_leaf(position, exploration_constant, forced_playout_k);
                 if let Some(value) = leaf.terminal_value {
                     tree.backup(&leaf.path, value);
                     *completed += 1;
@@ -430,6 +441,12 @@ impl PyRootSearch {
     }
 
     /// Normalized root visit counts: the training policy target.
+    /// The policy target after forced-playout pruning, as generation records it.
+    fn pruned_root_visit_distribution(&self) -> Vec<(u32, f64)> {
+        self.tree
+            .pruned_root_visit_distribution(self.exploration_constant, self.forced_playout_k)
+    }
+
     fn root_visit_distribution(&self) -> Vec<(u32, f64)> {
         self.tree.root_visit_distribution()
     }

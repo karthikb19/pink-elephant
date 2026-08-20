@@ -47,6 +47,8 @@ GENERATION_1_SHARD_POSITION_LIMIT: Final[int] = 8_192
 # target already gives each position its own signal, so dropping three of every
 # four rows costs four times the search for a redundancy that is no longer there.
 GENERATION_1_REPLAY_STRIDE: Final[int] = 1
+# KataGo's k = 2: large enough to force a small share of playouts in practice.
+GENERATION_1_FORCED_PLAYOUT_K: Final[float] = 2.0
 _SHA256_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -70,6 +72,7 @@ class GenerationSpec:
     base_seed: int
     start_pool: StartPositionPool | None = None
     replay_stride: int = 1
+    forced_playout_k: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.generation_id or not self.checkpoint_volume_path:
@@ -92,6 +95,8 @@ class GenerationSpec:
             raise ValueError("temperature_cutoff_ply must be non-negative")
         if self.replay_stride < 1:
             raise ValueError("replay_stride must be positive")
+        if not math.isfinite(self.forced_playout_k) or self.forced_playout_k < 0:
+            raise ValueError("forced_playout_k must be finite and non-negative")
         if self.base_seed < 0 or self.base_seed >= 2**64:
             raise ValueError("base_seed must be an unsigned 64-bit integer")
         if not self.encoder_version or not self.action_schema_version:
@@ -113,6 +118,7 @@ class GenerationSpec:
             "temperature_cutoff_ply": self.temperature_cutoff_ply,
             "base_seed": self.base_seed,
             "replay_stride": self.replay_stride,
+            "forced_playout_k": self.forced_playout_k,
             "start_pool_sha256": self.start_pool_sha256,
         }
         return _sha256_json(payload)
@@ -145,6 +151,7 @@ class GenerationSpec:
             "temperature_cutoff_ply": self.temperature_cutoff_ply,
             "base_seed": self.base_seed,
             "replay_stride": self.replay_stride,
+            "forced_playout_k": self.forced_playout_k,
             "start_pool": None if self.start_pool is None else self.start_pool.to_payload(),
             "search_config_sha256": self.search_config_sha256,
         }
@@ -279,6 +286,7 @@ def generation_1_spec(*, base_seed: int = 0) -> GenerationSpec:
         root_policy_temperature=GENERATION_1_ROOT_POLICY_TEMPERATURE,
         opening_temperature=GENERATION_1_OPENING_TEMPERATURE,
         temperature_cutoff_ply=GENERATION_1_TEMPERATURE_CUTOFF_PLY,
+        forced_playout_k=GENERATION_1_FORCED_PLAYOUT_K,
         base_seed=base_seed,
     )
 

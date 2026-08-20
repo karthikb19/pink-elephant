@@ -18,7 +18,7 @@ from pink_elephant.mcts import (
     MCTSNode,
     MCTSRootSummary,
     apply_root_policy_temperature,
-    root_visit_distribution,
+    pruned_root_visit_distribution,
     run_mcts_batch,
     summarize_root,
 )
@@ -275,6 +275,7 @@ def run_self_play_game(
     mcts_config = MCTSConfig(
         num_simulations=generation.simulations_per_move,
         exploration_constant=generation.exploration_constant,
+        forced_playout_k=generation.forced_playout_k,
     )
 
     while not current_board.is_game_over(claim_draw=True):
@@ -295,7 +296,13 @@ def run_self_play_game(
         root_value = root.mean_value
         policy = tuple(
             SparsePolicyEntry(action_index=action_index, probability=probability)
-            for action_index, probability in sorted(root_visit_distribution(root).items())
+            for action_index, probability in sorted(
+                pruned_root_visit_distribution(
+                    root,
+                    exploration_constant=generation.exploration_constant,
+                    forced_playout_k=generation.forced_playout_k,
+                ).items()
+            )
         )
         temperature = (
             generation.opening_temperature

@@ -106,7 +106,12 @@ impl Tree {
     }
 
     /// Descend from the root to a leaf, reconstructing the leaf's position.
-    pub fn select_leaf(&mut self, root: &GamePosition, exploration_constant: f64) -> SelectedLeaf {
+    pub fn select_leaf(
+        &mut self,
+        root: &GamePosition,
+        exploration_constant: f64,
+        forced_playout_k: f64,
+    ) -> SelectedLeaf {
         let mut path = vec![0u32];
         let mut position = root.clone();
         let mut current = 0u32;
@@ -120,7 +125,14 @@ impl Tree {
                     terminal_value: terminal,
                 };
             }
-            let child = self.select_child(current, exploration_constant);
+            // Forced playouts are a root-only device: deeper nodes carry no
+            // Dirichlet noise and need no visit floor.
+            let child = match current {
+                0 => self
+                    .forced_playout_child(forced_playout_k)
+                    .unwrap_or_else(|| self.select_child(current, exploration_constant)),
+                _ => self.select_child(current, exploration_constant),
+            };
             let chess_move = self.nodes[child as usize]
                 .chess_move
                 .clone()
@@ -148,6 +160,146 @@ impl Tree {
                 value
             }
         }
+    }
+
+    /// KataGo's minimum root playouts for one child: `sqrt(k P(c) sum N(c'))`.
+    ///
+    /// The one-half exponent lets forced playouts grow with search while decaying
+    /// to a vanishing share of it, so a noise move is explored enough to be
+    /// discovered without ever dominating the budget.
+    pub fn forced_playout_count(prior: f64, root_child_visits: u32, k: f64) -> u32 {
+        if k <= 0.0 || root_child_visits == 0 || prior <= 0.0 {
+            return 0;
+        }
+        (k * prior * root_child_visits as f64).sqrt() as u32
+    }
+
+    /// A visited root child still short of its forced playouts, in action order.
+    ///
+    /// Unvisited children already carry the largest exploration bonus, so only
+    /// children with at least one playout are forced.
+    fn forced_playout_child(&self, forced_playout_k: f64) -> Option<u32> {
+        if forced_playout_k <= 0.0 {
+            return None;
+        }
+        let children = &self.nodes[0].children;
+        let total_visits: u32 = children
+            .iter()
+            .map(|&index| self.nodes[index as usize].visits)
+            .sum();
+        if total_visits == 0 {
+            return None;
+        }
+        let mut best: Option<(u32, u32)> = None;
+        for &index in children {
+            let node = &self.nodes[index as usize];
+            if node.visits == 0 {
+                continue;
+            }
+            let required = Self::forced_playout_count(node.prior, total_visits, forced_playout_k);
+            if node.visits < required {
+                let candidate = (node.action_index, index);
+                if best.is_none_or(|(action, _)| candidate.0 < action) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        best.map(|(_, index)| index)
+    }
+
+    /// Root visit counts with forced playouts subtracted, following KataGo.
+    ///
+    /// Forced playouts improve exploration but would otherwise teach the policy
+    /// to predict visits normal PUCT never would have spent. Each non-best child
+    /// gives back up to its forced playouts, stopping before its PUCT would reach
+    /// the most-visited child's, and a child left with one playout is dropped.
+    /// Utility estimates are held constant, so only the visit term moves.
+    pub fn pruned_root_visit_counts(
+        &self,
+        exploration_constant: f64,
+        forced_playout_k: f64,
+    ) -> Vec<(u32, u32)> {
+        let children = &self.nodes[0].children;
+        let raw: Vec<(u32, u32)> = children
+            .iter()
+            .map(|&index| {
+                let node = &self.nodes[index as usize];
+                (node.action_index, node.visits)
+            })
+            .collect();
+        if forced_playout_k <= 0.0 || raw.is_empty() {
+            return raw;
+        }
+        let total_visits: u32 = raw.iter().map(|&(_, visits)| visits).sum();
+        if total_visits == 0 {
+            return raw;
+        }
+
+        let best_index = *children
+            .iter()
+            .max_by(|&&a, &&b| {
+                let (left, right) = (&self.nodes[a as usize], &self.nodes[b as usize]);
+                left.visits
+                    .cmp(&right.visits)
+                    .then(right.action_index.cmp(&left.action_index))
+            })
+            .expect("root children are non-empty");
+        let best_node = &self.nodes[best_index as usize];
+        let sqrt_parent_visits = (self.nodes[0].visits as f64).sqrt();
+        let best_score = -best_node.mean_value()
+            + exploration_constant * best_node.prior * sqrt_parent_visits
+                / (1.0 + best_node.visits as f64);
+
+        let mut pruned = Vec::with_capacity(raw.len());
+        for &index in children {
+            let node = &self.nodes[index as usize];
+            if index == best_index || node.visits == 0 {
+                pruned.push((node.action_index, node.visits));
+                continue;
+            }
+            let headroom = best_score + node.mean_value();
+            if headroom <= 0.0 {
+                pruned.push((node.action_index, node.visits));
+                continue;
+            }
+            let bonus_numerator = exploration_constant * node.prior * sqrt_parent_visits;
+            // Smallest visit count whose exploration bonus stays under the best
+            // child's score; below it, normal PUCT would have selected it again.
+            let minimum_visits = (bonus_numerator / headroom - 1.0).floor() + 1.0;
+            let minimum_visits = if minimum_visits.is_finite() && minimum_visits > 0.0 {
+                minimum_visits as u32
+            } else {
+                0
+            };
+            let forced = Self::forced_playout_count(node.prior, total_visits, forced_playout_k);
+            let allowed = node.visits.saturating_sub(forced);
+            let reduced = minimum_visits.max(allowed).min(node.visits);
+            pruned.push((node.action_index, if reduced <= 1 { 0 } else { reduced }));
+        }
+        if pruned.iter().map(|&(_, visits)| visits).sum::<u32>() == 0 {
+            return raw;
+        }
+        pruned
+    }
+
+    /// The normalized policy target, after forced-playout pruning.
+    pub fn pruned_root_visit_distribution(
+        &self,
+        exploration_constant: f64,
+        forced_playout_k: f64,
+    ) -> Vec<(u32, f64)> {
+        if forced_playout_k <= 0.0 {
+            return self.root_visit_distribution();
+        }
+        let counts = self.pruned_root_visit_counts(exploration_constant, forced_playout_k);
+        let total: u32 = counts.iter().map(|&(_, visits)| visits).sum();
+        if total == 0 {
+            return self.root_visit_distribution();
+        }
+        counts
+            .into_iter()
+            .map(|(action_index, visits)| (action_index, visits as f64 / total as f64))
+            .collect()
     }
 
     /// Return the highest-PUCT child, breaking exact ties by lowest action index.
