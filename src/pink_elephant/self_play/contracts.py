@@ -149,8 +149,12 @@ class GameRecord:
             raise ValueError("seed must be an unsigned 64-bit integer")
         if self.result not in {"1-0", "0-1", "1/2-1/2"}:
             raise ValueError("completed game result must be 1-0, 0-1, or 1/2-1/2")
-        if self.ply_count != len(self.moves_uci) or self.replay_position_count != self.ply_count:
+        if self.ply_count != len(self.moves_uci):
             raise ValueError("game counts must match the recorded move sequence")
+        # Stride subsampling admits a subset of a game's plies, so replay rows may
+        # be fewer than moves; the game itself is still reconstructed from all of them.
+        if not 1 <= self.replay_position_count <= self.ply_count:
+            raise ValueError("replay position count must be between one and the ply count")
         if self.ply_count < 1:
             raise ValueError("a completed replay game must contain at least one move")
         board = _board_from_fen(self.initial_fen)

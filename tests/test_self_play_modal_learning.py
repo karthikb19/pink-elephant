@@ -26,7 +26,8 @@ def test_self_play_modal_config_uses_conservative_defaults() -> None:
 
     assert config.learning_rate == pytest.approx(1e-4)
     assert config.replay_capacity == 1_000_000
-    assert config.value_weight == pytest.approx(1.0)
+    assert config.value_weight == pytest.approx(0.25)
+    assert config.value_target_q_ratio == pytest.approx(0.5)
     assert config.grad_clip_norm == pytest.approx(1.0)
     assert config.prefetch_batches == 4
     assert config.progress_interval_batches == 25

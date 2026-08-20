@@ -407,6 +407,48 @@ and legal actions from the stored FEN using the Python implementation. A
 non-zero `failed_game_count` therefore signals a genuine disagreement between the
 two encoders, not merely a schema problem.
 
+## Self-play start positions and stride subsampling
+
+Games no longer all begin from the standard start. `StartPositionMix` weights a
+pool across the standard start, the human opening book, and archived
+engine-evaluated positions banded by evaluation magnitude, so the value head
+keeps seeing decisive positions instead of only balanced ones:
+
+```sh
+uv run scripts/build_start_archive.py \
+  --source data/lichess-eval-1m.jsonl \
+  --output data/openings/start-archive-v1.jsonl \
+  --per-band 4000 --seed 20260819
+```
+
+The weighted mix is expanded once into a fixed pool of FENs whose digest enters
+`search_config_sha256`, so two rounds that claim the same generation identity
+really did draw from the same positions. Archive FENs often omit the move
+counters, so a game started from one begins at ply zero and the temperature
+cutoff is measured from the generated game, not the original.
+
+`--replay-stride` keeps one position per stride window with a per-game random
+offset. Every position in a game shares one outcome, so consecutive rows are
+near-duplicates of a single label; a random offset avoids the side-to-move bias
+a fixed offset would introduce. The native path subsamples before building rows,
+skipping the FEN re-derivation for discarded plies.
+
+## Value targets
+
+Self-play value targets blend the terminal outcome with the search-averaged root
+value, following Leela's `q_ratio`:
+
+```text
+target = q_ratio * root_value + (1 - q_ratio) * outcome
+```
+
+The outcome is constant across a game and carries about one bit however many
+positions it labels; the root value varies per position. The default of 0.5
+suits 200-simulation searches, and a shallower search makes the root value a
+weaker teacher and wants a lower ratio. Track the effect with
+`scripts/value_anchor.py evaluate`, which scores a checkpoint against a frozen
+held-out set of engine evaluations.
+
 ## Self-play replay fine-tuning
 
 Fine-tune the parent checkpoint from the consolidated replay dataset on Modal:

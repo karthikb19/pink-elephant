@@ -45,12 +45,13 @@ from pink_elephant.self_play.generation.admission import (
     AdmissionTimings,
     ReplayAdmissionWriter,
 )
-from pink_elephant.self_play.generation.config import WorkerSpec
+from pink_elephant.self_play.generation.config import GenerationSpec, WorkerSpec
 from pink_elephant.self_play.generation.game import (
     PendingPosition,
     complete_game,
     make_root_dirichlet_modifier,
     select_action_from_summary,
+    subsample_replay_rows,
 )
 from pink_elephant.self_play.generation.native_host import (
     PENDING_BATCHES,
@@ -319,7 +320,7 @@ def run_worker(
             if seed > worker.seed_end:
                 raise RuntimeError("worker seed range is smaller than its retry budget")
             attempts += 1
-            board = chess.Board()
+            board = _start_board(worker.generation, seed)
             active.append(
                 _ActiveGame(
                     game_id=(
@@ -485,9 +486,12 @@ def run_worker(
                     },
                 )
                 continue
-            shard_builder.add_game(completed.rows)
+            rows = subsample_replay_rows(
+                completed.rows, stride=worker.generation.replay_stride, seed=game.seed
+            )
+            shard_builder.add_game(rows)
             completed_games.append(completed.record)
-            completed_position_count += len(completed.rows)
+            completed_position_count += len(rows)
             termination_counts[completed.record.termination] += 1
             log_event(
                 logger,
@@ -806,6 +810,7 @@ def run_native_worker(
         opening_temperature=worker.generation.opening_temperature,
         temperature_cutoff_ply=worker.generation.temperature_cutoff_ply,
         max_plies=worker.max_plies_per_game,
+        start_fens=list(worker.generation.start_fens()),
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(
@@ -837,6 +842,7 @@ def run_native_worker(
         round_id=worker.round.round_id,
         worker_id=worker.worker_id,
         position_lower_bound=worker.position_lower_bound,
+        replay_stride=worker.generation.replay_stride,
     )
 
     def report(stats: HostStats, recorded: int) -> None:
@@ -957,3 +963,12 @@ def _native_completion_log_fields(
             result.elapsed_seconds - accounted
         ) / result.elapsed_seconds
     return fields
+
+
+def _start_board(generation: GenerationSpec, seed: int) -> chess.Board:
+    """Draw this game's start position from the generation's resolved pool."""
+
+    pool = generation.start_pool
+    if pool is None:
+        return chess.Board()
+    return pool.board(Random(seed).randrange(len(pool.fens)))

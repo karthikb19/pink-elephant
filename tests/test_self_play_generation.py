@@ -43,6 +43,7 @@ from pink_elephant.self_play.generation.game import (
     PendingPosition,
     complete_game,
     run_self_play_game,
+    subsample_replay_rows,
 )
 from pink_elephant.self_play.generation.manifests import (
     latest_snapshot,
@@ -66,6 +67,10 @@ from pink_elephant.self_play.generation.shards import (
     validate_replay_shard,
     write_games_table,
     write_replay_shard,
+)
+from pink_elephant.self_play.generation.start_positions import (
+    StartPositionMix,
+    build_start_position_pool,
 )
 from pink_elephant.self_play.generation.worker import (
     ModelBatchEvaluator,
@@ -965,3 +970,57 @@ def test_replay_shards_round_trip_the_root_value(tmp_path: Path) -> None:
     assert len(restored) == 1
     assert restored[0].root_value == pytest.approx(-0.375)
     assert restored[0].outcome == searched.outcome
+
+
+def test_subsampling_keeps_one_position_per_stride_window() -> None:
+    rows = tuple(replace(_valid_replay_row(), ply_index=index) for index in range(40))
+
+    kept = subsample_replay_rows(rows, stride=4, seed=11)
+
+    assert len(kept) == 10
+    positions = [row.ply_index for row in kept]
+    gaps = zip(positions[:-1], positions[1:], strict=True)
+    assert all(later - earlier == 4 for earlier, later in gaps)
+
+
+def test_subsampling_offsets_differ_across_games_so_no_colour_is_favoured() -> None:
+    rows = tuple(replace(_valid_replay_row(), ply_index=index) for index in range(40))
+
+    offsets = {subsample_replay_rows(rows, stride=4, seed=seed)[0].ply_index for seed in range(40)}
+
+    assert offsets == {0, 1, 2, 3}
+
+
+def test_subsampling_keeps_a_game_shorter_than_one_stride_window() -> None:
+    rows = (_valid_replay_row(),)
+
+    assert len(subsample_replay_rows(rows, stride=8, seed=3)) == 1
+
+
+def test_a_unit_stride_keeps_every_position() -> None:
+    rows = tuple(replace(_valid_replay_row(), ply_index=index) for index in range(7))
+
+    assert subsample_replay_rows(rows, stride=1, seed=0) == rows
+
+
+def test_generation_identity_covers_the_start_pool_and_stride() -> None:
+    base = generation_1_spec()
+    strided = replace(base, replay_stride=4)
+    pooled = replace(
+        base,
+        start_pool=build_start_position_pool(
+            mix=StartPositionMix(
+                startpos=1.0,
+                opening_book=0.0,
+                archive_balanced=0.0,
+                archive_moderate=0.0,
+                archive_decisive=0.0,
+            ),
+            size=8,
+        ),
+    )
+
+    assert base.search_config_sha256 != strided.search_config_sha256
+    assert base.search_config_sha256 != pooled.search_config_sha256
+    assert base.start_pool_sha256 == "startpos"
+    assert base.start_fens() == ()

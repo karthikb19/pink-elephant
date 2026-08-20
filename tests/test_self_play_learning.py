@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import chess
+import pytest
 
 from pink_elephant.action_mapping import ACTION_SCHEMA_VERSION, legal_policy_indices
 from pink_elephant.dataset import PrefetchIterator
@@ -213,3 +214,88 @@ def test_replay_buffer_prefetches_into_a_bounded_background_queue(tmp_path: Path
         assert batches.buffered_batches <= 2
     finally:
         batches.close()
+
+
+def _blend_dataset(directory: Path, *, outcome: int, root_value: float) -> None:
+    board = chess.Board()
+    actions = tuple(sorted(legal_policy_indices(board)))
+    policy = tuple(SparsePolicyEntry(action, 1 / len(actions)) for action in actions)
+    rows = tuple(
+        ReplayRow(
+            board=encode_board(board),
+            fen=board.fen(),
+            policy=policy,
+            selected_action_index=actions[0],
+            outcome=outcome,
+            root_value=root_value,
+            game_id=f"game-{index}",
+            ply_index=0,
+        )
+        for index in range(8)
+    )
+    relative_path = Path("sources") / "official" / "round-000001.parquet"
+    reference = write_replay_shard(directory / relative_path, rows)
+    manifest = {
+        "schema_version": SELF_PLAY_DATASET_VERSION,
+        "sources": [
+            {
+                "label": "official",
+                "generation_id": "generation-official",
+                "selection": "all-replay-shards-under-rounds",
+                "generation": {
+                    "checkpoint_volume_path": "runs/source/checkpoint.pt",
+                    "checkpoint_sha256": "b" * 64,
+                    "encoder_version": ENCODER_VERSION,
+                    "action_schema_version": ACTION_SCHEMA_VERSION,
+                    "model_spec": chess_resnet_spec(ResNetConfig()).to_payload(),
+                },
+            }
+        ],
+        "shards": [
+            {
+                "source_label": "official",
+                "destination_path": relative_path.as_posix(),
+                "original_path": relative_path.as_posix(),
+                "position_count": reference.position_count,
+                "game_count": reference.game_count,
+                "round_id": "round-000001",
+                "worker_id": "worker-0000",
+                "invocation_id": "invocation-0001",
+                "sha256": reference.sha256,
+                "size_bytes": reference.size_bytes,
+            }
+        ],
+        "total_position_count": reference.position_count,
+        "total_game_count": reference.game_count,
+    }
+    (directory / "dataset-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("q_ratio", "expected"),
+    [(0.0, 1.0), (0.5, 0.6), (1.0, 0.2)],
+)
+def test_value_targets_blend_the_outcome_with_the_search_value(
+    tmp_path: Path, q_ratio: float, expected: float
+) -> None:
+    _blend_dataset(tmp_path, outcome=1, root_value=0.2)
+
+    replay = ReplayBuffer(
+        tmp_path,
+        capacity=8,
+        validation_fraction=0.5,
+        seed=3,
+        value_target_q_ratio=q_ratio,
+    )
+    batches = tuple(replay.iter_batches(split="train", batch_size=4, shuffle=False))
+
+    assert batches
+    for batch in batches:
+        assert batch.outcomes.tolist() == pytest.approx([expected] * len(batch.outcomes))
+
+
+def test_replay_buffer_rejects_a_q_ratio_outside_the_unit_interval(tmp_path: Path) -> None:
+    _blend_dataset(tmp_path, outcome=1, root_value=0.2)
+
+    with pytest.raises(ValueError, match="value_target_q_ratio"):
+        ReplayBuffer(tmp_path, capacity=8, validation_fraction=0.5, value_target_q_ratio=1.5)

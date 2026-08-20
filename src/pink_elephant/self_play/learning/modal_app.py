@@ -34,6 +34,7 @@ from pink_elephant.self_play.learning.replay import (
     DEFAULT_REPLAY_CAPACITY,
     DEFAULT_SHUFFLE_BUFFER_SIZE,
     DEFAULT_VALIDATION_FRACTION,
+    DEFAULT_VALUE_TARGET_Q_RATIO,
     ReplayBuffer,
 )
 from pink_elephant.training import (
@@ -57,7 +58,9 @@ DEFAULT_EPOCHS: Final[int] = 5
 DEFAULT_LEARNING_RATE: Final[float] = 1e-4
 DEFAULT_WEIGHT_DECAY: Final[float] = 1e-4
 DEFAULT_GRAD_CLIP_NORM: Final[float] = 1.0
-DEFAULT_VALUE_WEIGHT: Final[float] = 1.0
+# A weight of 1.0 on hard {-1, 0, 1} outcome targets saturated the value head
+# past the engine-eval anchor's spread; 0.25 with the blended target replaces it.
+DEFAULT_VALUE_WEIGHT: Final[float] = 0.25
 DEFAULT_POLICY_HEAD_ONLY: Final[bool] = False
 DEFAULT_CHECKPOINT_INTERVAL: Final[int] = 1
 DEFAULT_PREFETCH_BATCHES: Final[int] = 4
@@ -90,6 +93,7 @@ class SelfPlayTrainingConfig:
     weight_decay: float = DEFAULT_WEIGHT_DECAY
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM
     value_weight: float = DEFAULT_VALUE_WEIGHT
+    value_target_q_ratio: float = DEFAULT_VALUE_TARGET_Q_RATIO
     policy_head_only: bool = DEFAULT_POLICY_HEAD_ONLY
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES
@@ -124,6 +128,7 @@ class SelfPlayTrainingConfig:
             ("weight_decay", self.weight_decay),
             ("grad_clip_norm", self.grad_clip_norm),
             ("value_weight", self.value_weight),
+            ("value_target_q_ratio", self.value_target_q_ratio),
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -231,6 +236,7 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
         capacity=config.replay_capacity,
         validation_fraction=config.validation_fraction,
         seed=config.seed,
+        value_target_q_ratio=config.value_target_q_ratio,
         verify_hashes=config.verify_hashes,
     )
     model_spec = replay.manifest.sources[0].model_spec
@@ -427,6 +433,7 @@ def main(
     validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
     learning_rate: float = DEFAULT_LEARNING_RATE,
     value_weight: float = DEFAULT_VALUE_WEIGHT,
+    value_target_q_ratio: float = DEFAULT_VALUE_TARGET_Q_RATIO,
     policy_head_only: bool = DEFAULT_POLICY_HEAD_ONLY,
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES,
@@ -447,6 +454,7 @@ def main(
         validation_fraction=validation_fraction,
         learning_rate=learning_rate,
         value_weight=value_weight,
+        value_target_q_ratio=value_target_q_ratio,
         policy_head_only=policy_head_only,
         checkpoint_interval=checkpoint_interval,
         prefetch_batches=prefetch_batches,
@@ -525,6 +533,7 @@ def _run_parameters(
                 "training_objective": _training_objective(config),
                 "validation_fraction": config.validation_fraction,
                 "value_weight": config.value_weight,
+                "value_target_q_ratio": config.value_target_q_ratio,
                 "weight_decay": config.weight_decay,
             }.items()
         )

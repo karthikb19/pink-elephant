@@ -37,6 +37,10 @@ DATASET_MANIFEST_FILENAME = "dataset-manifest.json"
 SELF_PLAY_DATASET_VERSION = "pink-elephant/self-play-dataset/v1"
 DEFAULT_REPLAY_CAPACITY = 1_000_000
 DEFAULT_VALIDATION_FRACTION = 0.05
+# Leela's q_ratio: target = q_ratio * root_value + (1 - q_ratio) * outcome. Half
+# is their recommended blend and suits the 200-simulation searches this trains on;
+# a shallower search makes root_value a weaker teacher and wants a lower ratio.
+DEFAULT_VALUE_TARGET_Q_RATIO = 0.5
 DEFAULT_READER_BATCH_SIZE = 32_768
 DEFAULT_SHUFFLE_BUFFER_SIZE = 32_768
 ReplaySplit = Literal["train", "validation"]
@@ -152,6 +156,7 @@ class _ReplayRowBatch:
     policy_probabilities: NDArray[np.float32]
     selected_actions: NDArray[np.int64]
     outcomes: NDArray[np.float32]
+    root_values: NDArray[np.float32]
     game_ids: tuple[str, ...]
     source_label: str
 
@@ -176,10 +181,13 @@ class ReplayBuffer:
         capacity: int = DEFAULT_REPLAY_CAPACITY,
         validation_fraction: float = DEFAULT_VALIDATION_FRACTION,
         seed: int = 0,
+        value_target_q_ratio: float = DEFAULT_VALUE_TARGET_Q_RATIO,
         verify_hashes: bool = True,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
+        if not math.isfinite(value_target_q_ratio) or not 0 <= value_target_q_ratio <= 1:
+            raise ValueError("value_target_q_ratio must be finite and in [0, 1]")
         if not math.isfinite(validation_fraction) or not 0 < validation_fraction < 1:
             raise ValueError("validation_fraction must be finite and in (0, 1)")
         if seed < 0:
@@ -188,6 +196,7 @@ class ReplayBuffer:
         self.capacity = capacity
         self.validation_fraction = validation_fraction
         self.seed = seed
+        self.value_target_q_ratio = value_target_q_ratio
         self.manifest_path = dataset_dir / DATASET_MANIFEST_FILENAME
         self.manifest = load_replay_dataset_manifest(self.manifest_path)
         self.selected_shards = select_recent_replay_shards(self.manifest.shards, capacity=capacity)
@@ -248,7 +257,9 @@ class ReplayBuffer:
                 seed=self.seed + epoch,
                 buffer_size=shuffle_buffer_size,
             )
-        batches: Iterable[TrainingBatch] = _batch_rows(rows, batch_size=batch_size)
+        batches: Iterable[TrainingBatch] = _batch_rows(
+            rows, batch_size=batch_size, q_ratio=self.value_target_q_ratio
+        )
         if pin_memory:
             batches = _pin_batches(batches)
         if prefetch_batches:
@@ -420,6 +431,7 @@ def _iter_shard_batches(
         "policy",
         "selected_action_index",
         "outcome",
+        "root_value",
         "game_id",
     )
     for batch in parquet.iter_batches(
@@ -438,13 +450,22 @@ def _iter_shard_batches(
         yield _convert_record_batch(batch, source_label=selected.shard.source_label)
 
 
+def _column_index(batch: pa.RecordBatch, name: str) -> int:
+    """Resolve a column, failing loudly instead of returning Arrow's -1 sentinel."""
+
+    index = batch.schema.get_field_index(name)
+    if index < 0:
+        raise ValueError(f"replay shard is missing the {name!r} column")
+    return index
+
+
 def _convert_record_batch(batch: pa.RecordBatch, *, source_label: str) -> _ReplayRowBatch:
-    board_array = cast(pa.FixedSizeListArray, batch.column(batch.schema.get_field_index("board")))
+    board_array = cast(pa.FixedSizeListArray, batch.column(_column_index(batch, "board")))
     board_values = board_array.flatten().to_numpy(zero_copy_only=False)
     boards = np.asarray(board_values, dtype=np.uint8).reshape(
         (batch.num_rows, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE)
     )
-    policy_array = cast(pa.ListArray, batch.column(batch.schema.get_field_index("policy")))
+    policy_array = cast(pa.ListArray, batch.column(_column_index(batch, "policy")))
     policy_offsets = np.asarray(policy_array.offsets.to_numpy(zero_copy_only=False), dtype=np.int64)
     policy_offsets -= policy_offsets[0]
     policy_values = cast(pa.StructArray, policy_array.flatten())
@@ -455,16 +476,18 @@ def _convert_record_batch(batch: pa.RecordBatch, *, source_label: str) -> _Repla
         policy_values.field("probability").to_numpy(zero_copy_only=False), dtype=np.float32
     )
     selected_actions = np.asarray(
-        batch.column(batch.schema.get_field_index("selected_action_index")).to_numpy(
-            zero_copy_only=False
-        ),
+        batch.column(_column_index(batch, "selected_action_index")).to_numpy(zero_copy_only=False),
         dtype=np.int64,
     )
     outcomes = np.asarray(
-        batch.column(batch.schema.get_field_index("outcome")).to_numpy(zero_copy_only=False),
+        batch.column(_column_index(batch, "outcome")).to_numpy(zero_copy_only=False),
         dtype=np.float32,
     )
-    raw_game_ids = batch.column(batch.schema.get_field_index("game_id")).to_pylist()
+    root_values = np.asarray(
+        batch.column(_column_index(batch, "root_value")).to_numpy(zero_copy_only=False),
+        dtype=np.float32,
+    )
+    raw_game_ids = batch.column(_column_index(batch, "game_id")).to_pylist()
     if any(not isinstance(game_id, str) for game_id in raw_game_ids):
         raise ValueError("replay batch contains a non-string game_id")
     game_ids = cast(tuple[str, ...], tuple(raw_game_ids))
@@ -475,6 +498,7 @@ def _convert_record_batch(batch: pa.RecordBatch, *, source_label: str) -> _Repla
         policy_probabilities=probabilities,
         selected_actions=selected_actions,
         outcomes=outcomes,
+        root_values=root_values,
         game_ids=game_ids,
         source_label=source_label,
     )
@@ -489,6 +513,12 @@ def _validate_row_batch(rows: _ReplayRowBatch) -> None:
         raise ValueError("replay board batch has an incompatible shape")
     if bool(((rows.outcomes < -1) | (rows.outcomes > 1)).any()):
         raise ValueError("replay outcomes must be in [-1, 1]")
+    if rows.root_values.shape != (rows.row_count,):
+        raise ValueError("replay batch must carry one root value per row")
+    if not bool(np.isfinite(rows.root_values).all()):
+        raise ValueError("replay root values must be finite")
+    if bool(((rows.root_values < -1) | (rows.root_values > 1)).any()):
+        raise ValueError("replay root values must be in [-1, 1]")
     for row in range(rows.row_count):
         start, end = rows.policy_offsets[row : row + 2]
         actions = rows.policy_actions[start:end]
@@ -507,15 +537,17 @@ def _validate_row_batch(rows: _ReplayRowBatch) -> None:
             raise ValueError("replay policy probabilities must sum to one")
 
 
-def _batch_rows(rows: Iterable[_RowReference], *, batch_size: int) -> Iterator[TrainingBatch]:
+def _batch_rows(
+    rows: Iterable[_RowReference], *, batch_size: int, q_ratio: float
+) -> Iterator[TrainingBatch]:
     batch: list[_RowReference] = []
     for row in rows:
         batch.append(row)
         if len(batch) == batch_size:
-            yield _collate_rows(batch)
+            yield _collate_rows(batch, q_ratio=q_ratio)
             batch = []
     if batch:
-        yield _collate_rows(batch)
+        yield _collate_rows(batch, q_ratio=q_ratio)
 
 
 def _pin_batches(batches: Iterable[TrainingBatch]) -> Iterator[TrainingBatch]:
@@ -523,11 +555,12 @@ def _pin_batches(batches: Iterable[TrainingBatch]) -> Iterator[TrainingBatch]:
         yield batch.pin_memory()
 
 
-def _collate_rows(rows: Sequence[_RowReference]) -> TrainingBatch:
+def _collate_rows(rows: Sequence[_RowReference], *, q_ratio: float) -> TrainingBatch:
     row_count = len(rows)
     boards = np.empty((row_count, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE), dtype=np.uint8)
     selected_actions = np.empty(row_count, dtype=np.int64)
     outcomes = np.empty(row_count, dtype=np.float32)
+    root_values = np.empty(row_count, dtype=np.float32)
     linear_policy_indices: list[NDArray[np.int64]] = []
     policy_probabilities: list[NDArray[np.float32]] = []
 
@@ -546,6 +579,7 @@ def _collate_rows(rows: Sequence[_RowReference]) -> TrainingBatch:
         boards[output_indices] = source.boards[source_indices]
         selected_actions[output_indices] = source.selected_actions[source_indices]
         outcomes[output_indices] = source.outcomes[source_indices]
+        root_values[output_indices] = source.root_values[source_indices]
 
         starts = source.policy_offsets[source_indices]
         lengths = source.policy_offsets[source_indices + 1] - starts
@@ -580,11 +614,14 @@ def _collate_rows(rows: Sequence[_RowReference]) -> TrainingBatch:
     )
     positions = torch.from_numpy(boards).float()
     positions[:, HALFMOVE_PLANE] /= HALFMOVE_SCALE
+    # The terminal outcome is constant across a game; the search value is not, so
+    # blending trades a little bias for a large drop in per-position variance.
+    value_targets = np.asarray(q_ratio * root_values + (1.0 - q_ratio) * outcomes, dtype=np.float32)
     return TrainingBatch(
         positions=positions,
         legal_mask=legal_mask,
         played_actions=torch.from_numpy(selected_actions),
-        outcomes=torch.from_numpy(outcomes),
+        outcomes=torch.from_numpy(value_targets),
         policy_targets=policy_targets,
     )
 

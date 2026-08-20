@@ -168,6 +168,7 @@ impl PySelfPlayEngine {
         opening_temperature = 1.0,
         temperature_cutoff_ply = 30,
         max_plies = 512,
+        start_fens = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -183,12 +184,14 @@ impl PySelfPlayEngine {
         opening_temperature: f64,
         temperature_cutoff_ply: u32,
         max_plies: u32,
+        start_fens: Vec<String>,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
             pending_batches,
             seed,
             game_id_prefix,
+            start_fens,
             search: SearchConfig {
                 simulations,
                 exploration_constant,

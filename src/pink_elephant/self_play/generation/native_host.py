@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from random import Random
 
 import numpy as np
 import pe_search
@@ -194,6 +195,8 @@ class NativeSelfPlayHost:
 
 def adapt_completed_game(
     game: pe_search.CompletedGame,
+    *,
+    replay_stride: int = 1,
 ) -> tuple[tuple[ReplayRow, ...], GameRecord]:
     """Convert one engine game into the existing replay contracts.
 
@@ -209,8 +212,12 @@ def adapt_completed_game(
     action_indices = game.policy_indices
     probabilities = game.policy_probabilities
 
+    # Subsampling before row construction skips the FEN re-derivation for every
+    # discarded ply, which dominates the cost of admitting a game.
+    kept = _kept_ply_indices(game.ply_count, stride=replay_stride, seed=game.seed)
+
     rows: list[ReplayRow] = []
-    for index in range(game.ply_count):
+    for index in kept:
         start, end = offsets[index], offsets[index + 1]
         rows.append(
             ReplayRow(
@@ -241,6 +248,18 @@ def adapt_completed_game(
         result=game.result,
         termination=game.termination,
         ply_count=game.ply_count,
-        replay_position_count=game.ply_count,
+        replay_position_count=len(rows),
     )
     return tuple(rows), record
+
+
+def _kept_ply_indices(ply_count: int, *, stride: int, seed: int) -> tuple[int, ...]:
+    """Return the ply offsets stride subsampling admits from one game."""
+
+    if stride < 1:
+        raise ValueError("replay_stride must be positive")
+    if stride == 1:
+        return tuple(range(ply_count))
+    offset = Random(seed).randrange(stride)
+    kept = tuple(index for index in range(ply_count) if (index - offset) % stride == 0)
+    return kept if kept else (offset % ply_count,)

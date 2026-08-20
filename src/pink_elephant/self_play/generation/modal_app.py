@@ -20,6 +20,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ID,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
+    GENERATION_1_REPLAY_STRIDE,
     GENERATION_1_ROOT_POLICY_TEMPERATURE,
     GENERATION_1_SHARD_POSITION_LIMIT,
     GENERATION_1_SIMULATIONS,
@@ -30,6 +31,7 @@ from pink_elephant.self_play.generation.config import (
     WorkerSpec,
     generation_1_spec,
     plan_worker_specs,
+    resolve_start_pool,
 )
 from pink_elephant.self_play.generation.manifests import (
     ensure_generation_manifest,
@@ -40,6 +42,10 @@ from pink_elephant.self_play.generation.manifests import (
 from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
 from pink_elephant.self_play.generation.shards import sha256_file
+from pink_elephant.self_play.generation.start_positions import (
+    DEFAULT_START_POOL_SIZE,
+    StartPositionMix,
+)
 from pink_elephant.self_play.generation.worker import (
     load_generation_evaluator,
     load_generation_model,
@@ -482,6 +488,15 @@ def main(
     opening_temperature: float = GENERATION_1_OPENING_TEMPERATURE,
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
+    replay_stride: int = GENERATION_1_REPLAY_STRIDE,
+    start_pool_size: int = DEFAULT_START_POOL_SIZE,
+    startpos_weight: float = 0.4,
+    opening_book_weight: float = 0.3,
+    archive_balanced_weight: float = 0.18,
+    archive_moderate_weight: float = 0.075,
+    archive_decisive_weight: float = 0.045,
+    opening_book_path: str = "",
+    start_archive_path: str = "",
     worker_gpu: str = SELF_PLAY_L4_GPU,
     worker_cpu: float | None = None,
     autocast: bool = False,
@@ -490,9 +505,25 @@ def main(
 ) -> None:
     """Launch a round through ``modal run --detach`` for disconnect safety."""
 
+    mix = StartPositionMix(
+        startpos=startpos_weight,
+        opening_book=opening_book_weight,
+        archive_balanced=archive_balanced_weight,
+        archive_moderate=archive_moderate_weight,
+        archive_decisive=archive_decisive_weight,
+    )
+    start_pool = resolve_start_pool(
+        mix=mix,
+        opening_book_path=Path(opening_book_path) if opening_book_path else None,
+        archive_path=Path(start_archive_path) if start_archive_path else None,
+        size=start_pool_size,
+        seed=base_seed,
+    )
     generation = replace(
         generation_1_spec(base_seed=base_seed),
         generation_id=generation_id,
+        start_pool=start_pool,
+        replay_stride=replay_stride,
         simulations_per_move=simulations,
         exploration_constant=exploration_constant,
         dirichlet_alpha=dirichlet_alpha,

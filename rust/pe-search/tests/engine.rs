@@ -32,6 +32,7 @@ fn config(games: usize, pending: usize, simulations: u32) -> EngineConfig {
         pending_batches: pending,
         seed: 20260819,
         game_id_prefix: "test".into(),
+        start_fens: Vec::new(),
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,

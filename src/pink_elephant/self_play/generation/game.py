@@ -140,6 +140,29 @@ def select_action_from_summary(
     return actions[-1].action_index
 
 
+def subsample_replay_rows(
+    rows: Sequence[ReplayRow], *, stride: int, seed: int
+) -> tuple[ReplayRow, ...]:
+    """Keep one position per stride window, offset randomly within each game.
+
+    Every position in a game shares one outcome, so consecutive rows are close to
+    duplicates of a single label. A randomized offset avoids the side-to-move bias
+    a fixed stride would introduce, since a fixed offset keeps only one colour's
+    turn at even strides.
+    """
+
+    if stride < 1:
+        raise ValueError("stride must be positive")
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+    if stride == 1 or not rows:
+        return tuple(rows)
+    offset = Random(seed).randrange(stride)
+    kept = tuple(row for index, row in enumerate(rows) if (index - offset) % stride == 0)
+    # A game shorter than one stride window would otherwise contribute nothing.
+    return kept if kept else (rows[offset % len(rows)],)
+
+
 def complete_game(
     *,
     game_id: str,

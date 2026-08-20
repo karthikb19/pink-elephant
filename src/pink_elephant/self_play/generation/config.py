@@ -7,12 +7,23 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 from pink_elephant.action_mapping import ACTION_SCHEMA_VERSION
 from pink_elephant.encoding import ENCODER_VERSION
 from pink_elephant.model import ResNetConfig
 from pink_elephant.model_adapter import ModelSpec, chess_resnet_spec
+from pink_elephant.opening_book import load_opening_book
+from pink_elephant.self_play.generation.start_positions import (
+    DEFAULT_START_POOL_SIZE,
+    STARTPOS_FEN,
+    ArchivePosition,
+    StartPositionMix,
+    StartPositionPool,
+    build_start_position_pool,
+    load_archive_positions,
+)
 
 GENERATION_1_ID: Final[str] = "generation-000001"
 GENERATION_1_CHECKPOINT_VOLUME_PATH: Final[str] = (
@@ -32,6 +43,7 @@ GENERATION_1_TEMPERATURE_CUTOFF_PLY: Final[int] = 30
 GENERATION_1_WORKER_COUNT: Final[int] = 1
 GENERATION_1_ACTIVE_GAMES_PER_WORKER: Final[int] = 16
 GENERATION_1_SHARD_POSITION_LIMIT: Final[int] = 8_192
+GENERATION_1_REPLAY_STRIDE: Final[int] = 4
 _SHA256_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -53,6 +65,8 @@ class GenerationSpec:
     opening_temperature: float
     temperature_cutoff_ply: int
     base_seed: int
+    start_pool: StartPositionPool | None = None
+    replay_stride: int = 1
 
     def __post_init__(self) -> None:
         if not self.generation_id or not self.checkpoint_volume_path:
@@ -73,6 +87,8 @@ class GenerationSpec:
             raise ValueError("dirichlet_fraction must be finite and in [0, 1]")
         if self.temperature_cutoff_ply < 0:
             raise ValueError("temperature_cutoff_ply must be non-negative")
+        if self.replay_stride < 1:
+            raise ValueError("replay_stride must be positive")
         if self.base_seed < 0 or self.base_seed >= 2**64:
             raise ValueError("base_seed must be an unsigned 64-bit integer")
         if not self.encoder_version or not self.action_schema_version:
@@ -93,8 +109,21 @@ class GenerationSpec:
             "opening_temperature": self.opening_temperature,
             "temperature_cutoff_ply": self.temperature_cutoff_ply,
             "base_seed": self.base_seed,
+            "replay_stride": self.replay_stride,
+            "start_pool_sha256": self.start_pool_sha256,
         }
         return _sha256_json(payload)
+
+    @property
+    def start_pool_sha256(self) -> str:
+        """Hash the resolved start positions, or the startpos-only sentinel."""
+
+        return "startpos" if self.start_pool is None else self.start_pool.sha256
+
+    def start_fens(self) -> tuple[str, ...]:
+        """Return the pool the engines draw start positions from."""
+
+        return () if self.start_pool is None else self.start_pool.fens
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -112,6 +141,8 @@ class GenerationSpec:
             "opening_temperature": self.opening_temperature,
             "temperature_cutoff_ply": self.temperature_cutoff_ply,
             "base_seed": self.base_seed,
+            "replay_stride": self.replay_stride,
+            "start_pool": None if self.start_pool is None else self.start_pool.to_payload(),
             "search_config_sha256": self.search_config_sha256,
         }
 
@@ -186,6 +217,39 @@ class WorkerSpec:
             "max_plies_per_game": self.max_plies_per_game,
             "max_game_attempts": self.max_game_attempts,
         }
+
+
+def resolve_start_pool(
+    *,
+    mix: StartPositionMix,
+    opening_book_path: Path | None = None,
+    archive_path: Path | None = None,
+    size: int = DEFAULT_START_POOL_SIZE,
+    seed: int = 0,
+) -> StartPositionPool | None:
+    """Load the requested books and expand the mix into one hashed start pool."""
+
+    if mix.needs_opening_book and opening_book_path is None:
+        raise ValueError("start position mix requests book positions but no book path was given")
+    if mix.needs_archive and archive_path is None:
+        raise ValueError("start position mix requests archive positions but no path was given")
+    opening_fens: tuple[str, ...] = ()
+    if opening_book_path is not None:
+        opening_fens = tuple(position.fen for position in load_opening_book(opening_book_path))
+    archive_positions: tuple[ArchivePosition, ...] = ()
+    if archive_path is not None:
+        archive_positions = load_archive_positions(archive_path)
+    pool = build_start_position_pool(
+        mix=mix,
+        opening_fens=opening_fens,
+        archive_positions=archive_positions,
+        size=size,
+        seed=seed,
+    )
+    # A pool of nothing but startpos is the engines' default; keep the identity stable.
+    if set(pool.fens) == {STARTPOS_FEN}:
+        return None
+    return pool
 
 
 def generation_1_spec(*, base_seed: int = 0) -> GenerationSpec:
