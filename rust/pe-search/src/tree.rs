@@ -314,6 +314,11 @@ impl Tree {
             .collect()
     }
 
+    /// The root's search-averaged value, from the root side-to-move perspective.
+    pub fn root_mean_value(&self) -> f64 {
+        self.nodes[0].mean_value()
+    }
+
     /// Root `(action index, visit count, prior)` triples in ascending action order.
     pub fn root_statistics(&self) -> Vec<(u32, u32, f64)> {
         self.nodes[0]

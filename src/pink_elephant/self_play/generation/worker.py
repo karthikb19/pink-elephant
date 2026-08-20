@@ -448,6 +448,7 @@ def run_worker(
                     fen=game.board.fen(en_passant="fen"),
                     policy=policy,
                     selected_action_index=selected_action_index,
+                    root_value=summary.root_value,
                     side_to_move=game.board.turn,
                     game_id=game.game_id,
                     ply_index=game.board.ply(),

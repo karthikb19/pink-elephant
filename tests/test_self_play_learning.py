@@ -70,6 +70,7 @@ def test_replay_buffer_collates_soft_policies_and_game_stable_splits(tmp_path: P
                 policy=policy,
                 selected_action_index=actions[0],
                 outcome=1 if index % 2 == 0 else -1,
+                root_value=0.25 if index % 2 == 0 else -0.25,
                 game_id=f"{source}-game-{index}",
                 ply_index=0,
             )
@@ -152,6 +153,7 @@ def test_replay_buffer_prefetches_into_a_bounded_background_queue(tmp_path: Path
             policy=policy,
             selected_action_index=actions[0],
             outcome=0,
+            root_value=0.0,
             game_id=f"game-{index}",
             ply_index=0,
         )

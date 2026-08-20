@@ -190,6 +190,7 @@ def _valid_replay_row() -> ReplayRow:
         ),
         selected_action_index=legal_actions[0],
         outcome=0,
+        root_value=0.0,
         game_id="test-game",
         ply_index=0,
     )
@@ -213,6 +214,7 @@ def _repetition_game_inputs() -> tuple[chess.Board, tuple[PendingPosition, ...]]
                     for action_index in legal_actions
                 ),
                 selected_action_index=move_to_policy_index(board, move),
+                root_value=0.0,
                 side_to_move=board.turn,
                 game_id="repetition-game",
                 ply_index=board.ply(),
@@ -931,3 +933,35 @@ def test_generation_1_checkpoint_digest_matches_the_pinned_volume_artifact() -> 
     assert GENERATION_1_CHECKPOINT_SHA256 == (
         "9e1f7bb15cc042357e1e4a0afea18c89f01e25aada7497be83c91f29f62a0229"
     )
+
+
+def test_replay_row_rejects_a_root_value_outside_the_value_range() -> None:
+    board = chess.Board()
+    legal_actions = tuple(sorted(legal_policy_indices(board)))
+    with pytest.raises(ValueError, match="root_value must be in"):
+        ReplayRow(
+            board=encode_board(board),
+            fen=board.fen(en_passant="fen"),
+            policy=tuple(
+                SparsePolicyEntry(action_index=action_index, probability=1 / len(legal_actions))
+                for action_index in legal_actions
+            ),
+            selected_action_index=legal_actions[0],
+            outcome=0,
+            root_value=1.5,
+            game_id="test-game",
+            ply_index=0,
+        )
+
+
+def test_replay_shards_round_trip_the_root_value(tmp_path: Path) -> None:
+    row = _valid_replay_row()
+    searched = replace(row, root_value=-0.375)
+    path = tmp_path / "replay-00000.parquet"
+
+    write_replay_shard(path, (searched,))
+    restored = list(iter_replay_rows(path))
+
+    assert len(restored) == 1
+    assert restored[0].root_value == pytest.approx(-0.375)
+    assert restored[0].outcome == searched.outcome

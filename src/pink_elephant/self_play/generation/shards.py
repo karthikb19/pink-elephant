@@ -41,6 +41,7 @@ _REPLAY_SCHEMA = pa.schema(
         ),
         pa.field("selected_action_index", pa.uint16(), nullable=False),
         pa.field("outcome", pa.int8(), nullable=False),
+        pa.field("root_value", pa.float32(), nullable=False),
         pa.field("game_id", pa.string(), nullable=False),
         pa.field("ply_index", pa.int32(), nullable=False),
     )
@@ -80,6 +81,7 @@ def write_replay_shard(path: Path, rows: Sequence[ReplayRow]) -> ReplayShardRef:
                 (row.selected_action_index for row in rows), dtype=np.uint16, count=len(rows)
             ),
             np.fromiter((row.outcome for row in rows), dtype=np.int8, count=len(rows)),
+            np.fromiter((row.root_value for row in rows), dtype=np.float32, count=len(rows)),
             pa.array(game_ids, type=pa.string()),
             np.fromiter((row.ply_index for row in rows), dtype=np.int32, count=len(rows)),
         ),
@@ -176,7 +178,16 @@ def iter_replay_rows(path: Path) -> Iterator[ReplayRow]:
     _validate_schema(table.schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
     columns = {name: table[name].to_pylist() for name in _REPLAY_SCHEMA.names}
     for values in zip(*(columns[name] for name in _REPLAY_SCHEMA.names), strict=True):
-        board_values, fen, policy_values, selected_action, outcome, game_id, ply_index = values
+        (
+            board_values,
+            fen,
+            policy_values,
+            selected_action,
+            outcome,
+            root_value,
+            game_id,
+            ply_index,
+        ) = values
         if not isinstance(board_values, list) or len(board_values) != _BOARD_SIZE:
             raise ValueError("replay board column contains an invalid fixed-size value")
         if not isinstance(policy_values, list):
@@ -196,6 +207,7 @@ def iter_replay_rows(path: Path) -> Iterator[ReplayRow]:
             policy=entries,
             selected_action_index=int(selected_action),
             outcome=int(outcome),
+            root_value=float(root_value),
             game_id=_required_string(game_id, "game_id"),
             ply_index=int(ply_index),
         )

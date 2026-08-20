@@ -227,6 +227,7 @@ def adapt_completed_game(
                 # numpy integers fail the contracts' strict `isinstance(int)` checks.
                 selected_action_index=int(game.selected_action_indices[index]),
                 outcome=int(game.outcomes[index]),
+                root_value=float(game.root_values[index]),
                 game_id=game.game_id,
                 ply_index=int(game.ply_indices[index]),
             )

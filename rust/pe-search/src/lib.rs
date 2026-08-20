@@ -56,6 +56,10 @@ pub struct PyCompletedGame {
     selected_action_indices: Vec<u32>,
     #[pyo3(get)]
     outcomes: Vec<i8>,
+    /// Search-averaged root value per position, from that position's own
+    /// side-to-move perspective, matching `outcomes`.
+    #[pyo3(get)]
+    root_values: Vec<f32>,
     /// Sparse visit-count policy in CSR form: `policy_indices[offsets[i]..offsets[i+1]]`
     /// are position `i`'s action indices.
     #[pyo3(get)]
@@ -101,6 +105,7 @@ impl PyCompletedGame {
         let mut fens = Vec::with_capacity(ply_count);
         let mut ply_indices = Vec::with_capacity(ply_count);
         let mut selected_action_indices = Vec::with_capacity(ply_count);
+        let mut root_values = Vec::with_capacity(ply_count);
         let mut policy_indices = Vec::new();
         let mut policy_probabilities = Vec::new();
         let mut policy_offsets = Vec::with_capacity(ply_count + 1);
@@ -111,6 +116,7 @@ impl PyCompletedGame {
             fens.push(recorded.fen);
             ply_indices.push(recorded.ply_index);
             selected_action_indices.push(recorded.selected_action_index);
+            root_values.push(recorded.root_value as f32);
             for (action_index, probability) in recorded.policy {
                 policy_indices.push(action_index);
                 policy_probabilities.push(probability as f32);
@@ -129,6 +135,7 @@ impl PyCompletedGame {
             ply_indices,
             selected_action_indices,
             outcomes: game.outcomes,
+            root_values,
             policy_indices,
             policy_probabilities,
             policy_offsets,

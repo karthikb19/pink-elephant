@@ -38,6 +38,7 @@ class PendingPosition:
     fen: str
     policy: tuple[SparsePolicyEntry, ...]
     selected_action_index: int
+    root_value: float
     side_to_move: chess.Color
     game_id: str
     ply_index: int
@@ -174,6 +175,7 @@ def complete_game(
                 policy=pending.policy,
                 selected_action_index=pending.selected_action_index,
                 outcome=position_outcome,
+                root_value=pending.root_value,
                 game_id=pending.game_id,
                 ply_index=pending.ply_index,
             )
@@ -267,6 +269,7 @@ def run_self_play_game(
             mcts_config,
             root_prior_modifiers=(root_noise,),
         )[0]
+        root_value = root.mean_value
         policy = tuple(
             SparsePolicyEntry(action_index=action_index, probability=probability)
             for action_index, probability in sorted(root_visit_distribution(root).items())
@@ -289,6 +292,7 @@ def run_self_play_game(
                 fen=current_board.fen(en_passant="fen"),
                 policy=policy,
                 selected_action_index=selected_action_index,
+                root_value=root_value,
                 side_to_move=current_board.turn,
                 game_id=game_id,
                 ply_index=current_board.ply(),
