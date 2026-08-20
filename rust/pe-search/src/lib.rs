@@ -60,6 +60,9 @@ pub struct PyCompletedGame {
     /// side-to-move perspective, matching `outcomes`.
     #[pyo3(get)]
     root_values: Vec<f32>,
+    /// Whether model A held white, for scoring a paired match.
+    #[pyo3(get)]
+    a_is_white: bool,
     /// Sparse visit-count policy in CSR form: `policy_indices[offsets[i]..offsets[i+1]]`
     /// are position `i`'s action indices.
     #[pyo3(get)]
@@ -135,6 +138,7 @@ impl PyCompletedGame {
             ply_indices,
             selected_action_indices,
             outcomes: game.outcomes,
+            a_is_white: game.a_is_white,
             root_values,
             policy_indices,
             policy_probabilities,
@@ -171,6 +175,7 @@ impl PySelfPlayEngine {
         start_fens = Vec::new(),
         forced_playout_k = 0.0,
         min_visit_fraction = 0.0,
+        paired_starts = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -189,6 +194,7 @@ impl PySelfPlayEngine {
         start_fens: Vec<String>,
         forced_playout_k: f64,
         min_visit_fraction: f64,
+        paired_starts: bool,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -196,6 +202,7 @@ impl PySelfPlayEngine {
             seed,
             game_id_prefix,
             start_fens,
+            paired_starts,
             search: SearchConfig {
                 simulations,
                 exploration_constant,
@@ -223,6 +230,14 @@ impl PySelfPlayEngine {
     /// is the ticket `submit` must quote.
     ///
     /// The GIL is released for the whole traversal.
+    /// Which model owns each row of a filled batch: 0 for A, 1 for B.
+    fn batch_model_indices(&self, batch_id: u64) -> PyResult<Vec<u8>> {
+        self.inner
+            .batch_model_indices(batch_id)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| value_error(format!("unknown batch id {batch_id}")))
+    }
+
     fn fill_batch(
         &mut self,
         py: Python<'_>,

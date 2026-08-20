@@ -109,6 +109,8 @@ pub struct CompletedGame {
     pub moves_uci: Vec<String>,
     pub result: String,
     pub termination: String,
+    /// In a paired match, whether model A held white in this game.
+    pub a_is_white: bool,
     pub positions: Vec<RecordedPosition>,
     /// Game result from each recorded position's own side-to-move perspective.
     pub outcomes: Vec<i8>,
@@ -135,6 +137,7 @@ pub struct SelfPlayGame {
     pub game_id: String,
     pub seed: u64,
     initial_fen: String,
+    a_is_white: bool,
     position: GamePosition,
     tree: Tree,
     config: SearchConfig,
@@ -151,12 +154,14 @@ impl SelfPlayGame {
         seed: u64,
         start: GamePosition,
         config: SearchConfig,
+        a_is_white: bool,
     ) -> Self {
         let initial_fen = start.fen();
         Self {
             game_id,
             seed,
             initial_fen,
+            a_is_white,
             position: start,
             tree: Tree::new(),
             config,
@@ -166,6 +171,24 @@ impl SelfPlayGame {
             recorded: Vec::new(),
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
+    }
+
+    /// Side to move at the root of the search currently in progress.
+    ///
+    /// One move's whole search belongs to one model, so this decides which net
+    /// evaluates every leaf this game contributes until the move is played.
+    pub fn turn(&self) -> Color {
+        self.position.turn()
+    }
+
+    /// Whether model A holds white in this game.
+    pub fn a_is_white(&self) -> bool {
+        self.a_is_white
+    }
+
+    /// Which model owns the search in progress: 0 for A, 1 for B.
+    pub fn model_index(&self) -> u8 {
+        u8::from((self.position.turn() == Color::White) != self.a_is_white)
     }
 
     pub fn awaiting_prediction(&self) -> bool {
@@ -407,6 +430,7 @@ impl SelfPlayGame {
             game_id: std::mem::take(&mut self.game_id),
             seed: self.seed,
             initial_fen: std::mem::take(&mut self.initial_fen),
+            a_is_white: self.a_is_white,
             moves_uci: std::mem::take(&mut self.moves_uci),
             result: outcome.result().to_string(),
             termination: outcome.termination.as_str().to_string(),

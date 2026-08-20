@@ -33,6 +33,7 @@ fn config(games: usize, pending: usize, simulations: u32) -> EngineConfig {
         seed: 20260819,
         game_id_prefix: "test".into(),
         start_fens: Vec::new(),
+        paired_starts: false,
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,
@@ -225,4 +226,58 @@ fn a_zero_visit_floor_leaves_selection_unchanged() {
     let expected_moves: Vec<&Vec<String>> = expected.iter().map(|game| &game.moves_uci).collect();
     let actual_moves: Vec<&Vec<String>> = actual.iter().map(|game| &game.moves_uci).collect();
     assert_eq!(expected_moves, actual_moves);
+}
+
+#[test]
+fn paired_starts_play_each_opening_from_both_sides() {
+    // A match must play every opening twice with the colours swapped, or the first
+    // move advantage shows up as a difference between the models. The invariant is
+    // per game ordinal, so it holds however many games finish before truncation.
+    let openings = [
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+        "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+    ];
+    let mut settings = config(4, 2, 8);
+    settings.paired_starts = true;
+    settings.start_fens = openings
+        .iter()
+        .flat_map(|fen| [fen.to_string(), fen.to_string()])
+        .collect();
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    engine.stop_starting_new_games();
+    let games = run(&mut engine, 4, 200_000);
+    assert!(!games.is_empty(), "no game completed");
+
+    for game in &games {
+        let ordinal: usize = game
+            .game_id
+            .rsplit('-')
+            .next()
+            .expect("game id carries its ordinal")
+            .parse()
+            .expect("ordinal is numeric");
+        assert_eq!(
+            game.a_is_white,
+            ordinal % 2 == 0,
+            "ordinal {ordinal} took the wrong colour"
+        );
+        assert_eq!(
+            game.initial_fen,
+            openings[(ordinal / 2) % openings.len()],
+            "ordinal {ordinal} started from the wrong opening"
+        );
+    }
+}
+
+#[test]
+fn unpaired_starts_keep_model_a_on_white() {
+    let mut settings = config(4, 2, 8);
+    settings.start_fens = vec![
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+    ];
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    let games = run(&mut engine, 2, 200_000);
+
+    assert!(!games.is_empty());
+    assert!(games.iter().all(|game| game.a_is_white));
 }
