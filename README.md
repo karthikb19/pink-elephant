@@ -406,6 +406,7 @@ Every admitted row is re-validated by `ReplayRow`, which re-derives the encoding
 and legal actions from the stored FEN using the Python implementation. A
 non-zero `failed_game_count` therefore signals a genuine disagreement between the
 two encoders, not merely a schema problem.
+
 ## Self-play replay fine-tuning
 
 Fine-tune the parent checkpoint from the consolidated replay dataset on Modal:
