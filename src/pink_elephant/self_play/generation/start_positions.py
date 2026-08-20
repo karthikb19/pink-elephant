@@ -12,6 +12,7 @@ from random import Random
 from typing import Final, Literal
 
 import chess
+import pe_search
 
 STARTPOS_FEN: Final[str] = chess.STARTING_FEN
 DEFAULT_START_POOL_SIZE: Final[int] = 4_096
@@ -57,6 +58,15 @@ class ArchivePosition:
             raise ValueError(f"archive position fen is not parseable: {self.fen}") from error
         if not board.is_valid():
             raise ValueError(f"archive position fen is not a legal position: {self.fen}")
+        # python-chess accepts composed positions the native engine rejects, such
+        # as eight queens a side. The engine parses every start FEN when it is
+        # configured, so an unchecked one fails on a GPU worker instead of here.
+        try:
+            pe_search.encode_position(self.fen)
+        except Exception as error:
+            raise ValueError(
+                f"archive position fen is rejected by the native engine: {self.fen}"
+            ) from error
 
     @property
     def band(self) -> ArchiveBand:

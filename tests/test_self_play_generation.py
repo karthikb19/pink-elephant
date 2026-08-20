@@ -61,6 +61,7 @@ from pink_elephant.self_play.generation.modal_app import (
 from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
 from pink_elephant.self_play.generation.scheduler import GenerationCoordinator
 from pink_elephant.self_play.generation.shards import (
+    audit_replay_shard,
     iter_replay_rows,
     sha256_file,
     validate_games_table,
@@ -1024,3 +1025,38 @@ def test_generation_identity_covers_the_start_pool_and_stride() -> None:
     assert base.search_config_sha256 != pooled.search_config_sha256
     assert base.start_pool_sha256 == "startpos"
     assert base.start_fens() == ()
+
+
+def test_audit_replay_shard_returns_the_game_ids_it_already_computed(tmp_path: Path) -> None:
+    rows = tuple(replace(_valid_replay_row(), game_id=f"game-{index // 2}") for index in range(4))
+    path = tmp_path / "shard-00000.parquet"
+    write_replay_shard(path, rows)
+
+    reference, game_ids = audit_replay_shard(path)
+
+    assert game_ids == frozenset({"game-0", "game-1"})
+    assert reference.game_count == 2
+    assert reference.position_count == 4
+    assert reference == validate_replay_shard(path)
+
+
+def test_sealing_reads_each_shard_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Row reconstruction dominates sealing, so a second read doubles its cost."""
+
+    from pink_elephant.self_play.generation import shards as shards_module
+
+    path = tmp_path / "shard-00000.parquet"
+    write_replay_shard(path, (_valid_replay_row(),))
+    reads = 0
+    original = shards_module.iter_replay_rows
+
+    def counting(target: Path):
+        nonlocal reads
+        reads += 1
+        return original(target)
+
+    monkeypatch.setattr(shards_module, "iter_replay_rows", counting)
+
+    shards_module.audit_replay_shard(path)
+
+    assert reads == 1

@@ -216,19 +216,35 @@ def iter_replay_rows(path: Path) -> Iterator[ReplayRow]:
 def validate_replay_shard(path: Path) -> ReplayShardRef:
     """Validate schema, row contracts, game grouping, and content digest."""
 
+    reference, _ = audit_replay_shard(path)
+    return reference
+
+
+def audit_replay_shard(path: Path) -> tuple[ReplayShardRef, frozenset[str]]:
+    """Validate one shard and return its reference alongside its game IDs.
+
+    Every row is reconstructed as a `ReplayRow`, which re-derives the encoding and
+    legal actions from the stored FEN, so this is the cross-implementation check
+    against the native encoder as well as a schema check. That makes it the
+    dominant cost of sealing a round, and callers that also need the shard's game
+    IDs must take them from here rather than reading the file a second time.
+    """
+
     rows = tuple(iter_replay_rows(path))
     if not rows:
         raise ValueError(f"replay shard is empty: {path}")
     game_ids = tuple(row.game_id for row in rows)
     if any(game_id == "" for game_id in game_ids):
         raise ValueError("replay shard contains an empty game ID")
-    return ReplayShardRef(
+    unique_game_ids = frozenset(game_ids)
+    reference = ReplayShardRef(
         path=str(path),
         sha256=sha256_file(path),
         size_bytes=path.stat().st_size,
         position_count=len(rows),
-        game_count=len(set(game_ids)),
+        game_count=len(unique_game_ids),
     )
+    return reference, unique_game_ids
 
 
 def write_games_table(path: Path, games: Sequence[GameRecord]) -> GameTableRef:

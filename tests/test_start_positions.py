@@ -167,3 +167,13 @@ def test_default_mix_still_reaches_every_archive_band() -> None:
     assert pool.fens.count(MODERATE_FEN) >= 500
     assert BALANCED_FEN in pool.fens
     assert DECISIVE_FEN in pool.fens
+
+
+def test_archive_position_rejects_what_the_native_engine_rejects() -> None:
+    """python-chess accepts composed positions the search engine will not parse."""
+
+    eight_queens = "qqqqk2q/p2pppqp/1p4pq/2p5/2P4P/2Q3P1/PP1PPPQ1/QQ1QK1QQ w - -"
+    assert chess.Board(eight_queens).is_valid()
+
+    with pytest.raises(ValueError, match="rejected by the native engine"):
+        ArchivePosition(fen=eight_queens, centipawns=11)
