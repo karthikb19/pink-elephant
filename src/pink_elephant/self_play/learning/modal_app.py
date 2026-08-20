@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import subprocess
 import time
 from collections.abc import Iterable, Iterator
@@ -47,7 +48,11 @@ from pink_elephant.training import (
 
 APP_NAME: Final[str] = "pink-elephant-self-play-training"
 # v2 replay shards carry root_value; the v1 volume is kept intact and unread.
-DATASET_VOLUME_NAME: Final[str] = "pink-elephant-self-play-datasets-v2"
+# PE_DATASET_VOLUME selects a different dataset, and the consolidation script
+# reads the same variable so the pair cannot drift.
+DATASET_VOLUME_ENV: Final[str] = "PE_DATASET_VOLUME"
+DEFAULT_DATASET_VOLUME: Final[str] = "pink-elephant-self-play-datasets-v2"
+DATASET_VOLUME_NAME: Final[str] = os.environ.get(DATASET_VOLUME_ENV, DEFAULT_DATASET_VOLUME)
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
 DATASET_MOUNT: Final[Path] = Path("/replay")
 TRAINING_MOUNT: Final[Path] = Path("/training")

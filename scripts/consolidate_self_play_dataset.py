@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -31,7 +32,12 @@ import modal
 import pyarrow.parquet as pq
 
 SOURCE_VOLUME_NAME = "pink-elephant-training"
-DESTINATION_VOLUME_NAME = "pink-elephant-self-play-datasets-v2"
+# Modal binds volumes when the module is imported, so the destination cannot be a
+# flag. The same variable selects the volume the trainer reads, keeping one knob
+# for a pair of scripts that must agree.
+DATASET_VOLUME_ENV = "PE_DATASET_VOLUME"
+DEFAULT_DATASET_VOLUME = "pink-elephant-self-play-datasets-v2"
+DESTINATION_VOLUME_NAME = os.environ.get(DATASET_VOLUME_ENV, DEFAULT_DATASET_VOLUME)
 SOURCE_MOUNT = Path("/source")
 DESTINATION_MOUNT = Path("/dataset")
 DATASET_MANIFEST_NAME = "dataset-manifest.json"
