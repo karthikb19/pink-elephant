@@ -67,36 +67,100 @@ def write_replay_shard(path: Path, rows: Sequence[ReplayRow]) -> ReplayShardRef:
     game_ids = tuple(row.game_id for row in rows)
     table = pa.Table.from_arrays(
         (
-            pa.array(
-                [row.board.reshape(-1).tolist() for row in rows],
-                type=_REPLAY_SCHEMA.field("board").type,
-            ),
+            _board_array(rows),
             pa.array([row.fen for row in rows], type=pa.string()),
-            pa.array(
-                [
-                    [
-                        {
-                            "action_index": entry.action_index,
-                            "probability": entry.probability,
-                        }
-                        for entry in row.policy
-                    ]
-                    for row in rows
-                ],
-                type=_REPLAY_SCHEMA.field("policy").type,
+            _policy_array(rows),
+            np.fromiter(
+                (row.selected_action_index for row in rows), dtype=np.uint16, count=len(rows)
             ),
-            pa.array([row.selected_action_index for row in rows], type=pa.uint16()),
-            pa.array([row.outcome for row in rows], type=pa.int8()),
+            np.fromiter((row.outcome for row in rows), dtype=np.int8, count=len(rows)),
             pa.array(game_ids, type=pa.string()),
-            pa.array([row.ply_index for row in rows], type=pa.int32()),
+            np.fromiter((row.ply_index for row in rows), dtype=np.int32, count=len(rows)),
         ),
         schema=_with_metadata(_REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION),
     )
     _write_immutable_parquet(path, table)
-    reference = validate_replay_shard(path)
+    reference = _verify_written_shard(path, table, game_ids)
     if reference.position_count != len(rows) or reference.game_count != len(set(game_ids)):
         raise RuntimeError("written replay shard count validation failed")
     return reference
+
+
+def _verify_written_shard(path: Path, written: pa.Table, game_ids: Sequence[str]) -> ReplayShardRef:
+    """Confirm the file on disk decodes to exactly the table that was written.
+
+    The rows were already validated when they were constructed, and comparing the
+    round-tripped table against the source proves the bytes on disk are correct
+    more directly than rebuilding every row would. Rebuilding is also ruinously
+    expensive here: it re-derives the encoding and legal actions from each FEN, so
+    at the default 8,192-position shard limit it took over two seconds per flush
+    while holding the GIL, stalling the whole host loop.
+
+    `validate_replay_shard` still performs the full row-level audit. It runs
+    during round sealing, after the worker has finished, where it blocks nothing.
+    """
+
+    table = pq.read_table(path)
+    _validate_schema(table.schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+    if not table.equals(written):
+        raise RuntimeError(f"written replay shard does not match its source table: {path}")
+    if any(game_id == "" for game_id in game_ids):
+        raise ValueError("replay shard contains an empty game ID")
+    return ReplayShardRef(
+        path=str(path),
+        sha256=sha256_file(path),
+        size_bytes=path.stat().st_size,
+        position_count=table.num_rows,
+        game_count=len(set(game_ids)),
+    )
+
+
+def _board_array(rows: Sequence[ReplayRow]) -> pa.Array:
+    """Build the fixed-size board column without materializing Python integers.
+
+    A board is 1,344 uint8 values, so the obvious `row.board.tolist()` creates
+    that many Python objects per row. At the default 8,192-position shard limit
+    that is roughly eleven million object allocations per flush, all of them
+    holding the GIL. When shard writing runs on the admission thread, the host
+    thread cannot launch GPU work for the duration and the device goes idle;
+    that showed up as a periodic collapse in GPU utilization exactly one shard
+    apart.
+
+    Stacking into one contiguous array and handing Arrow the buffer keeps the
+    conversion in C, so the GIL stays available to the host thread.
+    """
+
+    stacked = np.ascontiguousarray(np.stack([row.board for row in rows])).reshape(-1)
+    return pa.FixedSizeListArray.from_arrays(pa.array(stacked), _BOARD_SIZE)
+
+
+def _policy_array(rows: Sequence[ReplayRow]) -> pa.Array:
+    """Build the sparse policy column from flat buffers rather than per-entry dicts.
+
+    The previous construction allocated one dict per legal action, roughly
+    290,000 per shard. `np.fromiter` drives the same iteration from C and writes
+    straight into typed buffers.
+    """
+
+    lengths = np.fromiter((len(row.policy) for row in rows), dtype=np.int32, count=len(rows))
+    total = int(lengths.sum())
+    action_indices = np.fromiter(
+        (entry.action_index for row in rows for entry in row.policy),
+        dtype=np.uint16,
+        count=total,
+    )
+    probabilities = np.fromiter(
+        (entry.probability for row in rows for entry in row.policy),
+        dtype=np.float32,
+        count=total,
+    )
+    offsets = np.zeros(len(rows) + 1, dtype=np.int32)
+    np.cumsum(lengths, out=offsets[1:])
+    entries = pa.StructArray.from_arrays(
+        (pa.array(action_indices), pa.array(probabilities)),
+        fields=list(_REPLAY_SCHEMA.field("policy").type.value_type),
+    )
+    return pa.ListArray.from_arrays(pa.array(offsets), entries)
 
 
 def iter_replay_rows(path: Path) -> Iterator[ReplayRow]:

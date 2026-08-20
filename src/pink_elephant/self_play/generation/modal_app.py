@@ -40,14 +40,24 @@ from pink_elephant.self_play.generation.manifests import (
 from pink_elephant.self_play.generation.observability import configure_logging, log_event
 from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
 from pink_elephant.self_play.generation.shards import sha256_file
-from pink_elephant.self_play.generation.worker import load_generation_evaluator, run_worker
+from pink_elephant.self_play.generation.worker import (
+    load_generation_evaluator,
+    load_generation_model,
+    run_native_worker,
+    run_worker,
+)
 
 logger = logging.getLogger(__name__)
 
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
+# The native engine spends about 5% of one core's wall time on search, so the
+# eight cores the Python path needed are almost entirely idle. This stays at 8 as
+# the container's declared default because the retained Python backend still needs
+# one core per MCTS process; override it per run with `--worker-cpu`.
 SELF_PLAY_CPU: Final[float] = 8.0
+SELF_PLAY_NATIVE_CPU: Final[float] = 1.0
 SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(SELF_PLAY_CPU)
 SELF_PLAY_MCTS_TREES_PER_PROCESS: Final[int] = 2
 SELF_PLAY_L4_GPU: Final[str] = "L4"
@@ -69,12 +79,19 @@ self_play_volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=T
     max_containers=SELF_PLAY_CONCURRENCY,
 )
 def generate_worker_modal(
-    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+    worker: WorkerSpec,
+    autocast: bool = False,
+    torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> WorkerResult:
     """Generate one independently retryable worker invocation on CPU."""
 
     return _generate_worker_modal(
-        worker, device="cpu", autocast=autocast, torch_compile=torch_compile
+        worker,
+        device="cpu",
+        autocast=autocast,
+        torch_compile=torch_compile,
+        search_backend=search_backend,
     )
 
 
@@ -88,19 +105,31 @@ def generate_worker_modal(
     max_containers=SELF_PLAY_CONCURRENCY,
 )
 def generate_worker_modal_l4(
-    worker: WorkerSpec, autocast: bool = False, torch_compile: bool = False
+    worker: WorkerSpec,
+    autocast: bool = False,
+    torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> WorkerResult:
     """Generate one independently retryable worker invocation on an L4 GPU."""
 
     return _generate_worker_modal(
-        worker, device="cuda", autocast=autocast, torch_compile=torch_compile
+        worker,
+        device="cuda",
+        autocast=autocast,
+        torch_compile=torch_compile,
+        search_backend=search_backend,
     )
 
 
 def _generate_worker_modal(
-    worker: WorkerSpec, *, device: str, autocast: bool = False, torch_compile: bool = False
+    worker: WorkerSpec,
+    *,
+    device: str,
+    autocast: bool = False,
+    torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> WorkerResult:
-    """Load one worker evaluator on the selected compute device and commit its result."""
+    """Load one worker model on the selected compute device and commit its result."""
 
     configure_logging()
     log_event(
@@ -113,24 +142,31 @@ def _generate_worker_modal(
             "model_torch_compile": torch_compile,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
+            "search_backend": search_backend,
             "worker_id": worker.worker_id,
         },
     )
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     checkpoint_path = _mounted_checkpoint_path(worker.generation.checkpoint_volume_path)
-    evaluator = load_generation_evaluator(
-        checkpoint_path,
-        worker,
-        device=device,
-        autocast=autocast,
-        torch_compile=torch_compile,
-    )
-    with MultiprocessMCTSSearch(
-        evaluator,
-        SELF_PLAY_MCTS_PROCESS_COUNT,
-        trees_per_process=SELF_PLAY_MCTS_TREES_PER_PROCESS,
-    ) as process_search:
-        result = run_worker(worker, evaluator, output_root, process_search=process_search)
+    if search_backend == "native":
+        model = load_generation_model(
+            checkpoint_path, worker, device=device, torch_compile=torch_compile
+        )
+        result = run_native_worker(worker, model, output_root, device=device, autocast=autocast)
+    else:
+        evaluator = load_generation_evaluator(
+            checkpoint_path,
+            worker,
+            device=device,
+            autocast=autocast,
+            torch_compile=torch_compile,
+        )
+        with MultiprocessMCTSSearch(
+            evaluator,
+            SELF_PLAY_MCTS_PROCESS_COUNT,
+            trees_per_process=SELF_PLAY_MCTS_TREES_PER_PROCESS,
+        ) as process_search:
+            result = run_worker(worker, evaluator, output_root, process_search=process_search)
     self_play_volume.commit()
     log_event(
         logger,
@@ -300,8 +336,10 @@ def coordinate_generation_round(
     round_spec: GenerationRoundSpec,
     invocation_id: str = "invocation-0001",
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    worker_cpu: float | None = None,
     autocast: bool = False,
     torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> RoundCompletion:
     """Keep map-and-seal orchestration alive in Modal, independent of the client."""
 
@@ -316,6 +354,8 @@ def coordinate_generation_round(
             "worker_gpu": worker_gpu,
             "model_autocast": autocast,
             "model_torch_compile": torch_compile,
+            "search_backend": search_backend,
+            "worker_cpu": worker_cpu,
         },
     )
     if worker_gpu not in {"cpu", SELF_PLAY_L4_GPU}:
@@ -338,13 +378,24 @@ def coordinate_generation_round(
     worker_function = (
         generate_worker_modal_l4 if worker_gpu == SELF_PLAY_L4_GPU else generate_worker_modal
     )
+    if worker_cpu is None:
+        # The Python backend derives its MCTS process count from the declared CPU
+        # count, so only the native backend gets the reduced default.
+        worker_cpu = SELF_PLAY_NATIVE_CPU if search_backend == "native" else SELF_PLAY_CPU
+    if worker_cpu != SELF_PLAY_CPU:
+        # Invocation-time override; runs in its own container pool.
+        worker_function = worker_function.with_options(cpu=worker_cpu)
     generated_results = (
         ()
         if not missing_workers
         else tuple(
             worker_function.map(
                 missing_workers,
-                kwargs={"autocast": autocast, "torch_compile": torch_compile},
+                kwargs={
+                    "autocast": autocast,
+                    "torch_compile": torch_compile,
+                    "search_backend": search_backend,
+                },
             )
         )
     )
@@ -373,8 +424,10 @@ def launch_modal_generation_round(
     *,
     invocation_id: str = "invocation-0001",
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    worker_cpu: float | None = None,
     autocast: bool = False,
     torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> RoundCompletion:
     """Submit one coordinated round and wait for its durable completion."""
 
@@ -389,13 +442,17 @@ def launch_modal_generation_round(
         },
     )
     with app.run():
+        # Keyword arguments only: this signature has grown, and positional
+        # arguments would silently shift when a parameter is inserted.
         completion = coordinate_generation_round.spawn(
             generation,
             round_spec,
-            invocation_id,
-            worker_gpu,
-            autocast,
-            torch_compile,
+            invocation_id=invocation_id,
+            worker_gpu=worker_gpu,
+            worker_cpu=worker_cpu,
+            autocast=autocast,
+            torch_compile=torch_compile,
+            search_backend=search_backend,
         ).get()
     log_event(
         logger,
@@ -426,8 +483,10 @@ def main(
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
     worker_gpu: str = SELF_PLAY_L4_GPU,
+    worker_cpu: float | None = None,
     autocast: bool = False,
     torch_compile: bool = False,
+    search_backend: str = "native",
 ) -> None:
     """Launch a round through ``modal run --detach`` for disconnect safety."""
 
@@ -454,8 +513,10 @@ def main(
         generation,
         round_spec,
         worker_gpu=worker_gpu,
+        worker_cpu=worker_cpu,
         autocast=autocast,
         torch_compile=torch_compile,
+        search_backend=search_backend,
     ).get()
     print(json.dumps(completion.to_payload(), indent=2, sort_keys=True), flush=True)
 

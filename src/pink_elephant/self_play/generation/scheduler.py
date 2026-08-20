@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from pink_elephant.self_play.contracts import RoundCompletion, WorkerResult
 from pink_elephant.self_play.generation.config import (
@@ -19,7 +20,14 @@ from pink_elephant.self_play.generation.manifests import (
     latest_snapshot,
     seal_round,
 )
-from pink_elephant.self_play.generation.worker import load_generation_evaluator, run_worker
+from pink_elephant.self_play.generation.worker import (
+    load_generation_evaluator,
+    load_generation_model,
+    run_native_worker,
+    run_worker,
+)
+
+SearchBackend = Literal["native", "python"]
 
 WorkerRunner = Callable[[WorkerSpec], WorkerResult]
 
@@ -90,12 +98,20 @@ def run_local_round(
     checkpoint_path: Path,
     *,
     invocation_id: str = "invocation-0001",
+    search_backend: SearchBackend = "native",
 ) -> RoundCompletion:
-    """Run a complete local smoke/pilot round using CPU checkpoint workers."""
+    """Run a complete local smoke/pilot round using CPU checkpoint workers.
+
+    The Python backend is retained so a Modal round can be measured against the
+    native one in the same image, with every semantic search input held constant.
+    """
 
     coordinator = GenerationCoordinator(output_root=output_root, generation=generation)
 
     def worker_runner(worker: WorkerSpec) -> WorkerResult:
+        if search_backend == "native":
+            model = load_generation_model(checkpoint_path, worker)
+            return run_native_worker(worker, model, output_root)
         evaluator = load_generation_evaluator(checkpoint_path, worker)
         return run_worker(worker, evaluator, output_root)
 

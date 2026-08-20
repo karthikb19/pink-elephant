@@ -15,16 +15,18 @@ loop shape rather than a rule to remember.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 
+import numpy as np
 import pe_search
 import torch
 from torch import nn
 
 from pink_elephant.encoding import BOARD_SIZE, HALFMOVE_PLANE, HALFMOVE_SCALE, PLANE_COUNT
 from pink_elephant.model import ModelOutput
+from pink_elephant.self_play.contracts import GameRecord, ReplayRow, SparsePolicyEntry
 
 PENDING_BATCHES = 2
 
@@ -190,30 +192,54 @@ class NativeSelfPlayHost:
         return stats
 
 
-def iter_replay_rows(game: pe_search.CompletedGame) -> Iterator[dict[str, object]]:
-    """Expand one columnar completed game into per-position mappings.
+def adapt_completed_game(
+    game: pe_search.CompletedGame,
+) -> tuple[tuple[ReplayRow, ...], GameRecord]:
+    """Convert one engine game into the existing replay contracts.
 
-    The engine returns one Python object per game rather than per position, so
-    this is the single place where per-position Python objects are created, and
-    only for data that is about to be written to a shard anyway.
+    This is the single place per-position Python objects are created, and only
+    for data about to be written to a shard. `ReplayRow.__post_init__` re-derives
+    the encoding and legal actions from the stored FEN using the *Python*
+    implementation, so admitting a row is also a continuous conformance check
+    between the two encoders in production, not merely a schema check.
     """
 
     boards = game.boards()
     offsets = game.policy_offsets
+    action_indices = game.policy_indices
+    probabilities = game.policy_probabilities
+
+    rows: list[ReplayRow] = []
     for index in range(game.ply_count):
         start, end = offsets[index], offsets[index + 1]
-        yield {
-            "board": boards[index],
-            "fen": game.fens[index],
-            "policy": tuple(
-                zip(
-                    game.policy_indices[start:end],
-                    game.policy_probabilities[start:end],
-                    strict=True,
-                )
-            ),
-            "selected_action_index": game.selected_action_indices[index],
-            "outcome": game.outcomes[index],
-            "game_id": game.game_id,
-            "ply_index": game.ply_indices[index],
-        }
+        rows.append(
+            ReplayRow(
+                # The engine returns one stacked array per game; each row must own
+                # contiguous storage before it reaches Arrow.
+                board=np.ascontiguousarray(boards[index]),
+                fen=game.fens[index],
+                policy=tuple(
+                    SparsePolicyEntry(action_index=int(action), probability=float(probability))
+                    for action, probability in zip(
+                        action_indices[start:end], probabilities[start:end], strict=True
+                    )
+                ),
+                # numpy integers fail the contracts' strict `isinstance(int)` checks.
+                selected_action_index=int(game.selected_action_indices[index]),
+                outcome=int(game.outcomes[index]),
+                game_id=game.game_id,
+                ply_index=int(game.ply_indices[index]),
+            )
+        )
+
+    record = GameRecord(
+        game_id=game.game_id,
+        seed=game.seed,
+        initial_fen=game.initial_fen,
+        moves_uci=tuple(game.moves_uci),
+        result=game.result,
+        termination=game.termination,
+        ply_count=game.ply_count,
+        replay_position_count=game.ply_count,
+    )
+    return tuple(rows), record

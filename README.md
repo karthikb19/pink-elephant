@@ -345,6 +345,68 @@ uv run python scripts/benchmark_native_search.py \
 Note that games finish atomically, so a small `--positions` quota still runs every
 active game to completion and overshoots heavily.
 
+### Running self-play on the native engine
+
+`--search-backend` selects the engine and defaults to `native`. The legacy Python
+path is retained so a round can be measured against it in the same image with
+every semantic search input held constant:
+
+```sh
+uv run modal run --detach --timestamps \
+  src/pink_elephant/self_play/generation/modal_app.py \
+  --generation-id generation-native-32sims-20260819 \
+  --round-id round-000001 \
+  --requested-positions 10000 \
+  --simulations 32 \
+  --active-games-per-worker 64 \
+  --search-backend native
+```
+
+`--active-games-per-worker` is now the throughput knob: the inference batch is
+half of it, because games are split into two disjoint groups so no tree ever has
+two outstanding leaves. Sixty-four games therefore means a batch of 32. Process
+count and trees-per-process no longer exist.
+
+`--worker-cpu` overrides the container's CPU request per run. The native engine
+spends about 5% of one core on search, so it defaults to 1 CPU; the retained
+Python backend still derives its MCTS process count from the CPU count and
+defaults to 8. Sweep it to find the cost-optimal point.
+
+`--autocast` enables CUDA FP16 autocast and `--torch-compile` compiles the model.
+Both apply to the native path and are off by default. They were last evaluated
+when the model was 27.7% of wall time; it is now roughly 68%, so that verdict
+should be re-measured rather than carried forward. Note that `torch.compile` sees
+a shrinking batch during the drain tail, which can trigger recompilation.
+
+Follow the run with `uv run modal app logs pink-elephant-self-play -f`. The
+`worker_search_progress` and `worker_completed` events account for wall time
+end to end: `model_forward_seconds`, `stall_seconds`, `engine_fill_seconds`,
+`engine_submit_seconds`, `row_adapt_seconds`, `shard_buffer_seconds`, and the
+`unattributed_seconds` remainder, alongside `leaves_per_second`,
+`engine_microseconds_per_leaf`, `average_model_batch_size`, and `games_truncated`.
+
+`row_adapt_seconds` is the per-position replay-row revalidation and
+`shard_buffer_seconds` is Arrow/Parquet buffering. Both run on a background
+admission thread so they overlap GPU work rather than blocking it, which means
+the phase timings legitimately sum to more than wall time; a sum above 100% is
+the signal that the overlap is working. `admission_queue_wait_seconds` is host
+time lost to backpressure and should stay near zero. If it grows, the writer is
+not keeping up and the run has degraded to the old serial behaviour.
+
+Locally, the same round runs on CPU:
+
+```sh
+uv run pe-self-play generation extend \
+  --backend local --search-backend native \
+  --checkpoint /path/to/generation-1.pt \
+  --round-id smoke-000001 --requested-positions 100
+```
+
+Every admitted row is re-validated by `ReplayRow`, which re-derives the encoding
+and legal actions from the stored FEN using the Python implementation. A
+non-zero `failed_game_count` therefore signals a genuine disagreement between the
+two encoders, not merely a schema problem.
+
 ## Checkpoint arena
 
 Play a local checkpoint against Stockfish with an Elo-limited opponent. The

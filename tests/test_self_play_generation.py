@@ -700,12 +700,15 @@ def test_cli_passes_generation_overrides_to_local_scheduler(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run_local_round(output_root, generation, round_spec, checkpoint_path):
+    def fake_run_local_round(
+        output_root, generation, round_spec, checkpoint_path, *, search_backend
+    ):
         captured.update(
             output_root=output_root,
             generation=generation,
             round_spec=round_spec,
             checkpoint_path=checkpoint_path,
+            search_backend=search_backend,
         )
         return RoundCompletion(
             generation_id=generation.generation_id,
@@ -769,8 +772,14 @@ def test_cli_passes_l4_worker_selection_to_modal_launcher(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_launch(generation, round_spec, *, worker_gpu):
-        captured.update(generation=generation, round_spec=round_spec, worker_gpu=worker_gpu)
+    def fake_launch(generation, round_spec, *, worker_gpu, worker_cpu, search_backend):
+        captured.update(
+            generation=generation,
+            round_spec=round_spec,
+            worker_gpu=worker_gpu,
+            worker_cpu=worker_cpu,
+            search_backend=search_backend,
+        )
         return RoundCompletion(
             generation_id=generation.generation_id,
             round_id=round_spec.round_id,

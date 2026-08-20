@@ -302,11 +302,11 @@ Modal CPU is roughly 17% of the L4's hourly cost, so a second core must return m
 
 ### Deliberately out of scope
 
-Wiring the engine into `run_worker`, the generation CLI, and the Modal entrypoints is a
-separate change. It touches shard building, manifests, sealing, and observability, is
-largely mechanical, and would obscure review of the engine itself. The Modal image is
-already updated here because `pe-search` is a path dependency and `uv_sync()` cannot
-resolve it without a Rust toolchain in the image.
+Wiring the engine into `run_worker`, the generation CLI, and the Modal entrypoints was a
+separate change, landed immediately afterwards as `run_native_worker` plus a
+`--search-backend native|python` selector. The Python path is retained rather than deleted
+so a Modal round can be measured against it in the same image with every semantic search
+input held constant; it should be removed once the native path is proven in production.
 
 Batch size is currently `games / pending_batches`, so a large batch requires
 proportionally many concurrent games. That couples batch size to the drain tail at the
