@@ -43,7 +43,10 @@ GENERATION_1_TEMPERATURE_CUTOFF_PLY: Final[int] = 30
 GENERATION_1_WORKER_COUNT: Final[int] = 1
 GENERATION_1_ACTIVE_GAMES_PER_WORKER: Final[int] = 16
 GENERATION_1_SHARD_POSITION_LIMIT: Final[int] = 8_192
-GENERATION_1_REPLAY_STRIDE: Final[int] = 4
+# Off by default. Self-play games run about 32 plies, and the blended value
+# target already gives each position its own signal, so dropping three of every
+# four rows costs four times the search for a redundancy that is no longer there.
+GENERATION_1_REPLAY_STRIDE: Final[int] = 1
 _SHA256_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 

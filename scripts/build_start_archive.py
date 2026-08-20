@@ -21,6 +21,7 @@ DEFAULT_MIN_DEPTH = 20
 
 def _iter_candidates(source: Path, *, min_depth: int) -> list[ArchivePosition]:
     positions: list[ArchivePosition] = []
+    rejected = 0
     with source.open(encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
@@ -46,7 +47,12 @@ def _iter_candidates(source: Path, *, min_depth: int) -> list[ArchivePosition]:
             # Mate scores have no centipawn value and would all land in one band.
             if isinstance(centipawns, bool) or not isinstance(centipawns, int):
                 continue
-            positions.append(ArchivePosition(fen=fen, centipawns=centipawns))
+            # Lichess evaluates composed positions that are not reachable in play.
+            try:
+                positions.append(ArchivePosition(fen=fen, centipawns=centipawns))
+            except ValueError:
+                rejected += 1
+    print(f"rejected {rejected} illegal or unparseable positions")
     return positions
 
 

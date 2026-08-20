@@ -428,10 +428,14 @@ counters, so a game started from one begins at ply zero and the temperature
 cutoff is measured from the generated game, not the original.
 
 `--replay-stride` keeps one position per stride window with a per-game random
-offset. Every position in a game shares one outcome, so consecutive rows are
-near-duplicates of a single label; a random offset avoids the side-to-move bias
-a fixed offset would introduce. The native path subsamples before building rows,
-skipping the FEN re-derivation for discarded plies.
+offset, and defaults to 1, meaning off. It exists because every position in a
+game shares one outcome, but measured self-play games run about 32 plies and the
+blended value target already gives each position its own signal, so discarding
+rows would cost proportionally more search for redundancy that is no longer
+there. Raise it only if game length grows a lot. When set above one, the native
+path subsamples before building rows, skipping the FEN re-derivation for
+discarded plies, and a random offset avoids the side-to-move bias a fixed offset
+would introduce.
 
 ## Value targets
 
