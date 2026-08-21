@@ -10,6 +10,11 @@ Openings are resolved on the client and each is listed twice in the start pool,
 so `paired_starts` plays it once from each side. Checkpoints are read from the
 training Volume by path, so nothing is uploaded.
 
+Passing `--value-checkpoint-a` or `--value-checkpoint-b` gives that side another
+checkpoint's value head while keeping its own policy. Playing the two heads apart
+is what separates a policy regression from a value regression when a candidate
+wins at one simulation and loses with search.
+
     uv run modal run src/pink_elephant/checkpoint_match_modal.py \\
       --checkpoint-a runs/<run>/checkpoints/<candidate>.pt \\
       --checkpoint-b runs/<run>/checkpoints/<parent>.pt \\
@@ -23,12 +28,15 @@ import math
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import modal
 
 from pink_elephant.modal_image import build_image
 from pink_elephant.opening_book import load_opening_book, playable_openings, select_openings
+
+if TYPE_CHECKING:
+    from torch import nn
 
 APP_NAME: Final[str] = "pink-elephant-checkpoint-match"
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
@@ -55,6 +63,9 @@ class MatchRequest:
     max_plies: int
     seed: int
     pending_batches: int
+    # Empty means the side keeps its own value head; see `_with_value_head`.
+    value_checkpoint_a: str = ""
+    value_checkpoint_b: str = ""
 
     def __post_init__(self) -> None:
         if len(self.start_fens) < 2 or len(self.start_fens) % 2:
@@ -89,6 +100,8 @@ def play_match(request: MatchRequest) -> dict[str, object]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     loaded_a = load_checkpoint_model(TRAINING_MOUNT / request.checkpoint_a, device=device)
     loaded_b = load_checkpoint_model(TRAINING_MOUNT / request.checkpoint_b, device=device)
+    model_a = _with_value_head(loaded_a.model, request.value_checkpoint_a, device)
+    model_b = _with_value_head(loaded_b.model, request.value_checkpoint_b, device)
     engine = pe_search.SelfPlayEngine(
         games=len(request.start_fens),
         seed=request.seed,
@@ -104,7 +117,7 @@ def play_match(request: MatchRequest) -> dict[str, object]:
         start_fens=list(request.start_fens),
         paired_starts=True,
     )
-    host = BatchedMatchHost(loaded_a.model, loaded_b.model, engine, device=device, autocast=False)
+    host = BatchedMatchHost(model_a, model_b, engine, device=device, autocast=False)
 
     import logging
 
@@ -132,8 +145,23 @@ def play_match(request: MatchRequest) -> dict[str, object]:
         "leaves_by_model": list(stats.leaves_by_model),
         "epoch_a": loaded_a.epoch,
         "epoch_b": loaded_b.epoch,
+        "value_checkpoint_a": request.value_checkpoint_a,
+        "value_checkpoint_b": request.value_checkpoint_b,
         "games": [asdict(outcome) for outcome in outcomes],
     }
+
+
+def _with_value_head(model: nn.Module, value_checkpoint: str, device: str) -> nn.Module:
+    """Return the model itself, or its policy paired with another model's value."""
+
+    if not value_checkpoint:
+        return model
+    from pink_elephant.arena import load_checkpoint_model
+    from pink_elephant.match_host import HeadSwapModel
+
+    return HeadSwapModel(
+        model, load_checkpoint_model(TRAINING_MOUNT / value_checkpoint, device=device).model
+    )
 
 
 def confidence_interval(wins: int, draws: int, losses: int) -> tuple[float, float]:
@@ -154,6 +182,8 @@ def main(
     checkpoint_b: str,
     name_a: str = "model-a",
     name_b: str = "model-b",
+    value_checkpoint_a: str = "",
+    value_checkpoint_b: str = "",
     positions: int = 256,
     simulations: int = 200,
     simulations_b: int = 0,
@@ -192,6 +222,8 @@ def main(
             checkpoint_a=checkpoint_a,
             checkpoint_b=checkpoint_b,
             start_fens=start_fens,
+            value_checkpoint_a=value_checkpoint_a,
+            value_checkpoint_b=value_checkpoint_b,
             simulations=simulations,
             simulations_b=simulations_b,
             exploration=exploration,
@@ -220,8 +252,18 @@ def main(
         json.dumps(
             {
                 "recorded_at": datetime.now(UTC).isoformat(),
-                "model_a": {"name": name_a, "source": checkpoint_a, "epoch": result["epoch_a"]},
-                "model_b": {"name": name_b, "source": checkpoint_b, "epoch": result["epoch_b"]},
+                "model_a": {
+                    "name": name_a,
+                    "source": checkpoint_a,
+                    "epoch": result["epoch_a"],
+                    "value_source": value_checkpoint_a,
+                },
+                "model_b": {
+                    "name": name_b,
+                    "source": checkpoint_b,
+                    "epoch": result["epoch_b"],
+                    "value_source": value_checkpoint_b,
+                },
                 "parameters": {
                     "positions": positions,
                     "games": len(start_fens),

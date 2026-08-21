@@ -67,3 +67,9 @@ Do not automatically use the newest checkpoint for the next self-play generation
 The first run is a calibration experiment. Keep the dataset, parent checkpoint, and arena settings
 fixed while comparing epochs. If later epochs stop improving in the arena, shorten subsequent runs
 rather than compensating with a larger learning rate.
+
+A single-budget match is not enough. Every candidate measured so far beats its parent at one
+simulation and loses at 200, so a match at one budget can be read either way depending on which one
+is chosen. Play at least one low and one high budget, and play the heads apart when they disagree.
+See [the crossover record](self-play-runs/2026-08-21-search-crossover.md) for the full ledger and
+the head-swap attribution.

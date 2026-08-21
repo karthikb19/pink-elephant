@@ -66,6 +66,29 @@ class MatchStats:
         return self.leaves / self.wall_seconds if self.wall_seconds else 0.0
 
 
+class HeadSwapModel(nn.Module):
+    """Take the policy from one checkpoint and the value from another.
+
+    A candidate that beats its parent at one simulation but loses with search has
+    a head-specific regression: one simulation only ranks priors, so the value
+    head never enters move selection. Playing the two heads apart is the only
+    measurement that separates them, because both losses are computed on replay
+    rows the candidate was trained to fit.
+    """
+
+    def __init__(self, policy_model: nn.Module, value_model: nn.Module) -> None:
+        super().__init__()
+        self.policy_model = policy_model.eval()
+        self.value_model = value_model.eval()
+
+    def forward(self, positions: torch.Tensor) -> ModelOutput:
+        policy = self.policy_model(positions)
+        value = self.value_model(positions)
+        if not isinstance(policy, ModelOutput) or not isinstance(value, ModelOutput):
+            raise TypeError("both source models must return ModelOutput")
+        return ModelOutput(policy_logits=policy.policy_logits, value=value.value)
+
+
 class BatchedMatchHost:
     """Run one native engine against two models, one forward pass per model."""
 

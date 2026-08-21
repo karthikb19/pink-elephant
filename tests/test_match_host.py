@@ -3,9 +3,18 @@ from __future__ import annotations
 import math
 
 import pytest
+import torch
 
+from pink_elephant.action_mapping import POLICY_SIZE
 from pink_elephant.checkpoint_match_modal import MatchRequest, confidence_interval
-from pink_elephant.match_host import MatchOutcome, paired_start_pool, score_match
+from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
+from pink_elephant.match_host import (
+    HeadSwapModel,
+    MatchOutcome,
+    paired_start_pool,
+    score_match,
+)
+from pink_elephant.model import ModelOutput
 
 WHITE_FEN = "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2"
 
@@ -171,3 +180,39 @@ def test_match_request_accepts_asymmetric_search_depth() -> None:
 
     assert request.simulations == 800
     assert request.simulations_b == 200
+
+
+class _ConstantModel(torch.nn.Module):
+    """A stand-in that reports which source a head came from."""
+
+    def __init__(self, policy_value: float, value: float) -> None:
+        super().__init__()
+        self.policy_value = policy_value
+        self.value = value
+
+    def forward(self, positions: torch.Tensor) -> ModelOutput:
+        rows = positions.shape[0]
+        return ModelOutput(
+            policy_logits=torch.full((rows, POLICY_SIZE), self.policy_value),
+            value=torch.full((rows, 1), self.value),
+        )
+
+
+def test_head_swap_takes_the_policy_and_value_from_different_models() -> None:
+    swapped = HeadSwapModel(_ConstantModel(1.5, -0.25), _ConstantModel(-3.0, 0.75))
+
+    output = swapped(torch.zeros(4, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE))
+
+    assert torch.equal(output.policy_logits, torch.full((4, POLICY_SIZE), 1.5))
+    assert torch.equal(output.value, torch.full((4, 1), 0.75))
+
+
+def test_head_swap_rejects_a_model_that_does_not_return_model_output() -> None:
+    class _Bare(torch.nn.Module):
+        def forward(self, positions: torch.Tensor) -> torch.Tensor:
+            return positions
+
+    swapped = HeadSwapModel(_Bare(), _ConstantModel(0.0, 0.0))
+
+    with pytest.raises(TypeError, match="must return ModelOutput"):
+        swapped(torch.zeros(2, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE))
