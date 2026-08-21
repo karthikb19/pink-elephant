@@ -28,6 +28,9 @@ OUTPUT=${OUTPUT:-data/checkpoint-arena/modal-match.json}
 # Give a side another checkpoint's value head while keeping its own policy.
 VALUE_A=${VALUE_A:-}
 VALUE_B=${VALUE_B:-}
+# Below 1.0 sharpens that side's priors in-tree; 1.0 leaves them as trained.
+TEMP_A=${TEMP_A:-1.0}
+TEMP_B=${TEMP_B:-1.0}
 
 # Openings are resolved on the client, so the book must exist locally.
 test -f "$OPENINGS" || { echo "Missing opening book: $OPENINGS" >&2; exit 2; }
@@ -47,4 +50,6 @@ uv run modal run src/pink_elephant/checkpoint_match_modal.py \
   --opening-seed "$OPENING_SEED" \
   --value-checkpoint-a "$VALUE_A" \
   --value-checkpoint-b "$VALUE_B" \
+  --policy-temperature-a "$TEMP_A" \
+  --policy-temperature-b "$TEMP_B" \
   --output "$OUTPUT"

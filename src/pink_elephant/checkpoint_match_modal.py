@@ -66,6 +66,9 @@ class MatchRequest:
     # Empty means the side keeps its own value head; see `_with_value_head`.
     value_checkpoint_a: str = ""
     value_checkpoint_b: str = ""
+    # Below 1.0 sharpens that side's priors at every expansion, not only the root.
+    policy_temperature_a: float = 1.0
+    policy_temperature_b: float = 1.0
 
     def __post_init__(self) -> None:
         if len(self.start_fens) < 2 or len(self.start_fens) % 2:
@@ -74,6 +77,9 @@ class MatchRequest:
             raise ValueError("simulations and max_plies must be positive")
         if self.simulations_b < 0:
             raise ValueError("simulations_b must be non-negative; zero matches model A")
+        for temperature in (self.policy_temperature_a, self.policy_temperature_b):
+            if not math.isfinite(temperature) or temperature <= 0:
+                raise ValueError("policy temperatures must be finite and positive")
         if self.pending_batches < 1 or len(self.start_fens) % self.pending_batches:
             raise ValueError("games must divide evenly into pending_batches")
 
@@ -117,7 +123,14 @@ def play_match(request: MatchRequest) -> dict[str, object]:
         start_fens=list(request.start_fens),
         paired_starts=True,
     )
-    host = BatchedMatchHost(model_a, model_b, engine, device=device, autocast=False)
+    host = BatchedMatchHost(
+        model_a,
+        model_b,
+        engine,
+        device=device,
+        autocast=False,
+        policy_temperatures=(request.policy_temperature_a, request.policy_temperature_b),
+    )
 
     import logging
 
@@ -184,6 +197,8 @@ def main(
     name_b: str = "model-b",
     value_checkpoint_a: str = "",
     value_checkpoint_b: str = "",
+    policy_temperature_a: float = 1.0,
+    policy_temperature_b: float = 1.0,
     positions: int = 256,
     simulations: int = 200,
     simulations_b: int = 0,
@@ -213,7 +228,8 @@ def main(
     budget_b = simulations_b or simulations
     print(
         f"{positions} openings -> {len(start_fens)} games; "
-        f"{name_a} at {simulations} simulations, {name_b} at {budget_b}",
+        f"{name_a} at {simulations} simulations (policy T {policy_temperature_a}), "
+        f"{name_b} at {budget_b} (policy T {policy_temperature_b})",
         flush=True,
     )
 
@@ -224,6 +240,8 @@ def main(
             start_fens=start_fens,
             value_checkpoint_a=value_checkpoint_a,
             value_checkpoint_b=value_checkpoint_b,
+            policy_temperature_a=policy_temperature_a,
+            policy_temperature_b=policy_temperature_b,
             simulations=simulations,
             simulations_b=simulations_b,
             exploration=exploration,
@@ -274,6 +292,8 @@ def main(
                     "seed": seed,
                     "openings": openings,
                     "opening_seed": opening_seed,
+                    "policy_temperature_a": policy_temperature_a,
+                    "policy_temperature_b": policy_temperature_b,
                 },
                 "score": score,
                 "confidence_interval": [low, high],

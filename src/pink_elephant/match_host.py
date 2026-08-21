@@ -10,6 +10,7 @@ per model over its own rows.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -26,6 +27,21 @@ from pink_elephant.model import ModelOutput
 
 MODEL_A: int = 0
 MODEL_B: int = 1
+
+
+def apply_policy_temperature(logits: np.ndarray, temperature: float) -> np.ndarray:
+    """Scale logits so the engine's softmax yields a tempered prior.
+
+    The engine softmaxes the legal logits at every expansion, so scaling here
+    tempers the prior in-tree rather than only at the root. Below 1.0 the prior
+    sharpens, concentrating simulations on the model's preferred moves.
+    """
+
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("policy temperature must be finite and positive")
+    if temperature == 1.0:
+        return logits
+    return logits / temperature
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +116,13 @@ class BatchedMatchHost:
         *,
         device: torch.device | str = "cpu",
         autocast: bool = False,
+        policy_temperatures: tuple[float, float] = (1.0, 1.0),
     ) -> None:
         self.device = torch.device(device)
+        for temperature in policy_temperatures:
+            if not math.isfinite(temperature) or temperature <= 0:
+                raise ValueError("policy temperatures must be finite and positive")
+        self.policy_temperatures = policy_temperatures
         if autocast and self.device.type != "cuda":
             raise ValueError("autocast inference requires a CUDA device")
         self.models = (model_a.eval(), model_b.eval())
@@ -139,7 +160,10 @@ class BatchedMatchHost:
                 output = model(inputs.index_select(0, selection))
             if not isinstance(output, ModelOutput):
                 raise TypeError("match models must return ModelOutput")
-            logits[rows] = output.policy_logits.detach().to("cpu", dtype=torch.float32).numpy()
+            logits[rows] = apply_policy_temperature(
+                output.policy_logits.detach().to("cpu", dtype=torch.float32).numpy(),
+                self.policy_temperatures[index],
+            )
             values[rows] = output.value.detach().to("cpu", dtype=torch.float32).reshape(-1).numpy()
             stats.leaves_by_model[index] += int(rows.size)
         stats.forward_seconds += time.perf_counter() - started

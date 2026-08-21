@@ -42,7 +42,9 @@ SOURCE_MOUNT = Path("/source")
 DESTINATION_MOUNT = Path("/dataset")
 DATASET_MANIFEST_NAME = "dataset-manifest.json"
 DATASET_SCHEMA_VERSION = "pink-elephant/self-play-dataset/v1"
-REQUIRED_REPLAY_SCHEMA_VERSION = "self-play/replay/v2"
+# v3 widened `outcome` to float32; v2 shards remain valid input.
+REQUIRED_REPLAY_SCHEMA_VERSION = "self-play/replay/v3"
+SUPPORTED_REPLAY_SCHEMA_VERSIONS = ("self-play/replay/v3", "self-play/replay/v2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,10 +299,10 @@ def _assert_replay_schema_version(path: Path) -> None:
 
     metadata = pq.ParquetFile(path).schema_arrow.metadata or {}
     version = metadata.get(b"schema_version", b"").decode()
-    if version != REQUIRED_REPLAY_SCHEMA_VERSION:
+    if version not in SUPPORTED_REPLAY_SCHEMA_VERSIONS:
         raise ValueError(
-            f"replay shard schema is {version!r}, expected "
-            f"{REQUIRED_REPLAY_SCHEMA_VERSION!r}: {path}"
+            f"replay shard schema is {version!r}, expected one of "
+            f"{SUPPORTED_REPLAY_SCHEMA_VERSIONS!r}: {path}"
         )
 
 

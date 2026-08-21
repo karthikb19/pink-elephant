@@ -234,11 +234,17 @@ class TrainingBatch:
 
 @dataclass(frozen=True)
 class JointLoss:
-    """Differentiable policy, value, and combined losses for one batch."""
+    """Differentiable policy, value, and combined losses for one batch.
+
+    ``policy`` is always the cross-entropy against the search targets, even when
+    an anchor term is blended into ``total``, so the reported policy loss stays
+    comparable across runs with different anchor weights.
+    """
 
     total: Tensor
     policy: Tensor
     value: Tensor
+    anchor: Tensor | None = None
 
 
 @dataclass(frozen=True)

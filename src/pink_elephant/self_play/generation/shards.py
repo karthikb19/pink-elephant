@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 from pink_elephant.self_play.contracts import (
     GAME_SCHEMA_VERSION,
+    LEGACY_REPLAY_SCHEMA_VERSION,
     REPLAY_SCHEMA_VERSION,
     GameRecord,
     GameTableRef,
@@ -40,10 +41,18 @@ _REPLAY_SCHEMA = pa.schema(
             nullable=False,
         ),
         pa.field("selected_action_index", pa.uint16(), nullable=False),
-        pa.field("outcome", pa.int8(), nullable=False),
+        pa.field("outcome", pa.float32(), nullable=False),
         pa.field("root_value", pa.float32(), nullable=False),
         pa.field("game_id", pa.string(), nullable=False),
         pa.field("ply_index", pa.int32(), nullable=False),
+    )
+)
+# v2 shards stored `outcome` as int8. They stay readable: the loader casts the
+# column to float32 either way, and {-1, 0, 1} are exact float32 values.
+_LEGACY_REPLAY_SCHEMA = pa.schema(
+    tuple(
+        pa.field("outcome", pa.int8(), nullable=False) if field.name == "outcome" else field
+        for field in _REPLAY_SCHEMA
     )
 )
 _GAME_SCHEMA = pa.schema(
@@ -60,10 +69,34 @@ _GAME_SCHEMA = pa.schema(
 )
 
 
+def replay_table_schema() -> pa.Schema:
+    """Return the current replay schema with its version metadata attached."""
+
+    return _with_metadata(_REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+
+
 def validate_replay_schema(schema: pa.Schema) -> None:
     """Validate replay columns and version metadata without reading every row."""
 
-    _validate_schema(schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+    _validate_replay_schema(schema)
+
+
+def _validate_replay_schema(schema: pa.Schema) -> None:
+    """Accept the current float-outcome schema or the legacy int8 one."""
+
+    try:
+        _validate_schema(schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+        return
+    except ValueError as current_error:
+        try:
+            _validate_schema(schema, _LEGACY_REPLAY_SCHEMA, LEGACY_REPLAY_SCHEMA_VERSION)
+            return
+        except ValueError as legacy_error:
+            raise ValueError(
+                "replay shard matches neither supported schema version "
+                f"({REPLAY_SCHEMA_VERSION}: {current_error}; "
+                f"{LEGACY_REPLAY_SCHEMA_VERSION}: {legacy_error})"
+            ) from current_error
 
 
 def write_replay_shard(path: Path, rows: Sequence[ReplayRow]) -> ReplayShardRef:
@@ -80,7 +113,7 @@ def write_replay_shard(path: Path, rows: Sequence[ReplayRow]) -> ReplayShardRef:
             np.fromiter(
                 (row.selected_action_index for row in rows), dtype=np.uint16, count=len(rows)
             ),
-            np.fromiter((row.outcome for row in rows), dtype=np.int8, count=len(rows)),
+            np.fromiter((row.outcome for row in rows), dtype=np.float32, count=len(rows)),
             np.fromiter((row.root_value for row in rows), dtype=np.float32, count=len(rows)),
             pa.array(game_ids, type=pa.string()),
             np.fromiter((row.ply_index for row in rows), dtype=np.int32, count=len(rows)),
@@ -109,7 +142,7 @@ def _verify_written_shard(path: Path, written: pa.Table, game_ids: Sequence[str]
     """
 
     table = pq.read_table(path)
-    _validate_schema(table.schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+    _validate_replay_schema(table.schema)
     if not table.equals(written):
         raise RuntimeError(f"written replay shard does not match its source table: {path}")
     if any(game_id == "" for game_id in game_ids):
@@ -175,7 +208,7 @@ def iter_replay_rows(path: Path) -> Iterator[ReplayRow]:
     """Read and validate every row in one replay shard."""
 
     table = pq.read_table(path)
-    _validate_schema(table.schema, _REPLAY_SCHEMA, REPLAY_SCHEMA_VERSION)
+    _validate_replay_schema(table.schema)
     columns = {name: table[name].to_pylist() for name in _REPLAY_SCHEMA.names}
     for values in zip(*(columns[name] for name in _REPLAY_SCHEMA.names), strict=True):
         (
@@ -206,7 +239,7 @@ def iter_replay_rows(path: Path) -> Iterator[ReplayRow]:
             fen=_required_string(fen, "fen"),
             policy=entries,
             selected_action_index=int(selected_action),
-            outcome=int(outcome),
+            outcome=_terminal_outcome(outcome),
             root_value=float(root_value),
             game_id=_required_string(game_id, "game_id"),
             ply_index=int(ply_index),
@@ -393,6 +426,23 @@ def _validate_schema(actual: pa.Schema, expected: pa.Schema, schema_version: str
         raise ValueError("Parquet columns have an incompatible schema")
     if (actual.metadata or {}).get(b"schema_version") != schema_version.encode():
         raise ValueError("Parquet schema version metadata is missing or incorrect")
+
+
+def _terminal_outcome(value: object) -> int:
+    """Read a self-play outcome, refusing a continuous expert value target.
+
+    v3 widened the column to float32 so converted expert rows can carry an engine
+    evaluation. Those rows are not self-play positions and cannot be rebuilt as a
+    `ReplayRow`, so truncating one here would silently corrupt its value target.
+    """
+
+    outcome = float(value)  # type: ignore[arg-type]
+    if outcome not in (-1.0, 0.0, 1.0):
+        raise ValueError(
+            f"replay outcome {outcome} is not a terminal self-play result; "
+            "rows with a continuous value target cannot be read as ReplayRow"
+        )
+    return int(outcome)
 
 
 def _required_string(value: object, name: str) -> str:

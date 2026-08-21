@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,6 +12,7 @@ from pink_elephant.encoding import BOARD_SIZE, PLANE_COUNT
 from pink_elephant.match_host import (
     HeadSwapModel,
     MatchOutcome,
+    apply_policy_temperature,
     paired_start_pool,
     score_match,
 )
@@ -216,3 +218,44 @@ def test_head_swap_rejects_a_model_that_does_not_return_model_output() -> None:
 
     with pytest.raises(TypeError, match="must return ModelOutput"):
         swapped(torch.zeros(2, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE))
+
+
+def test_policy_temperature_below_one_sharpens_the_prior() -> None:
+    logits = np.array([[2.0, 1.0, 0.0]], dtype=np.float32)
+
+    tempered = apply_policy_temperature(logits, 0.5)
+
+    def softmax(row: np.ndarray) -> np.ndarray:
+        shifted = np.exp(row - row.max())
+        return shifted / shifted.sum()
+
+    assert softmax(tempered[0]).max() > softmax(logits[0]).max()
+    assert tempered[0].tolist() == [4.0, 2.0, 0.0]
+
+
+def test_policy_temperature_of_one_returns_the_logits_unchanged() -> None:
+    logits = np.array([[2.0, 1.0, 0.0]], dtype=np.float32)
+
+    assert apply_policy_temperature(logits, 1.0) is logits
+
+
+@pytest.mark.parametrize("temperature", (0.0, -0.5, math.inf, math.nan))
+def test_a_non_positive_policy_temperature_is_rejected(temperature: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        apply_policy_temperature(np.zeros((1, 3), dtype=np.float32), temperature)
+
+
+def test_match_request_rejects_a_non_positive_policy_temperature() -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        MatchRequest(
+            checkpoint_a="a.pt",
+            checkpoint_b="b.pt",
+            start_fens=(WHITE_FEN, WHITE_FEN),
+            simulations=8,
+            simulations_b=0,
+            exploration=1.25,
+            max_plies=64,
+            seed=0,
+            pending_batches=1,
+            policy_temperature_a=0.0,
+        )

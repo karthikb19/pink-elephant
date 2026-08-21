@@ -20,7 +20,10 @@ from pink_elephant.encoding import (
     encode_board,
 )
 
-REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v2"
+# v3 widens `outcome` to float32 so a row can carry a continuous value target,
+# which an engine-evaluated expert row needs and {-1, 0, 1} still represent exactly.
+REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v3"
+LEGACY_REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v2"
 GAME_SCHEMA_VERSION: Final[str] = "self-play/games/v1"
 WORKER_RESULT_SCHEMA_VERSION: Final[str] = "self-play/worker-result/v1"
 ROUND_SCHEMA_VERSION: Final[str] = "self-play/round/v1"

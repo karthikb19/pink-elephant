@@ -33,6 +33,7 @@ CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v2"
 LEGACY_CHECKPOINT_FORMAT_VERSION: Final[str] = "training-checkpoint/v1"
 EXPERT_PRETRAINING_VALUE_WEIGHT: Final[float] = 0.01
 POLICY_HEAD_MODULE_NAME: Final[str] = "policy_head"
+VALUE_HEAD_MODULE_NAME: Final[str] = "value_head"
 
 
 class _ConfigPayload(TypedDict):
@@ -43,6 +44,8 @@ class _ConfigPayload(TypedDict):
     seed: int | None
     grad_clip_norm: float | None
     policy_head_only: NotRequired[bool]
+    value_head_only: NotRequired[bool]
+    policy_anchor_weight: NotRequired[float]
 
 
 class _SchemaPayload(TypedDict):
@@ -85,6 +88,19 @@ class TrainerConfig:
     ``policy_head_only`` trains the policy head alone and leaves the shared
     trunk and the value head exactly as the parent checkpoint stored them, so
     value predictions are unchanged by the run.
+
+    ``value_head_only`` trains the value head alone, freezing the shared trunk as
+    well as the policy head. Freezing only the policy head would not hold the
+    policy fixed: the trunk feeds both heads, so training it moves the policy
+    output too. With the trunk frozen the policy output is bit-identical to the
+    parent's, which makes the result a single network equivalent to grafting a
+    new value head onto the parent.
+
+    ``policy_anchor_weight`` blends a second policy cross-entropy against a
+    frozen reference model's own distribution into the policy objective. Up to a
+    constant that term is the KL divergence from the reference, so it holds a
+    short fine-tune near the prior it started from instead of letting it drift.
+    Zero disables the term and requires no reference model.
     """
 
     learning_rate: float = 1e-3
@@ -94,6 +110,8 @@ class TrainerConfig:
     seed: int | None = None
     grad_clip_norm: float | None = None
     policy_head_only: bool = False
+    value_head_only: bool = False
+    policy_anchor_weight: float = 0.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -109,6 +127,12 @@ class TrainerConfig:
             raise ValueError("weight_decay must be non-negative")
         if self.value_weight < 0:
             raise ValueError("value_weight must be non-negative")
+        if self.policy_head_only and self.value_head_only:
+            raise ValueError("policy_head_only and value_head_only are mutually exclusive")
+        if not math.isfinite(self.policy_anchor_weight):
+            raise ValueError("policy_anchor_weight must be finite")
+        if not 0 <= self.policy_anchor_weight <= 1:
+            raise ValueError("policy_anchor_weight must be in [0, 1]")
         if self.seed is not None and self.seed < 0:
             raise ValueError("seed must be non-negative")
         if self.grad_clip_norm is not None and (
@@ -127,6 +151,8 @@ class TrainerConfig:
             "seed": self.seed,
             "grad_clip_norm": self.grad_clip_norm,
             "policy_head_only": self.policy_head_only,
+            "value_head_only": self.value_head_only,
+            "policy_anchor_weight": self.policy_anchor_weight,
         }
 
     @classmethod
@@ -141,6 +167,8 @@ class TrainerConfig:
             seed=payload["seed"],
             grad_clip_norm=payload["grad_clip_norm"],
             policy_head_only=payload.get("policy_head_only", False),
+            value_head_only=payload.get("value_head_only", False),
+            policy_anchor_weight=payload.get("policy_anchor_weight", 0.0),
         )
 
 
@@ -152,6 +180,7 @@ class TrainingSummary:
     total_loss: float
     policy_loss: float
     value_loss: float
+    anchor_loss: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,11 +290,28 @@ def _policy_cross_entropy(masked_logits: Tensor, batch: TrainingBatch) -> Tensor
         return F.cross_entropy(masked_logits, batch.played_actions)
     if batch.policy_targets.device != masked_logits.device:
         raise ValueError("policy logits and targets must be on the same device")
+    return _soft_policy_cross_entropy(masked_logits, batch.policy_targets, batch.legal_mask)
+
+
+def _soft_policy_cross_entropy(
+    masked_logits: Tensor, targets: Tensor, legal_mask: Tensor
+) -> Tensor:
+    """Return the mean cross-entropy of one dense target distribution."""
+
     log_probabilities = F.log_softmax(masked_logits, dim=1)
-    target_values = batch.policy_targets.masked_select(batch.legal_mask)
-    legal_log_probabilities = log_probabilities.masked_select(batch.legal_mask)
-    legal_terms = target_values * legal_log_probabilities
-    return -legal_terms.sum() / batch.positions.shape[0]
+    legal_terms = targets.masked_select(legal_mask) * log_probabilities.masked_select(legal_mask)
+    return -legal_terms.sum() / masked_logits.shape[0]
+
+
+def anchor_policy_targets(anchor_logits: Tensor, legal_mask: Tensor) -> Tensor:
+    """Return a frozen reference model's legal-masked policy as a dense target.
+
+    Cross-entropy against this target differs from KL(reference || candidate)
+    only by the reference's own entropy, which no candidate parameter can move,
+    so minimizing one minimizes the other.
+    """
+
+    return F.softmax(mask_policy_logits(anchor_logits, legal_mask), dim=1)
 
 
 def _policy_labels(batch: TrainingBatch) -> Tensor:
@@ -281,14 +327,22 @@ def compute_joint_loss(
     batch: TrainingBatch,
     *,
     value_weight: float = EXPERT_PRETRAINING_VALUE_WEIGHT,
+    anchor_logits: Tensor | None = None,
+    anchor_weight: float = 0.0,
 ) -> JointLoss:
     """Compute legal-masked policy loss, scalar value loss, and their sum.
 
     ``value_weight=0.01`` is the expert-PGN pretraining default. Passing
     ``1.0`` selects the equal-weight AlphaZero-style self-play objective.
+
+    A positive ``anchor_weight`` convexly blends cross-entropy against a frozen
+    reference model's policy into the policy objective. The returned ``policy``
+    term stays the unblended search-target cross-entropy so it remains
+    comparable with runs that use no anchor.
     """
 
     _validate_value_weight(value_weight)
+    _validate_anchor_weight(anchor_weight, anchor_logits)
     masked_logits = mask_policy_logits(output.policy_logits, batch.legal_mask)
     value_predictions = _value_predictions(output.value, batch.positions.shape[0])
     if value_predictions.device != batch.outcomes.device:
@@ -297,8 +351,26 @@ def compute_joint_loss(
         raise ValueError("value predictions must contain only finite values")
     policy_loss = _policy_cross_entropy(masked_logits, batch)
     value_loss = F.mse_loss(value_predictions, batch.outcomes)
-    total_loss = policy_loss + value_weight * value_loss
-    return JointLoss(total=total_loss, policy=policy_loss, value=value_loss)
+    anchor_loss: Tensor | None = None
+    policy_objective = policy_loss
+    if anchor_weight > 0 and anchor_logits is not None:
+        if anchor_logits.device != masked_logits.device:
+            raise ValueError("anchor logits and policy logits must be on the same device")
+        anchor_loss = _soft_policy_cross_entropy(
+            masked_logits,
+            anchor_policy_targets(anchor_logits, batch.legal_mask),
+            batch.legal_mask,
+        )
+        policy_objective = (1.0 - anchor_weight) * policy_loss + anchor_weight * anchor_loss
+    total_loss = policy_objective + value_weight * value_loss
+    return JointLoss(total=total_loss, policy=policy_loss, value=value_loss, anchor=anchor_loss)
+
+
+def _validate_anchor_weight(anchor_weight: float, anchor_logits: Tensor | None) -> None:
+    if not math.isfinite(anchor_weight) or not 0 <= anchor_weight <= 1:
+        raise ValueError("anchor_weight must be finite and in [0, 1]")
+    if anchor_weight > 0 and anchor_logits is None:
+        raise ValueError("a positive anchor_weight requires anchor logits")
 
 
 def compute_validation_metrics(output: ModelOutput, batch: TrainingBatch) -> ValidationMetrics:
@@ -399,21 +471,34 @@ def aggregate_validation_metrics(
     )
 
 
+def freeze_non_value_modules(model: nn.Module) -> tuple[nn.Module, ...]:
+    """Freeze every module except the value head and return the frozen ones.
+
+    The trunk is frozen too, so the policy output cannot move at all.
+    """
+
+    return _freeze_all_but(model, VALUE_HEAD_MODULE_NAME)
+
+
 def freeze_non_policy_modules(model: nn.Module) -> tuple[nn.Module, ...]:
     """Freeze every module except the policy head and return the frozen ones."""
 
-    policy_head = getattr(model, POLICY_HEAD_MODULE_NAME, None)
-    if not isinstance(policy_head, nn.Module):
-        raise ValueError(f"policy-head-only training requires a {POLICY_HEAD_MODULE_NAME!r} module")
-    policy_parameter_ids = {id(parameter) for parameter in policy_head.parameters()}
-    if not policy_parameter_ids:
-        raise ValueError("policy head has no parameters to train")
+    return _freeze_all_but(model, POLICY_HEAD_MODULE_NAME)
+
+
+def _freeze_all_but(model: nn.Module, head_name: str) -> tuple[nn.Module, ...]:
+    """Freeze every parameter outside one named head and return the frozen modules."""
+
+    head = getattr(model, head_name, None)
+    if not isinstance(head, nn.Module):
+        raise ValueError(f"head-only training requires a {head_name!r} module")
+    trainable = {id(parameter) for parameter in head.parameters()}
+    if not trainable:
+        raise ValueError(f"{head_name} has no parameters to train")
     for parameter in model.parameters():
-        if id(parameter) not in policy_parameter_ids:
+        if id(parameter) not in trainable:
             parameter.requires_grad_(False)
-    return tuple(
-        module for name, module in model.named_children() if name != POLICY_HEAD_MODULE_NAME
-    )
+    return tuple(module for name, module in model.named_children() if name != head_name)
 
 
 class Trainer:
@@ -437,9 +522,7 @@ class Trainer:
         if model_spec is not None and described_model is not None and model_spec != described_model:
             raise ValueError("explicit model specification does not match the model adapter")
         self.model_spec = model_spec or described_model
-        self.frozen_modules = (
-            freeze_non_policy_modules(self.model) if self.config.policy_head_only else ()
-        )
+        self.frozen_modules = self._freeze_configured_modules()
         self.optimizer = torch.optim.AdamW(
             self.trainable_parameters(),
             lr=self.config.learning_rate,
@@ -448,6 +531,41 @@ class Trainer:
         self.epoch = 0
         self.step = 0
         self.last_validation_metrics: ValidationMetrics | None = None
+        self.policy_anchor: nn.Module | None = None
+
+    def _freeze_configured_modules(self) -> tuple[nn.Module, ...]:
+        if self.config.policy_head_only:
+            return freeze_non_policy_modules(self.model)
+        if self.config.value_head_only:
+            return freeze_non_value_modules(self.model)
+        return ()
+
+    def set_policy_anchor(self, anchor: nn.Module) -> None:
+        """Freeze a reference model whose policy this run is regularized toward.
+
+        The anchor is never registered on the trainer's model, so its parameters
+        stay out of the optimizer and out of every saved checkpoint.
+        """
+
+        if self.config.policy_anchor_weight <= 0:
+            raise ValueError("setting a policy anchor requires a positive policy_anchor_weight")
+        anchored = anchor.to(self.device)
+        anchored.eval()
+        anchored.requires_grad_(False)
+        self.policy_anchor = anchored
+
+    def _anchor_policy_logits(self, batch: TrainingBatch) -> Tensor | None:
+        """Evaluate the frozen anchor on one batch, or return None when unused."""
+
+        if self.config.policy_anchor_weight <= 0:
+            return None
+        if self.policy_anchor is None:
+            raise ValueError("policy_anchor_weight is positive but no anchor was set")
+        with torch.no_grad():
+            output = self.policy_anchor(batch.positions)
+        if not isinstance(output, ModelOutput):
+            raise TypeError("the policy anchor must return pink_elephant.model.ModelOutput")
+        return output.policy_logits
 
     def trainable_parameters(self) -> list[Tensor]:
         """Return the parameters this trainer is allowed to update."""
@@ -505,7 +623,11 @@ class Trainer:
                 self._synchronize_device()
                 phase_started = time.perf_counter()
             losses = compute_joint_loss(
-                self._model_output(batch), batch, value_weight=self.config.value_weight
+                self._model_output(batch),
+                batch,
+                value_weight=self.config.value_weight,
+                anchor_logits=self._anchor_policy_logits(batch),
+                anchor_weight=self.config.policy_anchor_weight,
             )
             if measure_phases:
                 self._synchronize_device()
@@ -535,9 +657,21 @@ class Trainer:
             batch_size = batch.positions.shape[0]
             total_examples += batch_size
             if loss_totals is None:
-                loss_totals = torch.zeros(3, device=losses.total.device, dtype=losses.total.dtype)
+                loss_totals = torch.zeros(4, device=losses.total.device, dtype=losses.total.dtype)
+            anchor_loss = (
+                losses.anchor.detach()
+                if losses.anchor is not None
+                else torch.zeros((), device=losses.total.device, dtype=losses.total.dtype)
+            )
             loss_totals.add_(
-                torch.stack((losses.total.detach(), losses.policy.detach(), losses.value.detach())),
+                torch.stack(
+                    (
+                        losses.total.detach(),
+                        losses.policy.detach(),
+                        losses.value.detach(),
+                        anchor_loss,
+                    )
+                ),
                 alpha=batch_size,
             )
             batch_count += 1
@@ -546,12 +680,15 @@ class Trainer:
         if batch_count == 0 or loss_totals is None:
             raise ValueError("at least one training batch is required")
         self.epoch += 1
-        total_loss, total_policy_loss, total_value_loss = loss_totals.detach().cpu()
+        total_loss, total_policy_loss, total_value_loss, total_anchor_loss = (
+            loss_totals.detach().cpu()
+        )
         return TrainingSummary(
             example_count=total_examples,
             total_loss=float(total_loss) / total_examples,
             policy_loss=float(total_policy_loss) / total_examples,
             value_loss=float(total_value_loss) / total_examples,
+            anchor_loss=float(total_anchor_loss) / total_examples,
         )
 
     def validate(self, batches: Iterable[TrainingBatch]) -> ValidationMetrics:
