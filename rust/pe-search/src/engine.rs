@@ -2,8 +2,13 @@
 //!
 //! The engine owns every game and every tree. The host asks it to fill a buffer
 //! with leaf encodings, runs one model forward pass, and hands the output back.
-//! Games are partitioned into disjoint groups, one per in-flight batch, so a tree
-//! never has two outstanding leaves and virtual loss is not required.
+//! Games are partitioned into disjoint groups, one per in-flight batch, so two
+//! batches never touch the same tree.
+//!
+//! Within one batch a game may contribute up to `max_pending_leaves` rows. Those
+//! descents share a tree with no value between them, so virtual loss is what
+//! keeps them from selecting the same leaf; at the default of one leaf per game
+//! the batch is one row per game and virtual loss never engages.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -112,8 +117,15 @@ impl SelfPlayEngine {
         Ok(engine)
     }
 
+    /// Games per in-flight batch.
     pub fn group_size(&self) -> usize {
         self.config.games / self.config.pending_batches
+    }
+
+    /// Rows one `fill_batch` may write, and therefore the buffer a host must
+    /// provide: one group's games, each allowed its full in-flight leaf count.
+    pub fn batch_rows(&self) -> usize {
+        self.group_size() * self.config.search.max_pending_leaves
     }
 
     pub fn active_games(&self) -> usize {
@@ -176,30 +188,40 @@ impl SelfPlayEngine {
         ));
     }
 
-    /// Fill `buffer` with one leaf encoding per active game in the next group.
+    /// Fill `buffer` with leaf encodings from the next group's active games.
     ///
-    /// Returns the batch ticket and the number of rows written. Rows `[0, count)`
-    /// hold canonical `uint8 (21, 8, 8)` encodings.
+    /// Each game contributes between one and `max_pending_leaves` rows, so
+    /// `buffer` must hold [`SelfPlayEngine::batch_rows`] rows. Returns the batch
+    /// ticket and the number of rows written; rows `[0, count)` hold canonical
+    /// `uint8 (21, 8, 8)` encodings.
     pub fn fill_batch(&mut self, buffer: &mut [u8]) -> Result<(u64, usize), String> {
         let started = Instant::now();
         let group = self
             .next_free_group()
             .ok_or("every batch slot is already in flight; submit one before filling another")?;
         let capacity_rows = buffer.len() / ENCODED_LEN;
-        if capacity_rows < self.groups[group].len() {
+        let max_leaves = self.config.search.max_pending_leaves;
+        let required_rows = self.groups[group].len() * max_leaves;
+        if capacity_rows < required_rows {
             return Err(format!(
-                "buffer holds {} rows but group {} has {} games",
+                "buffer holds {} rows but group {} needs {} ({} games x {} leaves)",
                 capacity_rows,
                 group,
-                self.groups[group].len()
+                required_rows,
+                self.groups[group].len(),
+                max_leaves
             ));
         }
 
-        let mut rows: Vec<usize> = Vec::with_capacity(self.groups[group].len());
-        let mut model_indices: Vec<u8> = Vec::with_capacity(self.groups[group].len());
+        let mut rows: Vec<usize> = Vec::with_capacity(required_rows);
+        let mut model_indices: Vec<u8> = Vec::with_capacity(required_rows);
         let slots = self.groups[group].clone();
         for slot in slots {
-            loop {
+            // A game keeps producing leaves until it blocks on its own in-flight
+            // work, so a game deep in a long search fills several rows while one
+            // that just started a move fills only the first.
+            let mut leaves = 0usize;
+            while leaves < max_leaves {
                 if self.slots[slot].is_none() {
                     break;
                 }
@@ -223,8 +245,9 @@ impl SelfPlayEngine {
                                 .model_index(),
                         );
                         rows.push(slot);
-                        break;
+                        leaves += 1;
                     }
+                    Advance::Blocked => break,
                     Advance::Finished(game) => {
                         self.stats.games_completed += 1;
                         self.stats.positions_recorded += game.positions.len() as u64;

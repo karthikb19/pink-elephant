@@ -8,6 +8,10 @@
 //!   one history-bearing board per node.
 //! * Priors, values, and PUCT scores use `f64`, matching Python's float width so
 //!   visit counts agree rather than merely being close.
+//!
+//! Nodes additionally carry a virtual-visit count, which Python has no analogue
+//! for. It is zero whenever no descent is in flight, and every selection formula
+//! then reduces bit-for-bit to Python's, so parity is unaffected.
 
 use shakmaty::{Color, Move};
 
@@ -33,6 +37,10 @@ struct Node {
     chess_move: Option<Move>,
     visits: u32,
     total_value: f64,
+    /// Descents that have passed through this node and not yet been backed up.
+    /// Counted as visits during selection so a branch a sibling descent is
+    /// already exploring looks temporarily less attractive.
+    virtual_visits: u32,
     expanded: bool,
     terminal: Terminal,
     /// Child arena indices, kept in ascending action-index order so tie-breaking
@@ -48,6 +56,7 @@ impl Node {
             chess_move,
             visits: 0,
             total_value: 0.0,
+            virtual_visits: 0,
             expanded: false,
             terminal: Terminal::Unknown,
             children: Vec::new(),
@@ -60,6 +69,29 @@ impl Node {
             0.0
         } else {
             self.total_value / self.visits as f64
+        }
+    }
+
+    /// Visits plus in-flight descents, the count selection reasons about.
+    #[inline]
+    fn selection_visits(&self) -> u32 {
+        self.visits + self.virtual_visits
+    }
+
+    /// Mean value with each in-flight descent counted as a visit that returned
+    /// `virtual_loss` from this node's own perspective.
+    ///
+    /// At `virtual_loss = 0` this is the modern virtual-visit form: the count
+    /// grows and drags the mean toward a draw without inventing a lost game. At
+    /// `virtual_loss = 1` it degenerates to the classical full virtual loss.
+    /// With no descent in flight it is bit-for-bit `mean_value`.
+    #[inline]
+    fn selection_value(&self, virtual_loss: f64) -> f64 {
+        let visits = self.selection_visits();
+        if visits == 0 {
+            0.0
+        } else {
+            (self.total_value + self.virtual_visits as f64 * virtual_loss) / visits as f64
         }
     }
 }
@@ -106,11 +138,16 @@ impl Tree {
     }
 
     /// Descend from the root to a leaf, reconstructing the leaf's position.
+    ///
+    /// `virtual_loss` shapes how strongly paths already in flight are avoided;
+    /// see [`Node::selection_value`]. It has no effect while nothing is in
+    /// flight, so a single-leaf search is unchanged by it.
     pub fn select_leaf(
         &mut self,
         root: &GamePosition,
         exploration_constant: f64,
         forced_playout_k: f64,
+        virtual_loss: f64,
     ) -> SelectedLeaf {
         let mut path = vec![0u32];
         let mut position = root.clone();
@@ -130,8 +167,10 @@ impl Tree {
             let child = match current {
                 0 => self
                     .forced_playout_child(forced_playout_k)
-                    .unwrap_or_else(|| self.select_child(current, exploration_constant)),
-                _ => self.select_child(current, exploration_constant),
+                    .unwrap_or_else(|| {
+                        self.select_child(current, exploration_constant, virtual_loss)
+                    }),
+                _ => self.select_child(current, exploration_constant, virtual_loss),
             };
             let chess_move = self.nodes[child as usize]
                 .chess_move
@@ -183,9 +222,11 @@ impl Tree {
             return None;
         }
         let children = &self.nodes[0].children;
+        // In-flight descents count here too, so a child whose quota is already
+        // being filled by a sibling descent is not forced a second time.
         let total_visits: u32 = children
             .iter()
-            .map(|&index| self.nodes[index as usize].visits)
+            .map(|&index| self.nodes[index as usize].selection_visits())
             .sum();
         if total_visits == 0 {
             return None;
@@ -193,11 +234,11 @@ impl Tree {
         let mut best: Option<(u32, u32)> = None;
         for &index in children {
             let node = &self.nodes[index as usize];
-            if node.visits == 0 {
+            if node.selection_visits() == 0 {
                 continue;
             }
             let required = Self::forced_playout_count(node.prior, total_visits, forced_playout_k);
-            if node.visits < required {
+            if node.selection_visits() < required {
                 let candidate = (node.action_index, index);
                 if best.is_none_or(|(action, _)| candidate.0 < action) {
                     best = Some(candidate);
@@ -303,15 +344,18 @@ impl Tree {
     }
 
     /// Return the highest-PUCT child, breaking exact ties by lowest action index.
-    fn select_child(&self, parent: u32, exploration_constant: f64) -> u32 {
+    ///
+    /// Both PUCT terms read `selection_visits`, so an in-flight descent shrinks a
+    /// child's exploration bonus as well as pulling its mean toward `virtual_loss`.
+    fn select_child(&self, parent: u32, exploration_constant: f64, virtual_loss: f64) -> u32 {
         let parent_node = &self.nodes[parent as usize];
-        let sqrt_parent_visits = (parent_node.visits as f64).sqrt();
+        let sqrt_parent_visits = (parent_node.selection_visits() as f64).sqrt();
         let mut best: Option<(f64, u32, u32)> = None;
         for &child_index in &parent_node.children {
             let child = &self.nodes[child_index as usize];
-            let score = -child.mean_value()
+            let score = -child.selection_value(virtual_loss)
                 + exploration_constant * child.prior * sqrt_parent_visits
-                    / (1.0 + child.visits as f64);
+                    / (1.0 + child.selection_visits() as f64);
             let candidate = (score, child.action_index, child_index);
             best = match best {
                 None => Some(candidate),
@@ -371,6 +415,39 @@ impl Tree {
         node.children = children;
         node.expanded = true;
         Ok(())
+    }
+
+    /// Whether a node already has children, so a second descent that landed on
+    /// the same leaf can skip expanding it again.
+    pub fn is_expanded(&self, index: u32) -> bool {
+        self.nodes[index as usize].expanded
+    }
+
+    /// Mark a root-to-leaf path as in flight.
+    ///
+    /// Called once per selected leaf, immediately after the descent. Until the
+    /// matching [`Tree::release_virtual_loss`], every node on the path carries an
+    /// extra selection visit, which is what steers the next descent elsewhere.
+    pub fn apply_virtual_loss(&mut self, path: &[u32]) {
+        for &index in path {
+            self.nodes[index as usize].virtual_visits += 1;
+        }
+    }
+
+    /// Undo one [`Tree::apply_virtual_loss`], called as the real value arrives.
+    ///
+    /// Release must precede the backup of that path so the real visit replaces
+    /// the virtual one rather than stacking on it.
+    pub fn release_virtual_loss(&mut self, path: &[u32]) {
+        for &index in path {
+            let node = &mut self.nodes[index as usize];
+            node.virtual_visits = node.virtual_visits.saturating_sub(1);
+        }
+    }
+
+    /// In-flight descents recorded at the root, for tests and assertions.
+    pub fn root_virtual_visits(&self) -> u32 {
+        self.nodes[0].virtual_visits
     }
 
     /// Back a leaf value up the selected path, flipping perspective at each edge.

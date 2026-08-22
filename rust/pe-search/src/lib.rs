@@ -177,6 +177,8 @@ impl PySelfPlayEngine {
         forced_playout_k = 0.0,
         min_visit_fraction = 0.0,
         paired_starts = false,
+        max_pending_leaves = 1,
+        virtual_loss = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -197,6 +199,8 @@ impl PySelfPlayEngine {
         forced_playout_k: f64,
         min_visit_fraction: f64,
         paired_starts: bool,
+        max_pending_leaves: usize,
+        virtual_loss: f64,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -217,6 +221,8 @@ impl PySelfPlayEngine {
                 max_plies,
                 forced_playout_k,
                 min_visit_fraction,
+                max_pending_leaves,
+                virtual_loss,
             },
         };
         SelfPlayEngine::new(config)
@@ -312,8 +318,22 @@ impl PySelfPlayEngine {
         self.inner.accepting_new_games()
     }
 
-    /// Rows written per `fill_batch` when every game is active.
+    /// Rows a `fill_batch` may write, and so the buffer the host must allocate.
+    ///
+    /// This is `games / pending_batches` multiplied by `max_pending_leaves`; at
+    /// the default of one leaf per game it is exactly one row per game.
     fn group_size(&self) -> usize {
+        self.inner.batch_rows()
+    }
+
+    /// The same figure under its accurate name, for hosts that allow a game to
+    /// contribute more than one row.
+    fn batch_rows(&self) -> usize {
+        self.inner.batch_rows()
+    }
+
+    /// Games per in-flight batch, ignoring the per-game leaf allowance.
+    fn games_per_batch(&self) -> usize {
         self.inner.group_size()
     }
 
@@ -397,7 +417,11 @@ impl PyRootSearch {
 
         py.detach(move || -> Result<bool, String> {
             while *completed < simulations {
-                let leaf = tree.select_leaf(position, exploration_constant, forced_playout_k);
+                // A root search keeps one leaf in flight, so virtual loss has
+                // nothing to separate and is fixed at zero to keep this the
+                // exact differential counterpart of the Python search.
+                let leaf =
+                    tree.select_leaf(position, exploration_constant, forced_playout_k, 0.0);
                 if let Some(value) = leaf.terminal_value {
                     tree.backup(&leaf.path, value);
                     *completed += 1;

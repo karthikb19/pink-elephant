@@ -4,6 +4,12 @@
 //! move history, so a batch is assembled from many games that happen to want a
 //! leaf at the same moment. That independence is what makes a variable
 //! simulation budget a later configuration change rather than a redesign.
+//!
+//! A game may also hold several leaves in flight at once (`max_pending_leaves`),
+//! in which case virtual loss keeps those concurrent descents from piling onto
+//! the same branch.
+
+use std::collections::VecDeque;
 
 use rand::Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -36,6 +42,20 @@ pub struct SearchConfig {
     /// Never play a move holding less than this share of the most visited move's
     /// visits. Zero keeps every move eligible.
     pub min_visit_fraction: f64,
+    /// Leaves one game may have in flight at once. One keeps a tree strictly
+    /// sequential and makes `virtual_loss` inert; larger values let a single game
+    /// contribute several rows to a batch, which is what virtual loss exists for.
+    pub max_pending_leaves: usize,
+    /// The value an in-flight descent is assumed to return, from the perspective
+    /// of each node it passes through, until the real value lands.
+    ///
+    /// Zero is the virtual-visit form: the visit count rises, which shrinks the
+    /// exploration bonus and pulls the running mean toward a draw, without
+    /// pretending the branch lost. One is the classical full virtual loss. The
+    /// tradeoff runs both ways: too little and concurrent descents collide on the
+    /// same leaf, too much and they are shoved into branches the search has
+    /// already dismissed. The useful range is therefore small.
+    pub virtual_loss: f64,
 }
 
 impl Default for SearchConfig {
@@ -52,6 +72,8 @@ impl Default for SearchConfig {
             max_plies: 512,
             forced_playout_k: 0.0,
             min_visit_fraction: 0.0,
+            max_pending_leaves: 1,
+            virtual_loss: 0.0,
         }
     }
 }
@@ -86,6 +108,14 @@ impl SearchConfig {
         }
         if self.max_plies < 1 {
             return Err("max_plies must be positive".into());
+        }
+        if self.max_pending_leaves < 1 {
+            return Err("max_pending_leaves must be positive".into());
+        }
+        // A virtual loss above one would claim an outcome worse than a lost game
+        // and could rank a branch below moves that lose outright.
+        if !self.virtual_loss.is_finite() || !(0.0..=1.0).contains(&self.virtual_loss) {
+            return Err("virtual_loss must be finite and in [0, 1]".into());
         }
         Ok(())
     }
@@ -128,6 +158,9 @@ pub enum Advance {
     Finished(Box<CompletedGame>),
     /// The game hit the ply guard without terminating, so it is discarded.
     Truncated,
+    /// No further leaf can be selected until the leaves already in flight are
+    /// evaluated. Only reachable when several leaves per game are allowed.
+    Blocked,
 }
 
 struct PendingLeaf {
@@ -145,8 +178,15 @@ pub struct SelfPlayGame {
     position: GamePosition,
     tree: Tree,
     config: SearchConfig,
+    /// Simulations whose value has landed. The move ends when this reaches the
+    /// budget, which is why it must not count leaves still in flight.
     simulations_done: u32,
-    pending: Option<PendingLeaf>,
+    /// Simulations selected, including those awaiting a value. Gates how many
+    /// more descents may start so a move never overshoots its budget.
+    simulations_started: u32,
+    /// Leaves awaiting evaluation, oldest first. `apply_prediction` consumes the
+    /// front, which is the order the engine writes and submits their rows in.
+    pending: VecDeque<PendingLeaf>,
     moves_uci: Vec<String>,
     recorded: Vec<RecordedPosition>,
     rng: ChaCha8Rng,
@@ -170,7 +210,8 @@ impl SelfPlayGame {
             tree: Tree::new(),
             config,
             simulations_done: 0,
-            pending: None,
+            simulations_started: 0,
+            pending: VecDeque::new(),
             moves_uci: Vec::new(),
             recorded: Vec::new(),
             rng: ChaCha8Rng::seed_from_u64(seed),
@@ -208,7 +249,12 @@ impl SelfPlayGame {
     }
 
     pub fn awaiting_prediction(&self) -> bool {
-        self.pending.is_some()
+        !self.pending.is_empty()
+    }
+
+    /// Leaves this game currently has in flight.
+    pub fn pending_leaves(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn tree_nodes(&self) -> usize {
@@ -221,31 +267,44 @@ impl SelfPlayGame {
         2 * (fullmoves - 1) + u32::from(self.position.turn() == Color::Black)
     }
 
-    /// Advance until this game needs a network evaluation, finishes, or is
-    /// discarded. Terminal leaves are resolved in place and never reach the GPU.
+    /// Advance until this game needs a network evaluation, finishes, is
+    /// discarded, or can make no further progress until its outstanding leaves
+    /// are evaluated. Terminal leaves are resolved in place and never reach the
+    /// GPU.
     pub fn advance(&mut self, out: &mut [u8]) -> Result<Advance, String> {
-        debug_assert!(self.pending.is_none(), "advance while a prediction is pending");
         loop {
-            if let Some(outcome) = self.position.outcome(true) {
-                return Ok(Advance::Finished(Box::new(self.complete(outcome))));
-            }
-            if self.ply() >= self.config.max_plies {
-                return Ok(Advance::Truncated);
-            }
-            if self.simulations_done >= self.simulation_budget() {
-                self.finish_move()?;
-                continue;
+            if self.pending.is_empty() {
+                if let Some(outcome) = self.position.outcome(true) {
+                    return Ok(Advance::Finished(Box::new(self.complete(outcome))));
+                }
+                if self.ply() >= self.config.max_plies {
+                    return Ok(Advance::Truncated);
+                }
+                if self.simulations_done >= self.simulation_budget() {
+                    self.finish_move()?;
+                    continue;
+                }
+            } else if self.pending.len() >= self.config.max_pending_leaves
+                || self.simulations_started >= self.simulation_budget()
+                || !self.tree.root_is_expanded()
+            {
+                // A game with leaves in flight can neither end its move nor its
+                // game, so the only question is whether another descent may
+                // start. The root gate matters most: until the first evaluation
+                // expands the root, every descent would return the bare root and
+                // there would be nothing for virtual loss to separate.
+                return Ok(Advance::Blocked);
             }
 
-            let leaf = self
-                .tree
-                .select_leaf(
-                    &self.position,
-                    self.config.exploration_constant,
-                    self.config.forced_playout_k,
-                );
+            let leaf = self.tree.select_leaf(
+                &self.position,
+                self.config.exploration_constant,
+                self.config.forced_playout_k,
+                self.config.virtual_loss,
+            );
             if let Some(value) = leaf.terminal_value {
                 self.tree.backup(&leaf.path, value);
+                self.simulations_started += 1;
                 self.simulations_done += 1;
                 self.apply_root_exploration_after_first_simulation();
                 continue;
@@ -265,10 +324,12 @@ impl SelfPlayGame {
             legal.sort_by_key(|(index, _)| *index);
 
             leaf.position.encode_into(&mut out[..ENCODED_LEN]);
-            self.pending = Some(PendingLeaf {
+            self.tree.apply_virtual_loss(&leaf.path);
+            self.pending.push_back(PendingLeaf {
                 path: leaf.path,
                 legal,
             });
+            self.simulations_started += 1;
             return Ok(Advance::Leaf);
         }
     }
@@ -280,7 +341,7 @@ impl SelfPlayGame {
     pub fn apply_prediction(&mut self, policy_logits: &[f32], value: f32) -> Result<(), String> {
         let pending = self
             .pending
-            .take()
+            .pop_front()
             .ok_or("received a prediction for a game with no pending leaf")?;
         let gathered: Vec<f64> = pending
             .legal
@@ -289,7 +350,20 @@ impl SelfPlayGame {
             .collect();
         let leaf = *pending.path.last().expect("a path always has a leaf");
         let value = value as f64;
-        self.tree.expand(leaf, &pending.legal, &gathered, value)?;
+        // Release before the backup so the real visit replaces this descent's
+        // virtual one instead of stacking on top of it.
+        self.tree.release_virtual_loss(&pending.path);
+        // Virtual loss makes a collision unlikely, not impossible: a node with a
+        // single child, or one whose prior dwarfs its siblings', can still take
+        // two descents. The first expansion stands and the second evaluation is
+        // backed up as an ordinary extra sample of the same position.
+        if self.tree.is_expanded(leaf) {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                return Err(format!("value must be finite and in [-1, 1], got {value}"));
+            }
+        } else {
+            self.tree.expand(leaf, &pending.legal, &gathered, value)?;
+        }
         self.tree.backup(&pending.path, value);
         self.simulations_done += 1;
         self.apply_root_exploration_after_first_simulation();
@@ -356,6 +430,7 @@ impl SelfPlayGame {
         self.position.play(&chess_move);
         self.tree.reset();
         self.simulations_done = 0;
+        self.simulations_started = 0;
         Ok(())
     }
 
