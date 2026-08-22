@@ -59,6 +59,13 @@ GENERATION_1_MAX_PENDING_LEAVES: Final[int] = 1
 # Zero is a pure virtual visit: an in-flight descent raises the visit count
 # without inventing a lost game. One is the classical full virtual loss.
 GENERATION_1_VIRTUAL_LOSS: Final[float] = 0.0
+# Keep the played move's subtree instead of searching each move from an empty
+# root. Off by default because inherited visits count against the budget, which
+# buys throughput by spending less fresh search per move.
+GENERATION_1_TREE_REUSE: Final[bool] = False
+# Network evaluations cached across every game in a worker, rounded up to a power
+# of two. Zero disables the cache. Roughly 180 bytes an entry.
+GENERATION_1_EVAL_CACHE_ENTRIES: Final[int] = 0
 _SHA256_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -86,6 +93,8 @@ class GenerationSpec:
     min_visit_fraction: float = 0.0
     max_pending_leaves: int = 1
     virtual_loss: float = 0.0
+    tree_reuse: bool = False
+    eval_cache_entries: int = 0
 
     def __post_init__(self) -> None:
         if not self.generation_id or not self.checkpoint_volume_path:
@@ -117,6 +126,8 @@ class GenerationSpec:
         # Above one claims an outcome worse than a lost game.
         if not math.isfinite(self.virtual_loss) or not 0 <= self.virtual_loss <= 1:
             raise ValueError("virtual_loss must be finite and in [0, 1]")
+        if self.eval_cache_entries < 0:
+            raise ValueError("eval_cache_entries must be non-negative")
         if self.base_seed < 0 or self.base_seed >= 2**64:
             raise ValueError("base_seed must be an unsigned 64-bit integer")
         if not self.encoder_version or not self.action_schema_version:
@@ -149,6 +160,12 @@ class GenerationSpec:
         if self.max_pending_leaves != 1 or self.virtual_loss != 0.0:
             payload["max_pending_leaves"] = self.max_pending_leaves
             payload["virtual_loss"] = self.virtual_loss
+        # Reuse carries statistics between moves, so the visit distribution it
+        # records is a different search and must say so. The evaluation cache is
+        # deliberately absent: a hit returns exactly what the network would have,
+        # so it changes throughput and nothing a replay target can see.
+        if self.tree_reuse:
+            payload["tree_reuse"] = self.tree_reuse
         return _sha256_json(payload)
 
     @property
@@ -183,6 +200,8 @@ class GenerationSpec:
             "min_visit_fraction": self.min_visit_fraction,
             "max_pending_leaves": self.max_pending_leaves,
             "virtual_loss": self.virtual_loss,
+            "tree_reuse": self.tree_reuse,
+            "eval_cache_entries": self.eval_cache_entries,
             "start_pool": None if self.start_pool is None else self.start_pool.to_payload(),
             "search_config_sha256": self.search_config_sha256,
         }
@@ -321,6 +340,8 @@ def generation_1_spec(*, base_seed: int = 0) -> GenerationSpec:
         min_visit_fraction=GENERATION_1_MIN_VISIT_FRACTION,
         max_pending_leaves=GENERATION_1_MAX_PENDING_LEAVES,
         virtual_loss=GENERATION_1_VIRTUAL_LOSS,
+        tree_reuse=GENERATION_1_TREE_REUSE,
+        eval_cache_entries=GENERATION_1_EVAL_CACHE_ENTRIES,
         base_seed=base_seed,
     )
 

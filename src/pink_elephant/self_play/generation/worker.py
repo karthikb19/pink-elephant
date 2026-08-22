@@ -820,6 +820,8 @@ def run_native_worker(
         min_visit_fraction=worker.generation.min_visit_fraction,
         max_pending_leaves=worker.generation.max_pending_leaves,
         virtual_loss=worker.generation.virtual_loss,
+        tree_reuse=worker.generation.tree_reuse,
+        eval_cache_entries=worker.generation.eval_cache_entries,
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(
@@ -830,6 +832,8 @@ def run_native_worker(
             "generation_id": worker.generation.generation_id,
             "inference_batch_rows": host.rows,
             "max_pending_leaves": worker.generation.max_pending_leaves,
+            "tree_reuse": worker.generation.tree_reuse,
+            "eval_cache_entries": engine.eval_cache_capacity(),
             "invocation_id": worker.invocation_id,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,

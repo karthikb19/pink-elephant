@@ -259,6 +259,52 @@ def test_native_worker_runs_with_several_leaves_per_game(tmp_path: Path) -> None
     assert result.search_config_sha256 != _generation().search_config_sha256
 
 
+def test_native_worker_runs_with_tree_reuse_and_the_evaluation_cache(tmp_path: Path) -> None:
+    generation = replace(
+        _generation(),
+        simulations_per_move=8,
+        tree_reuse=True,
+        eval_cache_entries=1 << 12,
+    )
+    round_spec = _round(generation, "reuse-round", positions=2, games=2)
+    worker = _worker(generation, round_spec)
+
+    result = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    assert result.position_count >= worker.position_lower_bound
+    assert result.completed_game_count >= 1
+    assert result.search_config_sha256 == generation.search_config_sha256
+    assert result.search_config_sha256 != _generation().search_config_sha256
+
+
+def test_the_evaluation_cache_answers_repeated_positions() -> None:
+    """Every hit is a forward pass the GPU never runs."""
+
+    engine = pe_search.SelfPlayEngine(
+        games=8,
+        seed=5,
+        game_id_prefix="cache-test",
+        simulations=16,
+        dirichlet_fraction=0.0,
+        temperature_cutoff_ply=4,
+        max_plies=60,
+        eval_cache_entries=1 << 16,
+    )
+    assert engine.eval_cache_capacity() == 1 << 16
+    _drive_engine(engine, iterations=200)
+
+    stats = engine.stats()
+    assert stats["eval_cache_hits"] > 0
+    assert stats["eval_cache_hits"] + stats["eval_cache_misses"] > 0
+
+
+def test_the_evaluation_cache_is_off_by_default() -> None:
+    engine = pe_search.SelfPlayEngine(games=2, seed=5, game_id_prefix="cache-test")
+    assert engine.eval_cache_capacity() == 0
+    _drive_engine(engine, iterations=50)
+    assert engine.stats()["eval_cache_hits"] == 0
+
+
 def test_native_worker_refuses_a_non_empty_invocation_directory(tmp_path: Path) -> None:
     generation = _generation()
     round_spec = _round(generation, "collision-round", positions=2)

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::action::POLICY_SIZE;
+use crate::cache::EvalCache;
 use crate::encoding::ENCODED_LEN;
 use crate::game::{Advance, CompletedGame, SearchConfig, SelfPlayGame};
 use crate::position::GamePosition;
@@ -33,6 +34,10 @@ pub struct EngineConfig {
     /// 2k and 2k+1 on one position with the colours swapped. A match needs every
     /// opening played from both sides, which random selection cannot guarantee.
     pub paired_starts: bool,
+    /// Network evaluations to cache across every game, rounded up to a power of
+    /// two. Zero disables the cache. The table is shared engine-wide because the
+    /// overlap worth exploiting is mostly between games, not within one.
+    pub eval_cache_entries: usize,
     pub search: SearchConfig,
 }
 
@@ -67,6 +72,9 @@ pub struct EngineStats {
     pub fill_seconds: f64,
     pub submit_seconds: f64,
     pub max_tree_nodes: u64,
+    /// Leaves answered from the cache, each one a forward pass not run.
+    pub eval_cache_hits: u64,
+    pub eval_cache_misses: u64,
 }
 
 struct Ticket {
@@ -88,6 +96,7 @@ pub struct SelfPlayEngine {
     finished: Vec<CompletedGame>,
     accepting_new_games: bool,
     next_game_ordinal: u64,
+    cache: EvalCache,
     stats: EngineStats,
 }
 
@@ -108,6 +117,7 @@ impl SelfPlayEngine {
             finished: Vec::new(),
             accepting_new_games: true,
             next_game_ordinal: 0,
+            cache: EvalCache::new(config.eval_cache_entries),
             stats: EngineStats::default(),
             config,
         };
@@ -134,6 +144,12 @@ impl SelfPlayEngine {
 
     pub fn stats(&self) -> &EngineStats {
         &self.stats
+    }
+
+    /// Entries the shared evaluation cache holds, after rounding to a power of
+    /// two. Zero means the cache is disabled.
+    pub fn eval_cache_capacity(&self) -> usize {
+        self.cache.capacity()
     }
 
     /// Which model owns each row of a filled batch: 0 for A, 1 for B.
@@ -230,7 +246,7 @@ impl SelfPlayEngine {
                 let advance = self.slots[slot]
                     .as_mut()
                     .expect("slot checked above")
-                    .advance(window)?;
+                    .advance(window, &mut self.cache)?;
                 match advance {
                     Advance::Leaf => {
                         let nodes = self.slots[slot]
@@ -323,17 +339,20 @@ impl SelfPlayEngine {
             return Err(format!("expected {} values, got {}", count, values.len()));
         }
 
+        let cache = &mut self.cache;
         for (row, &slot) in ticket.rows.iter().enumerate() {
-            let game = self
-                .slots[slot]
+            let game = self.slots[slot]
                 .as_mut()
                 .ok_or("a submitted row refers to an empty slot")?;
             game.apply_prediction(
                 &policy_logits[row * POLICY_SIZE..(row + 1) * POLICY_SIZE],
                 values[row],
+                cache,
             )?;
         }
         self.busy_groups[ticket.group] = false;
+        self.stats.eval_cache_hits = self.cache.hits();
+        self.stats.eval_cache_misses = self.cache.misses();
         self.stats.submit_seconds += started.elapsed().as_secs_f64();
         Ok(())
     }

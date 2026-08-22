@@ -6,6 +6,7 @@
 //! and stays a valid differential counterpart to the Python implementation.
 
 use pe_search::action::{policy_index, POLICY_SIZE};
+use pe_search::cache::EvalCache;
 use pe_search::encoding::ENCODED_LEN;
 use pe_search::engine::{EngineConfig, SelfPlayEngine};
 use pe_search::game::{Advance, SearchConfig, SelfPlayGame};
@@ -202,6 +203,7 @@ fn config(games: usize, pending: usize, simulations: u32, max_pending_leaves: us
         game_id_prefix: "vl".into(),
         start_fens: Vec::new(),
         paired_starts: false,
+        eval_cache_entries: 0,
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,
@@ -315,6 +317,7 @@ fn a_move_never_exceeds_its_simulation_budget() {
     );
 
     let mut buffer = vec![0u8; ENCODED_LEN];
+    let mut cache = EvalCache::new(0);
     let mut logits = Vec::new();
     let mut values = Vec::new();
     let mut queued = Vec::new();
@@ -324,7 +327,7 @@ fn a_move_never_exceeds_its_simulation_budget() {
     let mut moves_seen = 0u32;
 
     for _ in 0..20_000 {
-        let advance = game.advance(&mut buffer).expect("advance");
+        let advance = game.advance(&mut buffer, &mut cache).expect("advance");
         // A played move rebuilds the tree from a single root, and that shrink is
         // the only externally visible move boundary. It has to be read before
         // the leaf is counted, because the move is played inside the same
@@ -350,7 +353,7 @@ fn a_move_never_exceeds_its_simulation_budget() {
                 assert!(game.pending_leaves() <= 5);
                 for encoded in queued.drain(..) {
                     evaluate(&encoded, 1, &mut logits, &mut values);
-                    game.apply_prediction(&logits, values[0]).expect("predict");
+                    game.apply_prediction(&logits, values[0], &mut cache).expect("predict");
                 }
             }
             Advance::Finished(_) | Advance::Truncated => break,

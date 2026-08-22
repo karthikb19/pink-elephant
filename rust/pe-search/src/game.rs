@@ -19,6 +19,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{Color, Move, Position};
 
 use crate::action::policy_index;
+use crate::cache::{hash_encoded, EvalCache, EvalKey};
 use crate::encoding::ENCODED_LEN;
 use crate::position::GamePosition;
 use crate::tree::Tree;
@@ -56,6 +57,10 @@ pub struct SearchConfig {
     /// same leaf, too much and they are shoved into branches the search has
     /// already dismissed. The useful range is therefore small.
     pub virtual_loss: f64,
+    /// Keep the played move's subtree as the next move's root instead of
+    /// searching from scratch. Inherited visits count against the budget, so the
+    /// saving is GPU work rather than a deeper tree.
+    pub tree_reuse: bool,
 }
 
 impl Default for SearchConfig {
@@ -74,6 +79,7 @@ impl Default for SearchConfig {
             min_visit_fraction: 0.0,
             max_pending_leaves: 1,
             virtual_loss: 0.0,
+            tree_reuse: false,
         }
     }
 }
@@ -168,6 +174,9 @@ struct PendingLeaf {
     /// Legal `(action index, move)` pairs in ascending action order, retained so
     /// `submit` never needs the leaf position again and Python never sees them.
     legal: Vec<(u32, Move)>,
+    /// Digest of the encoding sent to the network, so the answer can be cached
+    /// without re-encoding the position.
+    key: EvalKey,
 }
 
 pub struct SelfPlayGame {
@@ -187,6 +196,11 @@ pub struct SelfPlayGame {
     /// Leaves awaiting evaluation, oldest first. `apply_prediction` consumes the
     /// front, which is the order the engine writes and submits their rows in.
     pending: VecDeque<PendingLeaf>,
+    /// Whether this move's root has already been given its temperature and
+    /// noise. A reused root is expanded from the start, so the old "apply at
+    /// simulation one" rule would never fire and the search would silently lose
+    /// its exploration noise for every move after the first.
+    root_exploration_applied: bool,
     moves_uci: Vec<String>,
     recorded: Vec<RecordedPosition>,
     rng: ChaCha8Rng,
@@ -212,6 +226,7 @@ impl SelfPlayGame {
             simulations_done: 0,
             simulations_started: 0,
             pending: VecDeque::new(),
+            root_exploration_applied: false,
             moves_uci: Vec::new(),
             recorded: Vec::new(),
             rng: ChaCha8Rng::seed_from_u64(seed),
@@ -257,6 +272,11 @@ impl SelfPlayGame {
         self.pending.len()
     }
 
+    /// Whether the current move's root has had its temperature and noise applied.
+    pub fn root_exploration_applied(&self) -> bool {
+        self.root_exploration_applied
+    }
+
     pub fn tree_nodes(&self) -> usize {
         self.tree.node_count()
     }
@@ -271,7 +291,7 @@ impl SelfPlayGame {
     /// discarded, or can make no further progress until its outstanding leaves
     /// are evaluated. Terminal leaves are resolved in place and never reach the
     /// GPU.
-    pub fn advance(&mut self, out: &mut [u8]) -> Result<Advance, String> {
+    pub fn advance(&mut self, out: &mut [u8], cache: &mut EvalCache) -> Result<Advance, String> {
         loop {
             if self.pending.is_empty() {
                 if let Some(outcome) = self.position.outcome(true) {
@@ -306,7 +326,7 @@ impl SelfPlayGame {
                 self.tree.backup(&leaf.path, value);
                 self.simulations_started += 1;
                 self.simulations_done += 1;
-                self.apply_root_exploration_after_first_simulation();
+                self.apply_root_exploration();
                 continue;
             }
 
@@ -324,10 +344,24 @@ impl SelfPlayGame {
             legal.sort_by_key(|(index, _)| *index);
 
             leaf.position.encode_into(&mut out[..ENCODED_LEN]);
+            // The encoding is exactly what the network would be shown, so a hit
+            // is the answer it would have given. `out` is simply left to be
+            // overwritten by the next leaf.
+            let key = hash_encoded(&out[..ENCODED_LEN]);
+            if let Some((logits, value)) = cache.get(key) {
+                let gathered: Vec<f64> = logits.iter().map(|&logit| logit as f64).collect();
+                let value = value as f64;
+                self.resolve_leaf(&leaf.path, &legal, &gathered, value)?;
+                self.simulations_started += 1;
+                self.simulations_done += 1;
+                self.apply_root_exploration();
+                continue;
+            }
             self.tree.apply_virtual_loss(&leaf.path);
             self.pending.push_back(PendingLeaf {
                 path: leaf.path,
                 legal,
+                key,
             });
             self.simulations_started += 1;
             return Ok(Advance::Leaf);
@@ -338,45 +372,70 @@ impl SelfPlayGame {
     ///
     /// `policy_logits` is the full 4,672-wide row; gathering the legal subset
     /// happens here so the host never computes or ships legal action indices.
-    pub fn apply_prediction(&mut self, policy_logits: &[f32], value: f32) -> Result<(), String> {
+    pub fn apply_prediction(
+        &mut self,
+        policy_logits: &[f32],
+        value: f32,
+        cache: &mut EvalCache,
+    ) -> Result<(), String> {
         let pending = self
             .pending
             .pop_front()
             .ok_or("received a prediction for a game with no pending leaf")?;
-        let gathered: Vec<f64> = pending
+        let legal_logits: Vec<f32> = pending
             .legal
             .iter()
-            .map(|(index, _)| policy_logits[*index as usize] as f64)
+            .map(|(index, _)| policy_logits[*index as usize])
             .collect();
-        let leaf = *pending.path.last().expect("a path always has a leaf");
-        let value = value as f64;
+        cache.insert(pending.key, &legal_logits, value);
+        let gathered: Vec<f64> = legal_logits.iter().map(|&logit| logit as f64).collect();
         // Release before the backup so the real visit replaces this descent's
         // virtual one instead of stacking on top of it.
         self.tree.release_virtual_loss(&pending.path);
-        // Virtual loss makes a collision unlikely, not impossible: a node with a
-        // single child, or one whose prior dwarfs its siblings', can still take
-        // two descents. The first expansion stands and the second evaluation is
-        // backed up as an ordinary extra sample of the same position.
+        self.resolve_leaf(&pending.path, &pending.legal, &gathered, value as f64)?;
+        self.simulations_done += 1;
+        self.apply_root_exploration();
+        Ok(())
+    }
+
+    /// Expand a leaf from one evaluation and back its value up the path.
+    ///
+    /// Virtual loss makes a collision unlikely, not impossible: a node with a
+    /// single child, or one whose prior dwarfs its siblings', can still take two
+    /// descents, and a cached answer can land on a leaf another descent is
+    /// already out evaluating. The first expansion stands and the second
+    /// evaluation is backed up as an ordinary extra sample of the same position.
+    fn resolve_leaf(
+        &mut self,
+        path: &[u32],
+        legal: &[(u32, Move)],
+        gathered: &[f64],
+        value: f64,
+    ) -> Result<(), String> {
+        let leaf = *path.last().expect("a path always has a leaf");
         if self.tree.is_expanded(leaf) {
             if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
                 return Err(format!("value must be finite and in [-1, 1], got {value}"));
             }
         } else {
-            self.tree.expand(leaf, &pending.legal, &gathered, value)?;
+            self.tree.expand(leaf, legal, gathered, value)?;
         }
-        self.tree.backup(&pending.path, value);
-        self.simulations_done += 1;
-        self.apply_root_exploration_after_first_simulation();
+        self.tree.backup(path, value);
         Ok(())
     }
 
-    /// Apply root policy temperature and Dirichlet noise once per move, after the
-    /// first simulation has expanded the root. This mirrors the Python
+    /// Apply root policy temperature and Dirichlet noise once per move, as soon
+    /// as the root has children to apply them to. This mirrors the Python
     /// `root_prior_modifier` contract, which is only consulted at simulation zero.
-    fn apply_root_exploration_after_first_simulation(&mut self) {
-        if self.simulations_done != 1 || !self.tree.root_is_expanded() {
+    ///
+    /// A fresh root is expanded by its first simulation, so this fires exactly
+    /// where the old "at simulation one" rule did. A reused root arrives already
+    /// expanded and is noised the moment it is promoted.
+    fn apply_root_exploration(&mut self) {
+        if self.root_exploration_applied || !self.tree.root_is_expanded() {
             return;
         }
+        self.root_exploration_applied = true;
         self.tree
             .apply_root_policy_temperature(self.config.root_policy_temperature);
         if self.config.dirichlet_fraction <= 0.0 {
@@ -428,9 +487,21 @@ impl SelfPlayGame {
             .push(UciMove::from_standard(&chess_move).to_string());
 
         self.position.play(&chess_move);
-        self.tree.reset();
-        self.simulations_done = 0;
-        self.simulations_started = 0;
+        self.root_exploration_applied = false;
+        // Inherited visits count against the budget, so a reused subtree is spent
+        // as search already done rather than as a deeper tree. That is what turns
+        // reuse into evaluations the GPU never runs.
+        if self.config.tree_reuse && self.tree.promote_child(selected) {
+            self.simulations_done = self.tree.root_visits();
+            self.simulations_started = self.simulations_done;
+            // A promoted root is already expanded, so its noise cannot wait for a
+            // first simulation that will never expand anything.
+            self.apply_root_exploration();
+        } else {
+            self.tree.reset();
+            self.simulations_done = 0;
+            self.simulations_started = 0;
+        }
         Ok(())
     }
 

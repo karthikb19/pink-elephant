@@ -417,6 +417,58 @@ impl Tree {
         Ok(())
     }
 
+    /// Make the child on `action_index` the new root, keeping its subtree.
+    ///
+    /// The rest of the tree is dropped. Every retained node keeps its visits,
+    /// value, priors, and resolved terminal status: a node's position and history
+    /// do not change when the game advances into it, so its statistics stay
+    /// exactly as valid as they were.
+    ///
+    /// Returns false when no such child exists, leaving the tree untouched so the
+    /// caller can fall back to a fresh root.
+    pub fn promote_child(&mut self, action_index: u32) -> bool {
+        let Some(&child) = self.nodes[0]
+            .children
+            .iter()
+            .find(|&&index| self.nodes[index as usize].action_index == action_index)
+        else {
+            return false;
+        };
+        debug_assert_eq!(
+            self.nodes[0].virtual_visits, 0,
+            "a tree is promoted only between moves, with nothing in flight"
+        );
+
+        // Copy the subtree breadth-first into a fresh arena. Each node is pushed
+        // holding its old child indices, then those are rewritten as the children
+        // are themselves copied, so one pass both compacts and remaps.
+        let mut promoted = vec![self.nodes[child as usize].clone()];
+        let mut head = 0;
+        while head < promoted.len() {
+            let old_children = std::mem::take(&mut promoted[head].children);
+            let mut remapped = Vec::with_capacity(old_children.len());
+            for old in old_children {
+                remapped.push(promoted.len() as u32);
+                promoted.push(self.nodes[old as usize].clone());
+            }
+            promoted[head].children = remapped;
+            head += 1;
+        }
+
+        // The new root has no edge leading into it.
+        promoted[0].prior = 1.0;
+        promoted[0].action_index = u32::MAX;
+        promoted[0].chess_move = None;
+        self.nodes = promoted;
+        true
+    }
+
+    /// Visits already standing at the root, which is what a promoted subtree
+    /// carries into the next move.
+    pub fn root_visits(&self) -> u32 {
+        self.nodes[0].visits
+    }
+
     /// Whether a node already has children, so a second descent that landed on
     /// the same leaf can skip expanding it again.
     pub fn is_expanded(&self, index: u32) -> bool {

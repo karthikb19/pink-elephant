@@ -17,6 +17,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     GENERATION_1_DIRICHLET_ALPHA,
     GENERATION_1_DIRICHLET_FRACTION,
+    GENERATION_1_EVAL_CACHE_ENTRIES,
     GENERATION_1_FORCED_PLAYOUT_K,
     GENERATION_1_ID,
     GENERATION_1_MAX_PENDING_LEAVES,
@@ -28,6 +29,7 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_SHARD_POSITION_LIMIT,
     GENERATION_1_SIMULATIONS,
     GENERATION_1_TEMPERATURE_CUTOFF_PLY,
+    GENERATION_1_TREE_REUSE,
     GENERATION_1_VIRTUAL_LOSS,
     GENERATION_1_WORKER_COUNT,
     GenerationRoundSpec,
@@ -175,6 +177,8 @@ def _generate_worker_modal(
         # descent, so it would silently ignore both settings rather than fail.
         if worker.generation.max_pending_leaves != 1 or worker.generation.virtual_loss != 0.0:
             raise ValueError("virtual loss requires the native search backend")
+        if worker.generation.tree_reuse or worker.generation.eval_cache_entries:
+            raise ValueError("tree reuse and the evaluation cache require the native backend")
         evaluator = load_generation_evaluator(
             checkpoint_path,
             worker,
@@ -515,6 +519,8 @@ def main(
     min_visit_fraction: float = GENERATION_1_MIN_VISIT_FRACTION,
     max_pending_leaves: int = GENERATION_1_MAX_PENDING_LEAVES,
     virtual_loss: float = GENERATION_1_VIRTUAL_LOSS,
+    tree_reuse: bool = GENERATION_1_TREE_REUSE,
+    eval_cache_entries: int = GENERATION_1_EVAL_CACHE_ENTRIES,
     start_pool_size: int = DEFAULT_START_POOL_SIZE,
     startpos_weight: float = DEFAULT_START_MIX.startpos,
     opening_book_weight: float = DEFAULT_START_MIX.opening_book,
@@ -554,6 +560,8 @@ def main(
         min_visit_fraction=min_visit_fraction,
         max_pending_leaves=max_pending_leaves,
         virtual_loss=virtual_loss,
+        tree_reuse=tree_reuse,
+        eval_cache_entries=eval_cache_entries,
         simulations_per_move=simulations,
         exploration_constant=exploration_constant,
         dirichlet_alpha=dirichlet_alpha,

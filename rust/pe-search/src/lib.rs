@@ -6,6 +6,7 @@
 //! the GIL released.
 
 pub mod action;
+pub mod cache;
 pub mod encoding;
 pub mod engine;
 pub mod game;
@@ -179,6 +180,8 @@ impl PySelfPlayEngine {
         paired_starts = false,
         max_pending_leaves = 1,
         virtual_loss = 0.0,
+        tree_reuse = false,
+        eval_cache_entries = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -201,6 +204,8 @@ impl PySelfPlayEngine {
         paired_starts: bool,
         max_pending_leaves: usize,
         virtual_loss: f64,
+        tree_reuse: bool,
+        eval_cache_entries: usize,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -209,6 +214,7 @@ impl PySelfPlayEngine {
             game_id_prefix,
             start_fens,
             paired_starts,
+            eval_cache_entries,
             search: SearchConfig {
                 simulations,
                 simulations_b,
@@ -223,6 +229,7 @@ impl PySelfPlayEngine {
                 min_visit_fraction,
                 max_pending_leaves,
                 virtual_loss,
+                tree_reuse,
             },
         };
         SelfPlayEngine::new(config)
@@ -332,6 +339,12 @@ impl PySelfPlayEngine {
         self.inner.batch_rows()
     }
 
+    /// Entries the shared evaluation cache holds, after rounding to a power of
+    /// two. Zero means the cache is disabled.
+    fn eval_cache_capacity(&self) -> usize {
+        self.inner.eval_cache_capacity()
+    }
+
     /// Games per in-flight batch, ignoring the per-game leaf allowance.
     fn games_per_batch(&self) -> usize {
         self.inner.group_size()
@@ -348,6 +361,9 @@ impl PySelfPlayEngine {
         dict.set_item("fill_seconds", stats.fill_seconds)?;
         dict.set_item("submit_seconds", stats.submit_seconds)?;
         dict.set_item("max_tree_nodes", stats.max_tree_nodes)?;
+        dict.set_item("eval_cache_hits", stats.eval_cache_hits)?;
+        dict.set_item("eval_cache_misses", stats.eval_cache_misses)?;
+        dict.set_item("eval_cache_capacity", self.inner.eval_cache_capacity())?;
         Ok(dict)
     }
 }
