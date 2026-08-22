@@ -87,15 +87,42 @@ target, not a delta.
 **Matches need `--detach`.** One 512-game match was cancelled at 438 games when
 the local client disconnected, wasting ~14 minutes of A100.
 
-## Promotion candidate
+## Promotion candidate, and what it becomes
 
 ```
 runs/20260822T203909Z-combined-3m-400-200-800-anchor-030/checkpoints/
   20260822T203909Z-combined-3m-400-200-800-anchor-030-epoch-000002-step-000006628.pt
+
+sha256  fdc2d038c3f2cb7fa03dcd00f47f9d8edadccd2a568464a3436592d1090e81fe
 ```
 
-Not yet run against this checkpoint: the value-anchor evaluation (mixed-1m's
-balanced MSE 0.0551 is the bar) and the 800-simulation promotion gate.
+**Checkpoints are never renamed.** A promotion is an edit to
+`src/pink_elephant/self_play/generation/config.py`: the next generation gets a
+new identity constant and points at this file. Following the existing
+`GENERATION_1_*` block, that is a `GENERATION_2_*` block with
+`GENERATION_2_ID = "generation-000002"`, `GENERATION_2_CHECKPOINT_VOLUME_PATH`
+set to the path above, and `GENERATION_2_CHECKPOINT_SHA256` set to the digest
+above. The run-derived filename stays as it is; the generation id is the name
+that changes.
+
+**Do not make that edit yet.** Two gates are unrun:
+
+1. **Value anchor.** Balanced MSE against engine evals, versus mixed-1m's
+   0.0551. This is a hard fail if materially worse. In-distribution validation
+   MSE (0.0971 for this checkpoint) is a different measurement and says nothing
+   about this bar.
+2. **Promotion gate at generation depth.** The convention is candidate vs parent
+   at the generation's own simulation count, 512+ games, AGZ-style **≥ 55%** to
+   promote as the next generator.
+
+On the second gate there is a wrinkle worth deciding deliberately. The gate was
+written for the 800-simulation generation and specifies "the generation depth",
+but this dataset's largest and newest component was generated at **400**
+simulations, and the measured 0.5684 was at **200**. That 0.5684 clears 55%, but
+not at any of the depths the gate names. Run 400 sims (the depth that produced
+most of the data) or 800 (the depth the convention was written at, and the
+harder test) and record which was chosen and why — do not let the 200-sim number
+stand in for either.
 
 ## Open questions
 
