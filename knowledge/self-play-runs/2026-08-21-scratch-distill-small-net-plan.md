@@ -24,49 +24,92 @@ The self-amplification and tail diagnostics below separate them.
 
 ## Model
 
-`ResNetConfig(channels=128, residual_blocks=6)` (`model.py` — already fully
-parameterized; the parent is the larger production config, read its exact
-channels/blocks from the checkpoint rather than from memory). Optional second
-size 128×10 if the 128×6 result is interesting. Random init. Record the
+`ResNetConfig(channels=128, residual_blocks=6)`, **random init** — no parent
+weights, no anchor. `model.py` is fully parameterized and `build_model()`
+constructs any spec, so this is a config change, not a modelling change.
+Optional second size 128×10 if the 128×6 result is interesting. Record the
 parameter count in the run manifest.
 
-## Data — phased, one dataset at a time
+Note the coupling that has to be broken: the learning app takes its
+architecture from the *dataset* — `model_spec = replay.manifest.sources[0]
+.model_spec` (`self_play/learning/modal_app.py:243`), i.e. the generating
+(large) net's spec. Scratch training needs that overridable.
+
+## Data — one dataset at a time
 
 - **Phase 1 (this plan's deliverable)**: the 200-sim blended generation on
-  `pink-elephant-self-play-datasets-v2` — **718,742 positions, 9,135 games**
-  (no forced playouts, no visit floor; targets are unpruned visit
-  distributions — that is fine, it is the condition under test).
-- Phase 2 (later): the 800-sim pruned generation on `...-datasets-800sims`
-  (582,800 positions) — stronger teacher, pruned targets.
-- Phase 3 (later): both combined (~1.3M).
+  `pink-elephant-self-play-datasets-v2` — **718,742 positions, 9,135 games**;
+  no forced playouts, no visit floor, so the targets are *unpruned* visit
+  distributions. That is deliberate: unpruned soft targets are the condition
+  under test.
+- Phase 2 (later): the 800-sim generation on
+  `pink-elephant-self-play-datasets-800sims` (582,800 positions), selected via
+  `PE_DATASET_VOLUME`. Stronger teacher — but its targets are *pruned*
+  (`forced_playout_k = 2.0`, `min_visit_fraction = 0.1`), so 200-sim vs
+  800-sim moves two variables at once (teacher strength *and* target
+  treatment). Read it as a second data point, never as a clean sims ablation.
+- Phase 3 (later): both combined (~1.3M). This one needs
+  `--replay-capacity` raised — the default is 1,000,000
+  (`learning/replay.py:38`), which covers phases 1 and 2 but silently caps
+  phase 3.
 
 No expert rows anywhere in this experiment — pure distillation from search.
 
 ## Training
 
-- From scratch: random init, **no parent checkpoint, no KL anchor**
-  (`policy_anchor_weight = 0`).
+- Random init, **no parent checkpoint, no KL anchor**
+  (`policy_anchor_weight = 0`, already the default).
 - Soft CE on the visit-distribution targets; blended value target as usual;
-  `value_weight = 0.25` to start (note: a from-scratch value head may want
-  more — if the value head looks untrained after phase 1, rerun at 1.0; do
-  not change it mid-run).
-- Learning rate: 5e-5 is a fine-tune rate, wrong for scratch. Use the expert
-  pretraining schedule that built the parent (look it up in
-  `modal_training.py` rather than guessing), or 1e-3 with a short warmup if
-  that path is awkward to reuse.
+  `value_weight = 0.25` to start (a from-scratch value head may want more — if
+  it looks untrained after phase 1, rerun at 1.0; do not change it mid-run).
+- **Learning rate 3e-4**, no warmup: that is `MODAL_LEARNING_RATE`
+  (`modal_training.py:40`), the rate that trained the existing from-scratch
+  10M-position net, and the Trainer runs a plain optimizer with no scheduler.
+  The self-play app's 1e-4 default is a fine-tune rate and is wrong here.
 - Batch 1024. **10 epochs over the same 718k positions, checkpoint every
-  epoch.** Overfitting is expected and is part of the experiment — the
-  per-epoch curve is a deliverable, not a failure.
+  epoch** (`checkpoint_interval = 1`, already the default). Overfitting is
+  expected and is part of the experiment — the per-epoch curve is a
+  deliverable, not a failure.
+- **`validation_fraction = 0`** — train on all 718,742 positions. This is the
+  one requested setting the code actively rejects today; see below.
+
+### On holding out nothing
+
+Worth saying plainly, then proceeding as asked: at 5% the holdout is ~36k
+positions, and validation CE is the cheapest per-epoch overfitting signal in
+a run whose headline deliverable *is* the overfitting curve. Training CE on
+data the net has already memorized will keep falling and tell us little.
+If a compromise is wanted, 1% (~7k) preserves the signal at a rounding-error
+cost. Otherwise: with zero holdout, the epoch curve has to come entirely from
+play — the 64–128-game matches at epochs 1/3/5/10 stop being a nice-to-have
+and become the only overfitting readout.
 
 ### Implementation delta
 
-The self-play learning app assumes a parent checkpoint (init + anchor
-resolution from the dataset manifest). Needed: a from-scratch mode — model
-size flags (`--model-channels`, `--model-blocks`), random init when no parent
-is given, anchor skipped at weight 0. Alternatively reuse the expert
-pretraining entry point with the replay dataset. Implementer's choice; the
-invariants are: random init, configurable size, soft replay targets, per-epoch
-checkpoints.
+Concrete, and smaller than it looks. All in
+`src/pink_elephant/self_play/learning/`:
+
+1. **Allow zero validation.** Two guards reject it —
+   `modal_app.py:134` and `replay.py:191` (both `0 < f < 1`); relax to
+   `0 <= f < 1`. Then the epoch loop must skip the validation pass when
+   `replay.stats.validation_positions == 0`: `trainer.validate()` on an empty
+   iterable raises `"at least one validation batch is required"`
+   (`training.py:433`). `save_checkpoint(metrics=None)` is already supported,
+   and `SelfPlayEpochMetrics` needs its validation fields made optional (or
+   written as nulls) for those epochs.
+2. **Scratch init with a configurable size.** Add `--model-channels` /
+   `--model-blocks`; when set, build the spec from `chess_resnet_spec()`
+   instead of the replay manifest, and skip
+   `_resolve_parent_checkpoint` / `load_model_weights` in the non-resume
+   branch (`modal_app.py:274-283`). Store the overridden spec in the run
+   layout so `--resume`'s `layout.manifest.model` check still holds.
+3. Anchor path is untouched — it is already gated on
+   `policy_anchor_weight > 0`.
+
+Alternative if that is unappealing: reuse the expert pretraining entry point
+(`modal_training.py`, which already does random init + 3e-4) pointed at the
+replay dataset. Implementer's choice; the invariants are: random init,
+configurable size, soft replay targets, zero holdout, per-epoch checkpoints.
 
 ## Evaluation — parent-relative Elo is NOT the bar
 
@@ -88,15 +131,17 @@ trained on 25M; that tells us nothing. The informative measurements:
 4. **Calibration matches** (context, not verdict): vs parent at 200 sims for
    an Elo number; optionally a small Stockfish-level ladder for an absolute
    anchor.
-5. **Epoch curve**: validation CE + a small match (64–128 games) at epochs
-   1, 3, 5, 10 — where does play strength peak while CE keeps "improving"?
+5. **Epoch curve**: with no holdout, this is a match curve — 64–128 games at
+   epochs 1, 3, 5, 10 (plus train CE for reference). Where does play strength
+   peak while train CE keeps "improving"?
 
 ## Bookkeeping
 
 - Run names: `scratch-128x6-200sim-blended-ep10` (and `-800sims`, `-both`
   for later phases).
-- Record model config, parameter count, lr schedule, and dataset identity in
-  the run manifest; ledger entry compares epochs, not parents.
+- Record model config, parameter count, learning rate, `validation_fraction`,
+  and dataset identity in the run manifest; ledger entry compares epochs, not
+  parents.
 - Findings land in a companion note; if H1 holds, it directly informs whether
   future *generations* can train scratch students on soft targets even though
   *fine-tunes* must use chosen-move targets.
