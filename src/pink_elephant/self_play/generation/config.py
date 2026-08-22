@@ -52,6 +52,13 @@ GENERATION_1_FORCED_PLAYOUT_K: Final[float] = 2.0
 # Never play a move the search gave less than this share of the best move's
 # visits. Sampling proportional to visits otherwise plays the one-visit tail.
 GENERATION_1_MIN_VISIT_FRACTION: Final[float] = 0.10
+# One leaf per game per batch, which is the sequential search. Raising it widens
+# the batch without adding games; virtual loss is what keeps those extra descents
+# off the leaf the first one already claimed.
+GENERATION_1_MAX_PENDING_LEAVES: Final[int] = 1
+# Zero is a pure virtual visit: an in-flight descent raises the visit count
+# without inventing a lost game. One is the classical full virtual loss.
+GENERATION_1_VIRTUAL_LOSS: Final[float] = 0.0
 _SHA256_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -77,6 +84,8 @@ class GenerationSpec:
     replay_stride: int = 1
     forced_playout_k: float = 0.0
     min_visit_fraction: float = 0.0
+    max_pending_leaves: int = 1
+    virtual_loss: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.generation_id or not self.checkpoint_volume_path:
@@ -103,6 +112,11 @@ class GenerationSpec:
             raise ValueError("forced_playout_k must be finite and non-negative")
         if not math.isfinite(self.min_visit_fraction) or not 0 <= self.min_visit_fraction <= 1:
             raise ValueError("min_visit_fraction must be finite and in [0, 1]")
+        if self.max_pending_leaves < 1:
+            raise ValueError("max_pending_leaves must be positive")
+        # Above one claims an outcome worse than a lost game.
+        if not math.isfinite(self.virtual_loss) or not 0 <= self.virtual_loss <= 1:
+            raise ValueError("virtual_loss must be finite and in [0, 1]")
         if self.base_seed < 0 or self.base_seed >= 2**64:
             raise ValueError("base_seed must be an unsigned 64-bit integer")
         if not self.encoder_version or not self.action_schema_version:
@@ -128,6 +142,13 @@ class GenerationSpec:
             "min_visit_fraction": self.min_visit_fraction,
             "start_pool_sha256": self.start_pool_sha256,
         }
+        # Only recorded once it is switched on. At one leaf per game the native
+        # search is bit-for-bit the sequential one, so a generation sealed before
+        # virtual loss existed must keep hashing to the same identity and stay
+        # extendable; a run that turns it on is genuinely a different search.
+        if self.max_pending_leaves != 1 or self.virtual_loss != 0.0:
+            payload["max_pending_leaves"] = self.max_pending_leaves
+            payload["virtual_loss"] = self.virtual_loss
         return _sha256_json(payload)
 
     @property
@@ -160,6 +181,8 @@ class GenerationSpec:
             "replay_stride": self.replay_stride,
             "forced_playout_k": self.forced_playout_k,
             "min_visit_fraction": self.min_visit_fraction,
+            "max_pending_leaves": self.max_pending_leaves,
+            "virtual_loss": self.virtual_loss,
             "start_pool": None if self.start_pool is None else self.start_pool.to_payload(),
             "search_config_sha256": self.search_config_sha256,
         }
@@ -296,6 +319,8 @@ def generation_1_spec(*, base_seed: int = 0) -> GenerationSpec:
         temperature_cutoff_ply=GENERATION_1_TEMPERATURE_CUTOFF_PLY,
         forced_playout_k=GENERATION_1_FORCED_PLAYOUT_K,
         min_visit_fraction=GENERATION_1_MIN_VISIT_FRACTION,
+        max_pending_leaves=GENERATION_1_MAX_PENDING_LEAVES,
+        virtual_loss=GENERATION_1_VIRTUAL_LOSS,
         base_seed=base_seed,
     )
 

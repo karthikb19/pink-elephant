@@ -818,6 +818,8 @@ def run_native_worker(
         start_fens=list(worker.generation.start_fens()),
         forced_playout_k=worker.generation.forced_playout_k,
         min_visit_fraction=worker.generation.min_visit_fraction,
+        max_pending_leaves=worker.generation.max_pending_leaves,
+        virtual_loss=worker.generation.virtual_loss,
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(
@@ -827,6 +829,7 @@ def run_native_worker(
             "active_games": worker.round.active_games_per_worker,
             "generation_id": worker.generation.generation_id,
             "inference_batch_rows": host.rows,
+            "max_pending_leaves": worker.generation.max_pending_leaves,
             "invocation_id": worker.invocation_id,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,

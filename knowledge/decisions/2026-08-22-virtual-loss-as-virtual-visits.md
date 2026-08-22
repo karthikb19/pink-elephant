@@ -79,9 +79,20 @@ unnecessary.
 - Several leaves per tree make a search slightly less sequential than pure PUCT —
   each descent chooses without seeing the others' results. This is the standard
   cost of batched MCTS and the reason `virtual_loss` is tunable.
-- Not yet wired into the self-play hosts or the Modal generation config; both
-  still run one leaf per game. Turning it on is a generation-config change and
-  wants its own throughput measurement.
+- `GenerationSpec.search_config_sha256` records the two settings only when they
+  are non-default. At one leaf per game the native search is bit-for-bit the
+  sequential one, so a generation sealed before virtual loss existed hashes to
+  the same identity and stays extendable, while a run that turns virtual loss on
+  is correctly a different search and cannot merge into an old corpus.
+- The Python backend rejects a non-default setting rather than ignoring it.
+  `pink_elephant.mcts` is sequential and has no notion of an in-flight descent,
+  so silently dropping the setting would produce a corpus whose provenance
+  claimed a search it never ran.
+- Batch width now scales with `max_pending_leaves`. At 512 games per worker and
+  four leaves per game the staging buffer is 1024 rows rather than 256, so the
+  setting is a memory decision as much as a throughput one.
+- Both defaults are guesses. `virtual_loss = 0` with `max_pending_leaves = 4`
+  wants a throughput-versus-strength measurement before anything adopts it.
 
 ## Surface Areas
 
@@ -92,5 +103,13 @@ unnecessary.
 - `rust/pe-search/src/engine.rs`: multi-row fills and `batch_rows`.
 - `rust/pe-search/src/lib.rs`: the `virtual_loss` and `max_pending_leaves`
   keywords, plus `batch_rows` and `games_per_batch`.
+- `src/pink_elephant/self_play/generation/config.py`: `max_pending_leaves` and
+  `virtual_loss` on `GenerationSpec`, their defaults, and the conditional hash.
+- `src/pink_elephant/self_play/generation/worker.py` and `modal_app.py`: the
+  pass-through to the native engine, the `--max-pending-leaves` and
+  `--virtual-loss` flags, and the Python-backend guard.
+- `native_host.py` and `match_host.py` size their staging buffer from
+  `batch_rows()`.
 - `src/pink_elephant/mcts.py` is unchanged and stays sequential; it is the
   reference implementation, and virtual loss has no meaning without concurrency.
+  `scripts/play_self_play_games.py` drives that search and is unchanged too.

@@ -236,6 +236,29 @@ def test_native_worker_records_its_generation_identity(tmp_path: Path) -> None:
     assert result.source_checkpoint_sha256 == generation.checkpoint_sha256
 
 
+def test_native_worker_runs_with_several_leaves_per_game(tmp_path: Path) -> None:
+    """The full worker path, end to end, with virtual loss engaged."""
+
+    generation = replace(
+        _generation(),
+        simulations_per_move=8,
+        max_pending_leaves=4,
+        virtual_loss=0.25,
+    )
+    round_spec = _round(generation, "virtual-loss-round", positions=2, games=2)
+    worker = _worker(generation, round_spec)
+
+    result = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    assert result.position_count >= worker.position_lower_bound
+    assert result.completed_game_count >= 1
+    assert result.shards
+    # Turning virtual loss on is a different search, and the sealed provenance
+    # has to say so or two incompatible corpora merge without a complaint.
+    assert result.search_config_sha256 == generation.search_config_sha256
+    assert result.search_config_sha256 != _generation().search_config_sha256
+
+
 def test_native_worker_refuses_a_non_empty_invocation_directory(tmp_path: Path) -> None:
     generation = _generation()
     round_spec = _round(generation, "collision-round", positions=2)
