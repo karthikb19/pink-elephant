@@ -543,13 +543,42 @@ def test_worker_retries_truncated_games_and_records_failure_count(tmp_path: Path
     assert evaluator.request_count == 8
 
 
-def test_worker_refuses_to_reuse_a_nonempty_invocation(tmp_path: Path) -> None:
+def test_a_retry_of_a_published_worker_returns_its_result(tmp_path: Path) -> None:
+    """Modal retries reuse the WorkerSpec, so a finished worker must be idempotent."""
+
     generation = _smoke_generation()
     worker = _smoke_worker(generation, _smoke_round(generation, "worker-immutable"))
-    _run_fools_mate_worker(tmp_path, worker)
+    first = _run_fools_mate_worker(tmp_path, worker)
 
-    with pytest.raises(FileExistsError, match="not empty"):
-        _run_fools_mate_worker(tmp_path, worker)
+    second = _run_fools_mate_worker(tmp_path, worker)
+
+    assert second.result_path == first.result_path
+    assert second.position_count == first.position_count
+    assert [shard.sha256 for shard in second.shards] == [shard.sha256 for shard in first.shards]
+
+
+def test_a_retry_discards_a_dead_attempts_partial_output(tmp_path: Path) -> None:
+    """Refusing a dirty directory made every Modal retry fail after one shard."""
+
+    generation = _smoke_generation()
+    round_spec = _smoke_round(generation, "worker-retry")
+    worker = _smoke_worker(generation, round_spec)
+    invocation = (
+        tmp_path
+        / generation.generation_id
+        / "rounds"
+        / round_spec.round_id
+        / "workers"
+        / worker.worker_id
+        / "invocations"
+        / worker.invocation_id
+    )
+    invocation.mkdir(parents=True)
+    (invocation / "shard-00000.parquet").write_bytes(b"partial write from a dead attempt")
+
+    result = _run_fools_mate_worker(tmp_path, worker)
+
+    assert result.position_count >= worker.position_lower_bound
 
 
 def test_coordinator_appends_cumulative_snapshots_and_supports_noop_rounds(

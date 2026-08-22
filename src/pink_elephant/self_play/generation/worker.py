@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -53,6 +54,7 @@ from pink_elephant.self_play.generation.game import (
     select_action_from_summary,
     subsample_replay_rows,
 )
+from pink_elephant.self_play.generation.manifests import load_worker_result
 from pink_elephant.self_play.generation.native_host import (
     PENDING_BATCHES,
     HostStats,
@@ -283,10 +285,9 @@ def run_worker(
             "worker_id": worker.worker_id,
         },
     )
-    invocation_root = _invocation_root(output_root, worker)
-    if invocation_root.exists() and any(invocation_root.iterdir()):
-        raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
-    invocation_root.mkdir(parents=True, exist_ok=True)
+    invocation_root, published = _prepare_invocation_root(output_root, worker)
+    if published is not None:
+        return published
     shard_builder = ReplayShardBuilder(
         invocation_root,
         max_positions=worker.round.shard_position_limit,
@@ -664,6 +665,57 @@ def _process_search_log_fields(search: MultiprocessMCTSSearch) -> dict[str, floa
     }
 
 
+def _prepare_invocation_root(
+    output_root: Path, worker: WorkerSpec
+) -> tuple[Path, WorkerResult | None]:
+    """Return this worker's output directory, and its result if it already finished.
+
+    Modal retries a failed worker with the same `WorkerSpec`, so a retry lands on
+    the exact path its dead predecessor was writing into. Refusing a non-empty
+    directory therefore made every retry fail the moment one shard existed, and
+    the `FileExistsError` buried whatever actually killed the first attempt.
+
+    `worker-result.json` is written only after every shard and the games table
+    are on disk, so its presence means the work is done: return it and let the
+    retry be a no-op rather than regenerating games that are already published.
+    Anything else in the directory is a dead attempt's partial output, referenced
+    by no result and safe to discard. The path is scoped to one generation,
+    round, worker, and launch, so nothing else can be writing here.
+    """
+
+    invocation_root = _invocation_root(output_root, worker)
+    result_path = invocation_root / "worker-result.json"
+    if result_path.is_file():
+        log_event(
+            logger,
+            "worker_invocation_already_published",
+            {
+                "generation_id": worker.generation.generation_id,
+                "invocation_id": worker.invocation_id,
+                "round_id": worker.round.round_id,
+                "worker_id": worker.worker_id,
+            },
+        )
+        return invocation_root, load_worker_result(result_path)
+    if invocation_root.is_dir():
+        discarded = sorted(path.name for path in invocation_root.iterdir())
+        if discarded:
+            log_event(
+                logger,
+                "worker_invocation_reset",
+                {
+                    "discarded_file_count": len(discarded),
+                    "generation_id": worker.generation.generation_id,
+                    "invocation_id": worker.invocation_id,
+                    "round_id": worker.round.round_id,
+                    "worker_id": worker.worker_id,
+                },
+            )
+        shutil.rmtree(invocation_root)
+    invocation_root.mkdir(parents=True, exist_ok=True)
+    return invocation_root, None
+
+
 def _invocation_root(output_root: Path, worker: WorkerSpec) -> Path:
     return (
         output_root
@@ -843,10 +895,9 @@ def run_native_worker(
         },
     )
 
-    invocation_root = _invocation_root(output_root, worker)
-    if invocation_root.exists() and any(invocation_root.iterdir()):
-        raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
-    invocation_root.mkdir(parents=True, exist_ok=True)
+    invocation_root, published = _prepare_invocation_root(output_root, worker)
+    if published is not None:
+        return published
     shard_builder = ReplayShardBuilder(
         invocation_root,
         max_positions=worker.round.shard_position_limit,

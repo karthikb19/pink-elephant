@@ -305,14 +305,50 @@ def test_the_evaluation_cache_is_off_by_default() -> None:
     assert engine.stats()["eval_cache_hits"] == 0
 
 
-def test_native_worker_refuses_a_non_empty_invocation_directory(tmp_path: Path) -> None:
+def test_a_retry_of_a_published_worker_returns_its_result(tmp_path: Path) -> None:
+    """Modal retries reuse the WorkerSpec, so a finished worker must be idempotent."""
+
     generation = _generation()
     round_spec = _round(generation, "collision-round", positions=2)
     worker = _worker(generation, round_spec)
-    run_native_worker(worker, DrawSeekingModel(), tmp_path)
+    first = run_native_worker(worker, DrawSeekingModel(), tmp_path)
 
-    with pytest.raises(FileExistsError):
-        run_native_worker(worker, DrawSeekingModel(), tmp_path)
+    # The retry must not regenerate games that are already published; an
+    # identical result is how the caller sees "this work was already done".
+    second = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    assert second.result_path == first.result_path
+    assert second.position_count == first.position_count
+    assert second.completed_game_count == first.completed_game_count
+    assert [shard.sha256 for shard in second.shards] == [shard.sha256 for shard in first.shards]
+
+
+def test_a_retry_discards_a_dead_attempts_partial_output(tmp_path: Path) -> None:
+    """A worker that died mid-run leaves shards no result references."""
+
+    generation = _generation()
+    round_spec = _round(generation, "retry-round", positions=2)
+    worker = _worker(generation, round_spec)
+    invocation = (
+        tmp_path
+        / generation.generation_id
+        / "rounds"
+        / round_spec.round_id
+        / "workers"
+        / worker.worker_id
+        / "invocations"
+        / worker.invocation_id
+    )
+    invocation.mkdir(parents=True)
+    (invocation / "shard-00000.parquet").write_bytes(b"partial write from a dead attempt")
+
+    result = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    # Refusing here is what made every retry fail once one shard existed.
+    assert result.position_count >= worker.position_lower_bound
+    for shard in result.shards:
+        assert (tmp_path / shard.path).is_file()
+        assert sha256_file(tmp_path / shard.path) == shard.sha256
 
 
 def test_native_worker_game_ids_carry_the_full_worker_identity(tmp_path: Path) -> None:

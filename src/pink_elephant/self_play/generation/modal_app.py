@@ -238,10 +238,12 @@ def load_committed_worker_results(workers: tuple[WorkerSpec, ...]) -> tuple[Work
         )
         if not invocations.is_dir():
             continue
-        # Every attempt gets its own invocation directory, so recovery searches all
+        # Every launch gets its own invocation directory, so recovery searches all
         # of them rather than the one this launch happens to be using. A worker that
         # finished wrote worker-result.json; an interrupted one left only shards, and
-        # is skipped so a fresh invocation can retry it.
+        # is skipped so a fresh invocation can retry it. Retries within one launch
+        # reuse their directory: they return an existing result or discard a dead
+        # attempt's partial shards, so no directory here holds two attempts' output.
         for invocation in sorted(invocations.iterdir(), reverse=True):
             result_path = invocation / "worker-result.json"
             if result_path.is_file():
