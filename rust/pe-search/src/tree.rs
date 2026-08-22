@@ -441,6 +441,12 @@ impl Tree {
     pub fn release_virtual_loss(&mut self, path: &[u32]) {
         for &index in path {
             let node = &mut self.nodes[index as usize];
+            // A leaked virtual visit never crashes; it silently biases every
+            // later selection away from a branch nothing is searching.
+            debug_assert!(
+                node.virtual_visits > 0,
+                "released a virtual loss that was never applied"
+            );
             node.virtual_visits = node.virtual_visits.saturating_sub(1);
         }
     }
