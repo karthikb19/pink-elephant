@@ -34,6 +34,7 @@ fn config(games: usize, pending: usize, simulations: u32) -> EngineConfig {
         game_id_prefix: "test".into(),
         start_fens: Vec::new(),
         paired_starts: false,
+        eval_cache_entries: 0,
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,
@@ -46,7 +47,7 @@ fn config(games: usize, pending: usize, simulations: u32) -> EngineConfig {
 
 /// Run the same double-buffered loop the Python host uses.
 fn run(engine: &mut SelfPlayEngine, target_games: u64, max_iterations: usize) -> Vec<pe_search::game::CompletedGame> {
-    let rows = engine.group_size();
+    let rows = engine.batch_rows();
     let mut buffers = vec![vec![0u8; rows * ENCODED_LEN]; 2];
     let mut logits = Vec::new();
     let mut values = Vec::new();
@@ -140,7 +141,7 @@ fn outcomes_are_recorded_from_each_position_own_perspective() {
 #[test]
 fn a_group_cannot_be_filled_twice_before_submitting() {
     let mut engine = SelfPlayEngine::new(config(2, 2, 4)).expect("engine");
-    let mut buffer = vec![0u8; engine.group_size() * ENCODED_LEN];
+    let mut buffer = vec![0u8; engine.batch_rows() * ENCODED_LEN];
     let (_first, count) = engine.fill_batch(&mut buffer).expect("first fill");
     assert!(count > 0);
     // The second group is still free.
@@ -156,7 +157,7 @@ fn a_group_cannot_be_filled_twice_before_submitting() {
 #[test]
 fn submit_rejects_mismatched_shapes_and_unknown_batches() {
     let mut engine = SelfPlayEngine::new(config(2, 2, 4)).expect("engine");
-    let mut buffer = vec![0u8; engine.group_size() * ENCODED_LEN];
+    let mut buffer = vec![0u8; engine.batch_rows() * ENCODED_LEN];
     let (batch_id, count) = engine.fill_batch(&mut buffer).expect("fill");
     assert_eq!(count, 1);
     assert!(engine.submit(batch_id, &vec![0.0; POLICY_SIZE - 1], &[0.0]).is_err());

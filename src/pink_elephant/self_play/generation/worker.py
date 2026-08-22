@@ -818,6 +818,10 @@ def run_native_worker(
         start_fens=list(worker.generation.start_fens()),
         forced_playout_k=worker.generation.forced_playout_k,
         min_visit_fraction=worker.generation.min_visit_fraction,
+        max_pending_leaves=worker.generation.max_pending_leaves,
+        virtual_loss=worker.generation.virtual_loss,
+        tree_reuse=worker.generation.tree_reuse,
+        eval_cache_entries=worker.generation.eval_cache_entries,
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(
@@ -827,6 +831,9 @@ def run_native_worker(
             "active_games": worker.round.active_games_per_worker,
             "generation_id": worker.generation.generation_id,
             "inference_batch_rows": host.rows,
+            "max_pending_leaves": worker.generation.max_pending_leaves,
+            "tree_reuse": worker.generation.tree_reuse,
+            "eval_cache_entries": engine.eval_cache_capacity(),
             "invocation_id": worker.invocation_id,
             "position_lower_bound": worker.position_lower_bound,
             "round_id": worker.round.round_id,
@@ -900,6 +907,8 @@ def _native_progress_fields(
     """
 
     engine_stats = dict(engine.stats())
+    cache_hits = engine_stats.get("eval_cache_hits", 0)
+    cache_lookups = cache_hits + engine_stats.get("eval_cache_misses", 0)
     return {
         **writer.timings.fields(),
         "accepting_new_games": engine.accepting_new_games(),
@@ -907,6 +916,10 @@ def _native_progress_fields(
         "active_game_count": engine.active_games(),
         "average_model_batch_size": stats.average_batch_size,
         "elapsed_seconds": stats.wall_seconds,
+        # Each hit is a forward pass the GPU never ran, so the rate is the whole
+        # measurement of whether the cache is earning its memory.
+        "eval_cache_hits": cache_hits,
+        "eval_cache_hit_rate": cache_hits / cache_lookups if cache_lookups else 0.0,
         "engine_fill_seconds": engine_stats.get("fill_seconds", 0.0),
         "engine_submit_seconds": engine_stats.get("submit_seconds", 0.0),
         "games_truncated": engine_stats.get("games_truncated", 0),

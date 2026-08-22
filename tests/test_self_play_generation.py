@@ -1031,6 +1031,55 @@ def test_generation_identity_covers_the_start_pool_and_stride() -> None:
     assert base.start_fens() == ()
 
 
+def test_the_default_search_identity_survives_adding_virtual_loss() -> None:
+    """Generations sealed before virtual loss existed must stay extendable."""
+
+    base = generation_1_spec()
+    assert base.max_pending_leaves == 1
+    assert base.virtual_loss == 0.0
+    # The hash predates both fields, and one leaf per game is bit-for-bit the
+    # search it described, so restating the defaults must not change it.
+    assert (
+        replace(base, max_pending_leaves=1, virtual_loss=0.0).search_config_sha256
+        == base.search_config_sha256
+    )
+
+
+def test_turning_on_virtual_loss_changes_the_search_identity() -> None:
+    base = generation_1_spec()
+    for override in ({"max_pending_leaves": 4}, {"virtual_loss": 0.25}):
+        assert replace(base, **override).search_config_sha256 != base.search_config_sha256
+
+
+def test_tree_reuse_changes_the_search_identity_but_the_cache_does_not() -> None:
+    """Reuse carries statistics between moves; a cache hit is what the net said."""
+
+    base = generation_1_spec()
+    assert base.tree_reuse is False
+    assert base.eval_cache_entries == 0
+    assert replace(base, tree_reuse=True).search_config_sha256 != base.search_config_sha256
+    # The cache is a throughput device with no effect a replay target can see, so
+    # it must not fork the identity and strand a corpus from its own generation.
+    assert (
+        replace(base, eval_cache_entries=1 << 16).search_config_sha256 == base.search_config_sha256
+    )
+
+
+def test_generation_spec_rejects_a_negative_eval_cache() -> None:
+    with pytest.raises(ValueError, match="eval_cache_entries"):
+        replace(generation_1_spec(), eval_cache_entries=-1)
+
+
+def test_generation_spec_rejects_an_unusable_virtual_loss() -> None:
+    base = generation_1_spec()
+    with pytest.raises(ValueError, match="virtual_loss"):
+        replace(base, virtual_loss=1.5)
+    with pytest.raises(ValueError, match="virtual_loss"):
+        replace(base, virtual_loss=-0.1)
+    with pytest.raises(ValueError, match="max_pending_leaves"):
+        replace(base, max_pending_leaves=0)
+
+
 def test_audit_replay_shard_returns_the_game_ids_it_already_computed(tmp_path: Path) -> None:
     rows = tuple(replace(_valid_replay_row(), game_id=f"game-{index // 2}") for index in range(4))
     path = tmp_path / "shard-00000.parquet"

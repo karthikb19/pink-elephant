@@ -6,6 +6,7 @@
 //! the GIL released.
 
 pub mod action;
+pub mod cache;
 pub mod encoding;
 pub mod engine;
 pub mod game;
@@ -177,6 +178,10 @@ impl PySelfPlayEngine {
         forced_playout_k = 0.0,
         min_visit_fraction = 0.0,
         paired_starts = false,
+        max_pending_leaves = 1,
+        virtual_loss = 0.0,
+        tree_reuse = false,
+        eval_cache_entries = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -197,6 +202,10 @@ impl PySelfPlayEngine {
         forced_playout_k: f64,
         min_visit_fraction: f64,
         paired_starts: bool,
+        max_pending_leaves: usize,
+        virtual_loss: f64,
+        tree_reuse: bool,
+        eval_cache_entries: usize,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -205,6 +214,7 @@ impl PySelfPlayEngine {
             game_id_prefix,
             start_fens,
             paired_starts,
+            eval_cache_entries,
             search: SearchConfig {
                 simulations,
                 simulations_b,
@@ -217,6 +227,9 @@ impl PySelfPlayEngine {
                 max_plies,
                 forced_playout_k,
                 min_visit_fraction,
+                max_pending_leaves,
+                virtual_loss,
+                tree_reuse,
             },
         };
         SelfPlayEngine::new(config)
@@ -312,8 +325,28 @@ impl PySelfPlayEngine {
         self.inner.accepting_new_games()
     }
 
-    /// Rows written per `fill_batch` when every game is active.
+    /// Rows a `fill_batch` may write, and so the buffer the host must allocate.
+    ///
+    /// This is `games / pending_batches` multiplied by `max_pending_leaves`; at
+    /// the default of one leaf per game it is exactly one row per game.
     fn group_size(&self) -> usize {
+        self.inner.batch_rows()
+    }
+
+    /// The same figure under its accurate name, for hosts that allow a game to
+    /// contribute more than one row.
+    fn batch_rows(&self) -> usize {
+        self.inner.batch_rows()
+    }
+
+    /// Entries the shared evaluation cache holds, after rounding to a power of
+    /// two. Zero means the cache is disabled.
+    fn eval_cache_capacity(&self) -> usize {
+        self.inner.eval_cache_capacity()
+    }
+
+    /// Games per in-flight batch, ignoring the per-game leaf allowance.
+    fn games_per_batch(&self) -> usize {
         self.inner.group_size()
     }
 
@@ -328,6 +361,9 @@ impl PySelfPlayEngine {
         dict.set_item("fill_seconds", stats.fill_seconds)?;
         dict.set_item("submit_seconds", stats.submit_seconds)?;
         dict.set_item("max_tree_nodes", stats.max_tree_nodes)?;
+        dict.set_item("eval_cache_hits", stats.eval_cache_hits)?;
+        dict.set_item("eval_cache_misses", stats.eval_cache_misses)?;
+        dict.set_item("eval_cache_capacity", self.inner.eval_cache_capacity())?;
         Ok(dict)
     }
 }
@@ -397,7 +433,11 @@ impl PyRootSearch {
 
         py.detach(move || -> Result<bool, String> {
             while *completed < simulations {
-                let leaf = tree.select_leaf(position, exploration_constant, forced_playout_k);
+                // A root search keeps one leaf in flight, so virtual loss has
+                // nothing to separate and is fixed at zero to keep this the
+                // exact differential counterpart of the Python search.
+                let leaf =
+                    tree.select_leaf(position, exploration_constant, forced_playout_k, 0.0);
                 if let Some(value) = leaf.terminal_value {
                     tree.backup(&leaf.path, value);
                     *completed += 1;

@@ -236,6 +236,75 @@ def test_native_worker_records_its_generation_identity(tmp_path: Path) -> None:
     assert result.source_checkpoint_sha256 == generation.checkpoint_sha256
 
 
+def test_native_worker_runs_with_several_leaves_per_game(tmp_path: Path) -> None:
+    """The full worker path, end to end, with virtual loss engaged."""
+
+    generation = replace(
+        _generation(),
+        simulations_per_move=8,
+        max_pending_leaves=4,
+        virtual_loss=0.25,
+    )
+    round_spec = _round(generation, "virtual-loss-round", positions=2, games=2)
+    worker = _worker(generation, round_spec)
+
+    result = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    assert result.position_count >= worker.position_lower_bound
+    assert result.completed_game_count >= 1
+    assert result.shards
+    # Turning virtual loss on is a different search, and the sealed provenance
+    # has to say so or two incompatible corpora merge without a complaint.
+    assert result.search_config_sha256 == generation.search_config_sha256
+    assert result.search_config_sha256 != _generation().search_config_sha256
+
+
+def test_native_worker_runs_with_tree_reuse_and_the_evaluation_cache(tmp_path: Path) -> None:
+    generation = replace(
+        _generation(),
+        simulations_per_move=8,
+        tree_reuse=True,
+        eval_cache_entries=1 << 12,
+    )
+    round_spec = _round(generation, "reuse-round", positions=2, games=2)
+    worker = _worker(generation, round_spec)
+
+    result = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    assert result.position_count >= worker.position_lower_bound
+    assert result.completed_game_count >= 1
+    assert result.search_config_sha256 == generation.search_config_sha256
+    assert result.search_config_sha256 != _generation().search_config_sha256
+
+
+def test_the_evaluation_cache_answers_repeated_positions() -> None:
+    """Every hit is a forward pass the GPU never runs."""
+
+    engine = pe_search.SelfPlayEngine(
+        games=8,
+        seed=5,
+        game_id_prefix="cache-test",
+        simulations=16,
+        dirichlet_fraction=0.0,
+        temperature_cutoff_ply=4,
+        max_plies=60,
+        eval_cache_entries=1 << 16,
+    )
+    assert engine.eval_cache_capacity() == 1 << 16
+    _drive_engine(engine, iterations=200)
+
+    stats = engine.stats()
+    assert stats["eval_cache_hits"] > 0
+    assert stats["eval_cache_hits"] + stats["eval_cache_misses"] > 0
+
+
+def test_the_evaluation_cache_is_off_by_default() -> None:
+    engine = pe_search.SelfPlayEngine(games=2, seed=5, game_id_prefix="cache-test")
+    assert engine.eval_cache_capacity() == 0
+    _drive_engine(engine, iterations=50)
+    assert engine.stats()["eval_cache_hits"] == 0
+
+
 def test_native_worker_refuses_a_non_empty_invocation_directory(tmp_path: Path) -> None:
     generation = _generation()
     round_spec = _round(generation, "collision-round", positions=2)
@@ -466,3 +535,59 @@ def test_microbenchmark_report_shows_speedups_against_fp32() -> None:
     assert "2.00x" in report
     # Moves per second is the self-play ceiling the throughput implies.
     assert "800" in report
+
+
+def _drive_engine(engine: pe_search.SelfPlayEngine, *, iterations: int = 500) -> int:
+    """Run the host loop for a while and return the widest batch it produced."""
+
+    rows = engine.batch_rows()
+    buffer = np.zeros((rows, 21, 8, 8), dtype=np.uint8)
+    logits = np.zeros((rows, POLICY_SIZE), dtype=np.float32)
+    values = np.zeros(rows, dtype=np.float32)
+    widest = 0
+    for _ in range(iterations):
+        batch_id, count = engine.fill_batch(buffer.ctypes.data, rows)
+        widest = max(widest, count)
+        if count:
+            engine.submit(batch_id, logits[:count], values[:count])
+        engine.drain_finished()
+    return widest
+
+
+def _virtual_loss_engine(*, max_pending_leaves: int) -> pe_search.SelfPlayEngine:
+    return pe_search.SelfPlayEngine(
+        games=4,
+        seed=99,
+        game_id_prefix="virtual-loss-test",
+        simulations=16,
+        pending_batches=2,
+        dirichlet_fraction=0.0,
+        temperature_cutoff_ply=4,
+        max_plies=80,
+        max_pending_leaves=max_pending_leaves,
+        virtual_loss=0.0,
+    )
+
+
+def test_one_leaf_per_game_keeps_the_batch_one_row_per_game() -> None:
+    engine = _virtual_loss_engine(max_pending_leaves=1)
+    assert engine.batch_rows() == engine.games_per_batch() == engine.group_size()
+    assert _drive_engine(engine) == engine.games_per_batch()
+
+
+def test_several_leaves_per_game_widen_the_batch() -> None:
+    """Virtual loss is what lets one tree contribute several rows to a batch."""
+
+    engine = _virtual_loss_engine(max_pending_leaves=4)
+    assert engine.batch_rows() == engine.games_per_batch() * 4
+    assert _drive_engine(engine) > engine.games_per_batch()
+
+
+def test_the_engine_rejects_an_out_of_range_virtual_loss() -> None:
+    with pytest.raises(ValueError, match="virtual_loss"):
+        pe_search.SelfPlayEngine(
+            games=2,
+            seed=1,
+            game_id_prefix="virtual-loss-test",
+            virtual_loss=1.5,
+        )

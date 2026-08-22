@@ -79,7 +79,7 @@ class NativeSelfPlayHost:
         self.model = model.eval()
         self.engine = engine
         self.autocast = autocast
-        self.rows = engine.group_size()
+        self.rows = engine.batch_rows()
         # Page-locked staging lets the host-to-device copy run asynchronously and
         # gives the engine a stable address to encode into.
         pin = self.device.type == "cuda"

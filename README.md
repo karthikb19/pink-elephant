@@ -512,6 +512,29 @@ held-out set of engine evaluations.
 
 ## Self-play replay fine-tuning
 
+### Best checkpoint to date: +48 Elo over the parent
+
+On the `pink-elephant-training` Modal volume:
+
+```
+runs/20260822T203909Z-combined-3m-400-200-800-anchor-030/checkpoints/20260822T203909Z-combined-3m-400-200-800-anchor-030-epoch-000002-step-000006628.pt
+```
+
+`sha256 fdc2d038c3f2cb7fa03dcd00f47f9d8edadccd2a568464a3436592d1090e81fe`
+
+Scored 0.5684 against the parent over 1024 games at 200 simulations, 95% CI
+[0.545, 0.592]. Trained on `pink-elephant-self-play-datasets-combined-3m` with
+`--epochs 2 --learning-rate 0.00005 --policy-anchor-weight 0.3`. Full record in
+[the run notes](knowledge/self-play-runs/2026-08-22-anchor-030-combined-3m-results.md).
+
+Pull it locally with:
+
+```sh
+uv run modal volume get pink-elephant-training \
+  "runs/20260822T203909Z-combined-3m-400-200-800-anchor-030/checkpoints/20260822T203909Z-combined-3m-400-200-800-anchor-030-epoch-000002-step-000006628.pt" \
+  data/modal-checkpoints/combined-3m-anchor030-ep2.pt
+```
+
 Fine-tune the parent checkpoint from the consolidated replay dataset on Modal:
 
 ```sh

@@ -128,7 +128,7 @@ class BatchedMatchHost:
         self.models = (model_a.eval(), model_b.eval())
         self.engine = engine
         self.autocast = autocast
-        self.rows = engine.group_size()
+        self.rows = engine.batch_rows()
         pin = self.device.type == "cuda"
         self._buffer = torch.empty(
             (self.rows, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE), dtype=torch.uint8, pin_memory=pin

@@ -2,13 +2,19 @@
 //!
 //! The engine owns every game and every tree. The host asks it to fill a buffer
 //! with leaf encodings, runs one model forward pass, and hands the output back.
-//! Games are partitioned into disjoint groups, one per in-flight batch, so a tree
-//! never has two outstanding leaves and virtual loss is not required.
+//! Games are partitioned into disjoint groups, one per in-flight batch, so two
+//! batches never touch the same tree.
+//!
+//! Within one batch a game may contribute up to `max_pending_leaves` rows. Those
+//! descents share a tree with no value between them, so virtual loss is what
+//! keeps them from selecting the same leaf; at the default of one leaf per game
+//! the batch is one row per game and virtual loss never engages.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::action::POLICY_SIZE;
+use crate::cache::EvalCache;
 use crate::encoding::ENCODED_LEN;
 use crate::game::{Advance, CompletedGame, SearchConfig, SelfPlayGame};
 use crate::position::GamePosition;
@@ -28,6 +34,10 @@ pub struct EngineConfig {
     /// 2k and 2k+1 on one position with the colours swapped. A match needs every
     /// opening played from both sides, which random selection cannot guarantee.
     pub paired_starts: bool,
+    /// Network evaluations to cache across every game, rounded up to a power of
+    /// two. Zero disables the cache. The table is shared engine-wide because the
+    /// overlap worth exploiting is mostly between games, not within one.
+    pub eval_cache_entries: usize,
     pub search: SearchConfig,
 }
 
@@ -62,6 +72,9 @@ pub struct EngineStats {
     pub fill_seconds: f64,
     pub submit_seconds: f64,
     pub max_tree_nodes: u64,
+    /// Leaves answered from the cache, each one a forward pass not run.
+    pub eval_cache_hits: u64,
+    pub eval_cache_misses: u64,
 }
 
 struct Ticket {
@@ -83,6 +96,7 @@ pub struct SelfPlayEngine {
     finished: Vec<CompletedGame>,
     accepting_new_games: bool,
     next_game_ordinal: u64,
+    cache: EvalCache,
     stats: EngineStats,
 }
 
@@ -103,6 +117,7 @@ impl SelfPlayEngine {
             finished: Vec::new(),
             accepting_new_games: true,
             next_game_ordinal: 0,
+            cache: EvalCache::new(config.eval_cache_entries),
             stats: EngineStats::default(),
             config,
         };
@@ -112,8 +127,15 @@ impl SelfPlayEngine {
         Ok(engine)
     }
 
+    /// Games per in-flight batch.
     pub fn group_size(&self) -> usize {
         self.config.games / self.config.pending_batches
+    }
+
+    /// Rows one `fill_batch` may write, and therefore the buffer a host must
+    /// provide: one group's games, each allowed its full in-flight leaf count.
+    pub fn batch_rows(&self) -> usize {
+        self.group_size() * self.config.search.max_pending_leaves
     }
 
     pub fn active_games(&self) -> usize {
@@ -122,6 +144,12 @@ impl SelfPlayEngine {
 
     pub fn stats(&self) -> &EngineStats {
         &self.stats
+    }
+
+    /// Entries the shared evaluation cache holds, after rounding to a power of
+    /// two. Zero means the cache is disabled.
+    pub fn eval_cache_capacity(&self) -> usize {
+        self.cache.capacity()
     }
 
     /// Which model owns each row of a filled batch: 0 for A, 1 for B.
@@ -176,30 +204,40 @@ impl SelfPlayEngine {
         ));
     }
 
-    /// Fill `buffer` with one leaf encoding per active game in the next group.
+    /// Fill `buffer` with leaf encodings from the next group's active games.
     ///
-    /// Returns the batch ticket and the number of rows written. Rows `[0, count)`
-    /// hold canonical `uint8 (21, 8, 8)` encodings.
+    /// Each game contributes between one and `max_pending_leaves` rows, so
+    /// `buffer` must hold [`SelfPlayEngine::batch_rows`] rows. Returns the batch
+    /// ticket and the number of rows written; rows `[0, count)` hold canonical
+    /// `uint8 (21, 8, 8)` encodings.
     pub fn fill_batch(&mut self, buffer: &mut [u8]) -> Result<(u64, usize), String> {
         let started = Instant::now();
         let group = self
             .next_free_group()
             .ok_or("every batch slot is already in flight; submit one before filling another")?;
         let capacity_rows = buffer.len() / ENCODED_LEN;
-        if capacity_rows < self.groups[group].len() {
+        let max_leaves = self.config.search.max_pending_leaves;
+        let required_rows = self.groups[group].len() * max_leaves;
+        if capacity_rows < required_rows {
             return Err(format!(
-                "buffer holds {} rows but group {} has {} games",
+                "buffer holds {} rows but group {} needs {} ({} games x {} leaves)",
                 capacity_rows,
                 group,
-                self.groups[group].len()
+                required_rows,
+                self.groups[group].len(),
+                max_leaves
             ));
         }
 
-        let mut rows: Vec<usize> = Vec::with_capacity(self.groups[group].len());
-        let mut model_indices: Vec<u8> = Vec::with_capacity(self.groups[group].len());
+        let mut rows: Vec<usize> = Vec::with_capacity(required_rows);
+        let mut model_indices: Vec<u8> = Vec::with_capacity(required_rows);
         let slots = self.groups[group].clone();
         for slot in slots {
-            loop {
+            // A game keeps producing leaves until it blocks on its own in-flight
+            // work, so a game deep in a long search fills several rows while one
+            // that just started a move fills only the first.
+            let mut leaves = 0usize;
+            while leaves < max_leaves {
                 if self.slots[slot].is_none() {
                     break;
                 }
@@ -208,7 +246,7 @@ impl SelfPlayEngine {
                 let advance = self.slots[slot]
                     .as_mut()
                     .expect("slot checked above")
-                    .advance(window)?;
+                    .advance(window, &mut self.cache)?;
                 match advance {
                     Advance::Leaf => {
                         let nodes = self.slots[slot]
@@ -223,8 +261,9 @@ impl SelfPlayEngine {
                                 .model_index(),
                         );
                         rows.push(slot);
-                        break;
+                        leaves += 1;
                     }
+                    Advance::Blocked => break,
                     Advance::Finished(game) => {
                         self.stats.games_completed += 1;
                         self.stats.positions_recorded += game.positions.len() as u64;
@@ -300,17 +339,20 @@ impl SelfPlayEngine {
             return Err(format!("expected {} values, got {}", count, values.len()));
         }
 
+        let cache = &mut self.cache;
         for (row, &slot) in ticket.rows.iter().enumerate() {
-            let game = self
-                .slots[slot]
+            let game = self.slots[slot]
                 .as_mut()
                 .ok_or("a submitted row refers to an empty slot")?;
             game.apply_prediction(
                 &policy_logits[row * POLICY_SIZE..(row + 1) * POLICY_SIZE],
                 values[row],
+                cache,
             )?;
         }
         self.busy_groups[ticket.group] = false;
+        self.stats.eval_cache_hits = self.cache.hits();
+        self.stats.eval_cache_misses = self.cache.misses();
         self.stats.submit_seconds += started.elapsed().as_secs_f64();
         Ok(())
     }
