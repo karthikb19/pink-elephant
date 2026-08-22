@@ -907,6 +907,8 @@ def _native_progress_fields(
     """
 
     engine_stats = dict(engine.stats())
+    cache_hits = engine_stats.get("eval_cache_hits", 0)
+    cache_lookups = cache_hits + engine_stats.get("eval_cache_misses", 0)
     return {
         **writer.timings.fields(),
         "accepting_new_games": engine.accepting_new_games(),
@@ -914,6 +916,10 @@ def _native_progress_fields(
         "active_game_count": engine.active_games(),
         "average_model_batch_size": stats.average_batch_size,
         "elapsed_seconds": stats.wall_seconds,
+        # Each hit is a forward pass the GPU never ran, so the rate is the whole
+        # measurement of whether the cache is earning its memory.
+        "eval_cache_hits": cache_hits,
+        "eval_cache_hit_rate": cache_hits / cache_lookups if cache_lookups else 0.0,
         "engine_fill_seconds": engine_stats.get("fill_seconds", 0.0),
         "engine_submit_seconds": engine_stats.get("submit_seconds", 0.0),
         "games_truncated": engine_stats.get("games_truncated", 0),

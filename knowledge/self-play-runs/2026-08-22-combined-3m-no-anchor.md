@@ -4,6 +4,17 @@
 **Dataset:** `pink-elephant-self-play-datasets-combined-3m` (3,577,893 positions)
 **Status:** complete, 5 epochs. Not a valid test of the mixed-two-gens hypothesis.
 
+> **Correction (same day).** This record originally concluded "epoch 1 is the
+> best checkpoint, and every metric agrees" from the validation curve. Matches
+> since then show validation loss does not track playing strength in this setup,
+> in either direction — see
+> [the anchor-030 results](2026-08-22-anchor-030-combined-3m-results.md). Epoch 1
+> of *this* run was measured at 0.4912 (−6 Elo) against the parent, and the
+> anchored run's epoch 2 reached +48 while looking *worse* on validation than its
+> own epoch 1. Treat every validation-based ranking below as unverified: the
+> within-run degradation is real, but which epoch plays best was never
+> established by matches.
+
 ## What was run, and what should have been
 
 This run was launched with the recipe's flags omitted. The run name says
@@ -58,13 +69,15 @@ Uniform-policy baseline for the same validation set: 3.0375.
 absolute numbers are healthy throughout: epoch 1 sits at 1.6650 against a 3.0375
 uniform baseline, with 57.7% top-1 and 91.8% top-5. Epoch 1 to epoch 5 costs
 +2.9% validation policy loss and −1.38pp top-1. That is a real regression and a
-reason to stop at one epoch, but it is not a collapse, and reading the curve as
-one overstates what happened.
+reason to stop early, but it is not a collapse, and reading the curve as one
+overstates what happened.
 
-**2. Epoch 1 is the best checkpoint, and every metric agrees.** Validation
-policy loss rose monotonically and top-1 fell monotonically across all five
-epochs while training loss fell monotonically. The train/validation gap grew
-from +0.007 to +0.215, a 30x widening.
+**2. Validation degraded monotonically, which is not the same as epoch 1 being
+best.** Validation policy loss rose and top-1 fell across all five epochs while
+training loss fell, and the train/validation gap grew from +0.007 to +0.215, a
+30x widening. That the run overfits is established. *Which* epoch plays best was
+never measured here, and in the anchored run the analogous validation ranking
+turned out to be exactly backwards.
 
 **3. The epoch-4 value spike was noise, not a breakdown.** `va_mse` went
 0.0966 → 0.0982 → 0.0976 → **0.1229** → 0.0982. Epoch 4 was an outlier that
@@ -117,9 +130,11 @@ Four causes, in rough order of size:
 
 ## What to do next
 
-- Re-run with the recipe: `--epochs 1 --learning-rate 0.00005
-  --policy-anchor-weight 0.3 --replay-capacity 4000000`.
-- Evaluate **epoch 1** of this run, not epoch 5, if it is evaluated at all. It is
-  a legitimate no-anchor, high-LR ablation and its value-anchor number is worth
-  having as a control.
+- Re-run with the recipe. This was done: see
+  [the anchor-030 results](2026-08-22-anchor-030-combined-3m-results.md), which
+  reached +48 Elo at epoch 2 on this same dataset.
+- Epoch 1 of this run was matched against the parent: **0.4912 (−6 Elo), CI
+  [0.457, 0.525]**, non-decisive. It stands as the no-anchor control, and against
+  the anchored run's +48 it is the measurement that quantifies what the anchor is
+  worth.
 - Keep the dataset. It is independent of this run's training mistake.

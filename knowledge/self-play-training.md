@@ -53,10 +53,21 @@ separately as `anchor_loss`.
 uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
   --run-name policy-anchor-030 \
   --replay-capacity 2000000 \
-  --epochs 1 \
+  --epochs 2 \
   --learning-rate 0.00005 \
   --policy-anchor-weight 0.3
 ```
+
+Two epochs, not one. Epoch 2 was measured at +32 Elo over epoch 1 on a 3.58M
+dataset, and epoch 3 lost 27 Elo to epoch 2 in a decisive head-to-head, so the
+optimum is a peak rather than a ceiling. Pick the epoch with matches, never with
+validation loss: validation ranked epoch 1 above epoch 2 and rated epoch 3's
+value head best of three, and the board contradicted it both times. See
+[the anchor-030 results](self-play-runs/2026-08-22-anchor-030-combined-3m-results.md).
+
+`--resume` restores model and optimizer state but reads configuration from
+flags, so a resumed epoch must repeat `--policy-anchor-weight`, or it trains
+with no anchor and nothing says so. `--epochs` is a cumulative target.
 
 ## Live progress
 
