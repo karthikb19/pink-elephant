@@ -182,6 +182,7 @@ impl PySelfPlayEngine {
         virtual_loss = 0.0,
         tree_reuse = false,
         eval_cache_entries = 0,
+        first_game_ordinal = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -206,6 +207,7 @@ impl PySelfPlayEngine {
         virtual_loss: f64,
         tree_reuse: bool,
         eval_cache_entries: usize,
+        first_game_ordinal: u64,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -215,6 +217,7 @@ impl PySelfPlayEngine {
             start_fens,
             paired_starts,
             eval_cache_entries,
+            first_game_ordinal,
             search: SearchConfig {
                 simulations,
                 simulations_b,

@@ -25,6 +25,8 @@ from pink_elephant.encoding import (
 REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v3"
 LEGACY_REPLAY_SCHEMA_VERSION: Final[str] = "self-play/replay/v2"
 GAME_SCHEMA_VERSION: Final[str] = "self-play/games/v1"
+# Sidecar written beside each sealed shard so a preempted worker can resume.
+SHARD_GAMES_SCHEMA_VERSION: Final[str] = "self-play/shard-games/v1"
 WORKER_RESULT_SCHEMA_VERSION: Final[str] = "self-play/worker-result/v1"
 ROUND_SCHEMA_VERSION: Final[str] = "self-play/round/v1"
 SNAPSHOT_SCHEMA_VERSION: Final[str] = "self-play/snapshot/v1"

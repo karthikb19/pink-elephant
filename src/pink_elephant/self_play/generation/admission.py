@@ -31,7 +31,7 @@ import pe_search
 from pink_elephant.self_play.contracts import GameRecord
 from pink_elephant.self_play.generation.native_host import adapt_completed_game
 from pink_elephant.self_play.generation.observability import log_event
-from pink_elephant.self_play.generation.shards import ReplayShardBuilder
+from pink_elephant.self_play.generation.shards import ReplayShardBuilder, ResumedShards
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,7 @@ class ReplayAdmissionWriter:
         position_lower_bound: int,
         replay_stride: int = 1,
         max_pending: int = DEFAULT_MAX_PENDING,
+        resumed: ResumedShards | None = None,
     ) -> None:
         if max_pending < 1:
             raise ValueError("max_pending must be positive")
@@ -119,6 +120,13 @@ class ReplayAdmissionWriter:
         self._lock = threading.Lock()
         self._timings = AdmissionTimings()
         self._results = AdmissionResults()
+        if resumed is not None:
+            # Games a previous attempt sealed are already durable, so they count
+            # toward the quota this attempt has left to fill.
+            self._results.completed_games.extend(resumed.games)
+            self._results.position_count = resumed.position_count
+            for record in resumed.games:
+                self._results.termination_counts[record.termination] += 1
         self._failure: BaseException | None = None
         self._started = False
         self._closed = False
@@ -243,7 +251,7 @@ class ReplayAdmissionWriter:
 
         adapt_elapsed = time.perf_counter() - adapt_started
         shard_started = time.perf_counter()
-        self._shard_builder.add_game(rows)
+        self._shard_builder.add_game(rows, record)
         shard_elapsed = time.perf_counter() - shard_started
         with self._lock:
             self._timings.adapt_seconds += adapt_elapsed

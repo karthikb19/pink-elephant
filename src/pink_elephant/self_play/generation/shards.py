@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shutil
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +18,7 @@ from pink_elephant.self_play.contracts import (
     GAME_SCHEMA_VERSION,
     LEGACY_REPLAY_SCHEMA_VERSION,
     REPLAY_SCHEMA_VERSION,
+    SHARD_GAMES_SCHEMA_VERSION,
     GameRecord,
     GameTableRef,
     ReplayRow,
@@ -349,11 +352,19 @@ def validate_games_table(path: Path) -> GameTableRef:
 
 @dataclass(slots=True)
 class ReplayShardBuilder:
-    """Accumulate complete games without ever splitting one across shards."""
+    """Accumulate complete games without ever splitting one across shards.
+
+    Sealing a shard also writes a sidecar holding the game records it contains,
+    which is what makes a preempted worker resumable: a shard and its sidecar
+    together are a complete, self-describing unit of finished work. The sidecar
+    is written after the shard, so a shard without one is a torn write from a
+    container that died mid-seal.
+    """
 
     output_dir: Path
     max_positions: int
     _games: list[tuple[ReplayRow, ...]] = field(default_factory=list, init=False)
+    _records: list[GameRecord] = field(default_factory=list, init=False)
     _position_count: int = field(default=0, init=False)
     _shard_index: int = field(default=0, init=False)
     _references: list[ReplayShardRef] = field(default_factory=list, init=False)
@@ -363,7 +374,7 @@ class ReplayShardBuilder:
         if self.max_positions < 1:
             raise ValueError("max_positions must be positive")
 
-    def add_game(self, rows: Sequence[ReplayRow]) -> None:
+    def add_game(self, rows: Sequence[ReplayRow], record: GameRecord) -> None:
         """Add one complete game, flushing the current shard when necessary."""
 
         if not rows:
@@ -371,13 +382,17 @@ class ReplayShardBuilder:
         game_ids = {row.game_id for row in rows}
         if len(game_ids) != 1:
             raise ValueError("one shard-builder game must have one game ID")
-        if next(iter(game_ids)) in self._game_ids:
+        game_id = next(iter(game_ids))
+        if game_id != record.game_id:
+            raise ValueError("game rows and game record must share one game ID")
+        if game_id in self._game_ids:
             raise ValueError("a game ID cannot be added to two builder groups")
         if self._games and self._position_count + len(rows) > self.max_positions:
             self._flush()
         self._games.append(tuple(rows))
+        self._records.append(record)
         self._position_count += len(rows)
-        self._game_ids.update(game_ids)
+        self._game_ids.add(game_id)
 
     def finish(self) -> tuple[ReplayShardRef, ...]:
         """Flush the final non-empty shard and return all committed references."""
@@ -385,15 +400,150 @@ class ReplayShardBuilder:
         self._flush()
         return tuple(self._references)
 
+    def adopt(self, references: Sequence[ReplayShardRef], game_ids: Sequence[str]) -> None:
+        """Take ownership of shards a previous attempt already sealed."""
+
+        if self._games or self._references:
+            raise RuntimeError("shards can only be adopted into an empty builder")
+        self._references.extend(references)
+        self._shard_index = len(references)
+        self._game_ids.update(game_ids)
+
     def _flush(self) -> None:
         if not self._games:
             return
         rows = tuple(row for game in self._games for row in game)
         path = self.output_dir / f"shard-{self._shard_index:05d}.parquet"
-        self._references.append(write_replay_shard(path, rows))
+        reference = write_replay_shard(path, rows)
+        self._references.append(reference)
+        _write_shard_games(_shard_games_path(path), reference, tuple(self._records))
         self._shard_index += 1
         self._games.clear()
+        self._records.clear()
         self._position_count = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResumedShards:
+    """Finished work recovered from a previous attempt's sealed shards."""
+
+    references: tuple[ReplayShardRef, ...]
+    games: tuple[GameRecord, ...]
+    position_count: int
+
+
+def resume_shard_builder(
+    output_dir: Path, *, max_positions: int
+) -> tuple[ReplayShardBuilder, ResumedShards]:
+    """Build over a directory a previous attempt left behind, keeping its shards.
+
+    A shard counts as finished only when its sidecar is present and the shard on
+    disk still hashes to what that sidecar recorded. Shards are adopted in index
+    order and stop at the first gap, so the builder always appends to a
+    contiguous run and no later orphan is silently skipped over. Everything not
+    adopted is deleted: an unreferenced shard left in place would be swept up by
+    dataset consolidation, which finds shards by globbing the filesystem rather
+    than by reading a manifest, and would double-count those games.
+    """
+
+    builder = ReplayShardBuilder(output_dir, max_positions=max_positions)
+    if not output_dir.is_dir():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return builder, ResumedShards(references=(), games=(), position_count=0)
+
+    references: list[ReplayShardRef] = []
+    games: list[GameRecord] = []
+    adopted: set[Path] = set()
+    for index in range(len(list(output_dir.glob("shard-*.parquet")))):
+        shard_path = output_dir / f"shard-{index:05d}.parquet"
+        recovered = _read_shard_games(shard_path)
+        if recovered is None:
+            break
+        reference, records = recovered
+        references.append(reference)
+        games.extend(records)
+        adopted.update((shard_path, _shard_games_path(shard_path)))
+
+    for path in sorted(output_dir.iterdir()):
+        if path in adopted:
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    builder.adopt(references, [record.game_id for record in games])
+    return builder, ResumedShards(
+        references=tuple(references),
+        games=tuple(games),
+        position_count=sum(reference.position_count for reference in references),
+    )
+
+
+def _shard_games_path(shard_path: Path) -> Path:
+    return shard_path.with_name(f"{shard_path.stem}-games.json")
+
+
+def _write_shard_games(
+    path: Path, reference: ReplayShardRef, records: Sequence[GameRecord]
+) -> None:
+    payload = {
+        "schema_version": SHARD_GAMES_SCHEMA_VERSION,
+        "shard": Path(reference.path).name,
+        "sha256": reference.sha256,
+        "size_bytes": reference.size_bytes,
+        "position_count": reference.position_count,
+        "game_count": reference.game_count,
+        "games": [record.to_payload() for record in records],
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _read_shard_games(
+    shard_path: Path,
+) -> tuple[ReplayShardRef, tuple[GameRecord, ...]] | None:
+    """Recover one sealed shard and its games, or None when it is not intact."""
+
+    games_path = _shard_games_path(shard_path)
+    if not shard_path.is_file() or not games_path.is_file():
+        return None
+    try:
+        payload = json.loads(games_path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != SHARD_GAMES_SCHEMA_VERSION:
+            return None
+        # The digest is the whole check. A shard still being written when the
+        # container died does not match the sidecar and is not finished work.
+        if shard_path.stat().st_size != int(payload["size_bytes"]):
+            return None
+        if sha256_file(shard_path) != payload["sha256"]:
+            return None
+        records = tuple(
+            GameRecord(
+                game_id=_required_string(game["game_id"], "game_id"),
+                seed=int(game["seed"]),
+                initial_fen=_required_string(game["initial_fen"], "initial_fen"),
+                moves_uci=tuple(_required_string(move, "move") for move in game["moves_uci"]),
+                result=_required_string(game["result"], "result"),
+                termination=_required_string(game["termination"], "termination"),
+                ply_count=int(game["ply_count"]),
+                replay_position_count=int(game["replay_position_count"]),
+            )
+            for game in payload["games"]
+        )
+        reference = ReplayShardRef(
+            path=str(shard_path),
+            sha256=str(payload["sha256"]),
+            size_bytes=int(payload["size_bytes"]),
+            position_count=int(payload["position_count"]),
+            game_count=int(payload["game_count"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        # A malformed sidecar means unusable work, not a run-ending error: the
+        # caller discards the pair and regenerates those games.
+        return None
+    if len(records) != reference.game_count:
+        return None
+    return reference, records
 
 
 def sha256_file(path: Path) -> str:

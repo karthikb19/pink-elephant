@@ -32,7 +32,11 @@ from pink_elephant.self_play.generation.config import (
     plan_worker_specs,
 )
 from pink_elephant.self_play.generation.native_host import adapt_completed_game
-from pink_elephant.self_play.generation.shards import ReplayShardBuilder, sha256_file
+from pink_elephant.self_play.generation.shards import (
+    ReplayShardBuilder,
+    load_games_table,
+    sha256_file,
+)
 from pink_elephant.self_play.generation.worker import (
     load_generation_model,
     run_native_worker,
@@ -349,6 +353,39 @@ def test_a_retry_discards_a_dead_attempts_partial_output(tmp_path: Path) -> None
     for shard in result.shards:
         assert (tmp_path / shard.path).is_file()
         assert sha256_file(tmp_path / shard.path) == shard.sha256
+
+
+def test_a_preempted_worker_resumes_from_its_sealed_shards(tmp_path: Path) -> None:
+    """The end-to-end case: a container dies after sealing shards, before publishing.
+
+    Modal restarts the Function with the same input, so the retry finds those
+    shards. Adopting them is the difference between losing the whole worker and
+    losing only the games that were still in the unsealed buffer.
+    """
+
+    generation = _generation()
+    round_spec = _round(generation, "preempt-round", positions=2)
+    worker = _worker(generation, round_spec)
+    first = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+    invocation = (tmp_path / first.result_path).parent
+    sealed = {path.name: sha256_file(path) for path in sorted(invocation.glob("shard-*.parquet"))}
+    assert sealed, "the first attempt sealed no shards, so there is nothing to resume"
+
+    # Preemption after the shards are durable but before the completion barrier.
+    (invocation / "worker-result.json").unlink()
+    (invocation / "games.parquet").unlink()
+
+    resumed = run_native_worker(worker, DrawSeekingModel(), tmp_path)
+
+    # Every sealed shard is carried over byte-for-byte rather than regenerated.
+    for name, digest in sealed.items():
+        assert sha256_file(invocation / name) == digest
+    assert {Path(shard.path).name for shard in resumed.shards} >= set(sealed)
+    assert resumed.position_count >= first.position_count
+    assert resumed.completed_game_count >= first.completed_game_count
+    # Adopted games must appear once, not twice.
+    game_ids = [game.game_id for game in load_games_table(tmp_path / resumed.games.path)]
+    assert len(game_ids) == len(set(game_ids))
 
 
 def test_native_worker_game_ids_carry_the_full_worker_identity(tmp_path: Path) -> None:

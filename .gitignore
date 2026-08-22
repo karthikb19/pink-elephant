@@ -225,3 +225,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Stray lock from running uv inside the crate directory.
+rust/pe-search/uv.lock
