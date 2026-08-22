@@ -299,3 +299,24 @@ def test_replay_buffer_rejects_a_q_ratio_outside_the_unit_interval(tmp_path: Pat
 
     with pytest.raises(ValueError, match="value_target_q_ratio"):
         ReplayBuffer(tmp_path, capacity=8, validation_fraction=0.5, value_target_q_ratio=1.5)
+
+
+def test_zero_validation_fraction_trains_on_every_position(tmp_path: Path) -> None:
+    _blend_dataset(tmp_path, outcome=1, root_value=0.2)
+
+    replay = ReplayBuffer(tmp_path, capacity=8, validation_fraction=0.0, seed=3)
+    train_positions = sum(
+        batch.positions.shape[0]
+        for batch in replay.iter_batches(split="train", batch_size=4, shuffle=False)
+    )
+
+    assert replay.stats.validation_positions == 0
+    assert replay.stats.train_positions == replay.stats.selected_positions
+    assert train_positions == replay.stats.selected_positions
+
+
+def test_replay_buffer_rejects_a_validation_fraction_of_one(tmp_path: Path) -> None:
+    _blend_dataset(tmp_path, outcome=1, root_value=0.2)
+
+    with pytest.raises(ValueError, match=r"validation_fraction must be finite and in \[0, 1\)"):
+        ReplayBuffer(tmp_path, capacity=8, validation_fraction=1.0)

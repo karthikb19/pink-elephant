@@ -84,32 +84,36 @@ cost. Otherwise: with zero holdout, the epoch curve has to come entirely from
 play — the 64–128-game matches at epochs 1/3/5/10 stop being a nice-to-have
 and become the only overfitting readout.
 
-### Implementation delta
+### Implementation — done on `kb/scratch-distill-small-net`
 
-Concrete, and smaller than it looks. All in
-`src/pink_elephant/self_play/learning/`:
+Both blockers are cleared; the run is a command, not a code task.
 
-1. **Allow zero validation.** Two guards reject it —
-   `modal_app.py:134` and `replay.py:191` (both `0 < f < 1`); relax to
-   `0 <= f < 1`. Then the epoch loop must skip the validation pass when
-   `replay.stats.validation_positions == 0`: `trainer.validate()` on an empty
-   iterable raises `"at least one validation batch is required"`
-   (`training.py:433`). `save_checkpoint(metrics=None)` is already supported,
-   and `SelfPlayEpochMetrics` needs its validation fields made optional (or
-   written as nulls) for those epochs.
-2. **Scratch init with a configurable size.** Add `--model-channels` /
-   `--model-blocks`; when set, build the spec from `chess_resnet_spec()`
-   instead of the replay manifest, and skip
-   `_resolve_parent_checkpoint` / `load_model_weights` in the non-resume
-   branch (`modal_app.py:274-283`). Store the overridden spec in the run
-   layout so `--resume`'s `layout.manifest.model` check still holds.
-3. Anchor path is untouched — it is already gated on
-   `policy_anchor_weight > 0`.
+1. **Zero holdout.** `validation_fraction` now accepts `[0, 1)` in both
+   `SelfPlayTrainingConfig` and `ReplayBuffer`; a zero fraction is treated as
+   the requested state rather than a degenerate selection, and the epoch loop
+   skips the validation pass (logging `validation_phase_skipped`) instead of
+   tripping `"at least one validation batch is required"`. The validation
+   fields in `SelfPlayEpochMetrics` are written as nulls for those epochs.
+2. **Scratch init.** `--from-scratch` builds the model from
+   `--model-channels` / `--model-blocks` (defaults 128 and 6) instead of the
+   replay manifest's spec, and skips parent resolution and weight loading. It
+   refuses a policy anchor or an explicit parent, logs the parameter count,
+   and records `from_scratch`, the size, and a `-from-scratch` objective in
+   the run manifest.
 
-Alternative if that is unappealing: reuse the expert pretraining entry point
-(`modal_training.py`, which already does random init + 3e-4) pointed at the
-replay dataset. Implementer's choice; the invariants are: random init,
-configurable size, soft replay targets, zero holdout, per-epoch checkpoints.
+Launch:
+
+```
+uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
+    --run-name scratch-128x6-200sim-blended-ep10 \
+    --from-scratch \
+    --validation-fraction 0 \
+    --learning-rate 3e-4 \
+    --epochs 10
+```
+
+Everything else is already the default: 128×6, batch 1024, per-epoch
+checkpoints, `value_weight = 0.25`, no anchor, the v2 dataset volume.
 
 ## Evaluation — parent-relative Elo is NOT the bar
 

@@ -30,9 +30,10 @@ import torch
 
 from pink_elephant.arena import load_checkpoint_model
 from pink_elephant.artifacts import RunIdentity, RunParameter, RunStore
-from pink_elephant.contracts import TrainingBatch
+from pink_elephant.contracts import TrainingBatch, ValidationMetrics
 from pink_elephant.modal_image import build_image
-from pink_elephant.model_adapter import build_model
+from pink_elephant.model import ResNetConfig
+from pink_elephant.model_adapter import build_model, chess_resnet_spec
 from pink_elephant.self_play.learning.replay import (
     DEFAULT_REPLAY_CAPACITY,
     DEFAULT_SHUFFLE_BUFFER_SIZE,
@@ -73,6 +74,10 @@ DEFAULT_POLICY_HEAD_ONLY: Final[bool] = False
 DEFAULT_POLICY_ANCHOR_WEIGHT: Final[float] = 0.0
 DEFAULT_VALUE_HEAD_ONLY: Final[bool] = False
 DEFAULT_CHECKPOINT_INTERVAL: Final[int] = 1
+# Distillation students are trained from random init at the size named in the
+# scratch-distillation plan; fine-tunes keep taking their size from the parent.
+DEFAULT_SCRATCH_CHANNELS: Final[int] = 128
+DEFAULT_SCRATCH_BLOCKS: Final[int] = 6
 DEFAULT_PREFETCH_BATCHES: Final[int] = 4
 DEFAULT_PROGRESS_INTERVAL_BATCHES: Final[int] = 25
 DEFAULT_PHASE_TIMING_BATCHES: Final[int] = 5
@@ -112,6 +117,9 @@ class SelfPlayTrainingConfig:
     seed: int = 0
     verify_hashes: bool = True
     parent_checkpoint_volume_path: str | None = None
+    from_scratch: bool = False
+    model_channels: int = DEFAULT_SCRATCH_CHANNELS
+    model_blocks: int = DEFAULT_SCRATCH_BLOCKS
     resume: bool = False
     git_revision: str | None = None
 
@@ -131,8 +139,19 @@ class SelfPlayTrainingConfig:
             raise ValueError("seed must be non-negative")
         if self.phase_timing_batches < 0:
             raise ValueError("phase_timing_batches must be non-negative")
-        if not 0 < self.validation_fraction < 1:
-            raise ValueError("validation_fraction must be in (0, 1)")
+        if not 0 <= self.validation_fraction < 1:
+            raise ValueError("validation_fraction must be in [0, 1)")
+        for name, value in (
+            ("model_channels", self.model_channels),
+            ("model_blocks", self.model_blocks),
+        ):
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.from_scratch:
+            if self.policy_anchor_weight > 0:
+                raise ValueError("a from-scratch run has no parent to anchor to")
+            if self.parent_checkpoint_volume_path is not None:
+                raise ValueError("from_scratch and parent_checkpoint_volume_path are exclusive")
         for name, value in (
             ("learning_rate", self.learning_rate),
             ("weight_decay", self.weight_decay),
@@ -155,12 +174,12 @@ class SelfPlayEpochMetrics:
     step: int
     train: TrainingSummary
     validation_examples: int
-    validation_policy_loss: float
-    validation_uniform_policy_loss: float
-    validation_policy_top1_accuracy: float
-    validation_policy_top5_accuracy: float
-    validation_value_mse: float
-    validation_value_mae: float
+    validation_policy_loss: float | None
+    validation_uniform_policy_loss: float | None
+    validation_policy_top1_accuracy: float | None
+    validation_policy_top5_accuracy: float | None
+    validation_value_mse: float | None
+    validation_value_mae: float | None
     checkpoint: str | None
     elapsed_seconds: float
     recorded_at: str
@@ -249,7 +268,19 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
         value_target_q_ratio=config.value_target_q_ratio,
         verify_hashes=config.verify_hashes,
     )
-    model_spec = replay.manifest.sources[0].model_spec
+    dataset_model_spec = replay.manifest.sources[0].model_spec
+    # A fine-tune must match the net that generated the replay; a scratch
+    # student is a different, smaller architecture reading the same targets.
+    model_spec = (
+        chess_resnet_spec(
+            ResNetConfig(
+                channels=config.model_channels,
+                residual_blocks=config.model_blocks,
+            )
+        )
+        if config.from_scratch
+        else dataset_model_spec
+    )
     trainer = Trainer(
         build_model(model_spec),
         TrainerConfig(
@@ -275,9 +306,18 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
     else:
         if (RUNS_ROOT / config.run_id).exists():
             raise FileExistsError(f"training run already exists: {config.run_id}")
-        parent_path, parent_sha256 = _resolve_parent_checkpoint(replay, config)
-        _validate_parent_checkpoint(parent_path, expected_sha256=parent_sha256)
-        trainer.load_model_weights(parent_path)
+        parent_path: Path | None = None
+        parent_sha256: str | None = None
+        if config.from_scratch:
+            _log_event(
+                "scratch_initialization",
+                model_spec=model_spec.to_payload(),
+                parameter_count=sum(parameter.numel() for parameter in trainer.model.parameters()),
+            )
+        else:
+            parent_path, parent_sha256 = _resolve_parent_checkpoint(replay, config)
+            _validate_parent_checkpoint(parent_path, expected_sha256=parent_sha256)
+            trainer.load_model_weights(parent_path)
         layout = store.initialize(
             RunIdentity.parse(config.run_id),
             model_spec,
@@ -361,35 +401,41 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             optimizer_step=trainer.step,
             summary=asdict(training),
         )
-        validation_batches = replay.iter_batches(
-            split="validation",
-            batch_size=config.batch_size,
-            shuffle=False,
-            prefetch_batches=config.prefetch_batches,
-            pin_memory=True,
-        )
-        validation_started = time.perf_counter()
-        try:
-            validation = trainer.validate(
-                _log_batch_progress(
-                    validation_batches,
-                    phase="validation",
-                    epoch=target_epoch,
-                    total_batches=validation_batch_count,
-                    total_examples=replay.stats.validation_positions,
-                    interval_batches=config.progress_interval_batches,
-                    optimizer_step_start=trainer.step,
-                )
+        validation: ValidationMetrics | None = None
+        if replay.stats.validation_positions:
+            validation_batches = replay.iter_batches(
+                split="validation",
+                batch_size=config.batch_size,
+                shuffle=False,
+                prefetch_batches=config.prefetch_batches,
+                pin_memory=True,
             )
-        finally:
-            _close_batches(validation_batches)
-        _log_event(
-            "validation_phase_completed",
-            elapsed_seconds=time.perf_counter() - validation_started,
-            epoch=target_epoch,
-            metrics=asdict(validation),
-            optimizer_step=trainer.step,
-        )
+            validation_started = time.perf_counter()
+            try:
+                validation = trainer.validate(
+                    _log_batch_progress(
+                        validation_batches,
+                        phase="validation",
+                        epoch=target_epoch,
+                        total_batches=validation_batch_count,
+                        total_examples=replay.stats.validation_positions,
+                        interval_batches=config.progress_interval_batches,
+                        optimizer_step_start=trainer.step,
+                    )
+                )
+            finally:
+                _close_batches(validation_batches)
+            _log_event(
+                "validation_phase_completed",
+                elapsed_seconds=time.perf_counter() - validation_started,
+                epoch=target_epoch,
+                metrics=asdict(validation),
+                optimizer_step=trainer.step,
+            )
+        else:
+            # Zero holdout is a deliberate setting, so the epoch curve comes
+            # from training loss and play instead of validation metrics.
+            _log_event("validation_phase_skipped", epoch=target_epoch)
         checkpoint_name: str | None = None
         if target_epoch % config.checkpoint_interval == 0 or target_epoch == config.epochs:
             checkpoint_path = layout.checkpoints.path_for(trainer.epoch, trainer.step)
@@ -412,13 +458,17 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             epoch=trainer.epoch,
             step=trainer.step,
             train=training,
-            validation_examples=validation.example_count,
-            validation_policy_loss=validation.policy_loss,
-            validation_uniform_policy_loss=validation.uniform_policy_loss,
-            validation_policy_top1_accuracy=validation.policy_top1_accuracy,
-            validation_policy_top5_accuracy=validation.policy_top5_accuracy,
-            validation_value_mse=validation.value_mse,
-            validation_value_mae=validation.value_mae,
+            validation_examples=validation.example_count if validation else 0,
+            validation_policy_loss=validation.policy_loss if validation else None,
+            validation_uniform_policy_loss=(validation.uniform_policy_loss if validation else None),
+            validation_policy_top1_accuracy=(
+                validation.policy_top1_accuracy if validation else None
+            ),
+            validation_policy_top5_accuracy=(
+                validation.policy_top5_accuracy if validation else None
+            ),
+            validation_value_mse=validation.value_mse if validation else None,
+            validation_value_mae=validation.value_mae if validation else None,
             checkpoint=checkpoint_name,
             elapsed_seconds=time.perf_counter() - started,
             recorded_at=datetime.now(UTC).isoformat(),
@@ -465,6 +515,9 @@ def main(
     progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES,
     phase_timing_batches: int = DEFAULT_PHASE_TIMING_BATCHES,
     parent_checkpoint_volume_path: str | None = None,
+    from_scratch: bool = False,
+    model_channels: int = DEFAULT_SCRATCH_CHANNELS,
+    model_blocks: int = DEFAULT_SCRATCH_BLOCKS,
     resume: bool = False,
     verify_hashes: bool = True,
 ) -> None:
@@ -488,6 +541,9 @@ def main(
         progress_interval_batches=progress_interval_batches,
         phase_timing_batches=phase_timing_batches,
         parent_checkpoint_volume_path=parent_checkpoint_volume_path,
+        from_scratch=from_scratch,
+        model_channels=model_channels,
+        model_blocks=model_blocks,
         resume=resume,
         verify_hashes=verify_hashes,
         git_revision=_git_revision(),
@@ -535,7 +591,7 @@ def _training_volume_path(relative_path: str) -> Path:
 def _run_parameters(
     config: SelfPlayTrainingConfig,
     replay: ReplayBuffer,
-    parent_path: Path,
+    parent_path: Path | None,
     parent_sha256: str | None,
 ) -> tuple[RunParameter, ...]:
     return tuple(
@@ -549,8 +605,15 @@ def _run_parameters(
                 "gpu": DEFAULT_GPU,
                 "grad_clip_norm": config.grad_clip_norm,
                 "learning_rate": config.learning_rate,
-                "parent_checkpoint": str(parent_path.relative_to(TRAINING_MOUNT)),
+                "parent_checkpoint": (
+                    str(parent_path.relative_to(TRAINING_MOUNT))
+                    if parent_path is not None
+                    else None
+                ),
                 "parent_checkpoint_sha256": parent_sha256,
+                "from_scratch": config.from_scratch,
+                "model_channels": config.model_channels,
+                "model_blocks": config.model_blocks,
                 "prefetch_batches": config.prefetch_batches,
                 "progress_interval_batches": config.progress_interval_batches,
                 "phase_timing_batches": config.phase_timing_batches,
@@ -578,6 +641,8 @@ def _training_objective(config: SelfPlayTrainingConfig) -> str:
         objective = "soft-mcts-policy-cross-entropy-plus-value-mse"
     if config.policy_anchor_weight > 0:
         return f"{objective}-with-parent-policy-anchor"
+    if config.from_scratch:
+        return f"{objective}-from-scratch"
     return objective
 
 

@@ -188,8 +188,8 @@ class ReplayBuffer:
             raise ValueError("capacity must be positive")
         if not math.isfinite(value_target_q_ratio) or not 0 <= value_target_q_ratio <= 1:
             raise ValueError("value_target_q_ratio must be finite and in [0, 1]")
-        if not math.isfinite(validation_fraction) or not 0 < validation_fraction < 1:
-            raise ValueError("validation_fraction must be finite and in (0, 1)")
+        if not math.isfinite(validation_fraction) or not 0 <= validation_fraction < 1:
+            raise ValueError("validation_fraction must be finite and in [0, 1)")
         if seed < 0:
             raise ValueError("seed must be non-negative")
         self.dataset_dir = dataset_dir
@@ -202,8 +202,12 @@ class ReplayBuffer:
         self.selected_shards = select_recent_replay_shards(self.manifest.shards, capacity=capacity)
         self._validate_files(verify_hashes=verify_hashes)
         train_positions, validation_positions, validation_games = self._index_splits()
-        if train_positions == 0 or validation_positions == 0:
-            raise ValueError("replay selection must contain both training and validation games")
+        if train_positions == 0:
+            raise ValueError("replay selection must contain training games")
+        # A zero fraction trains on every position, so an empty validation split
+        # is the requested state rather than a degenerate selection.
+        if validation_fraction > 0 and validation_positions == 0:
+            raise ValueError("replay selection must contain validation games")
         self._validation_games = validation_games
         self.stats = ReplayBufferStats(
             available_positions=self.manifest.total_position_count,

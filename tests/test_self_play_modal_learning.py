@@ -108,3 +108,37 @@ def test_policy_head_only_config_records_a_distinct_training_objective() -> None
 
     assert config.value_weight == pytest.approx(0.0)
     assert _training_objective(config) == "soft-mcts-policy-cross-entropy-policy-head-only"
+
+
+def test_self_play_modal_config_accepts_a_zero_validation_fraction() -> None:
+    config = SelfPlayTrainingConfig(run_id=RUN_ID, validation_fraction=0.0)
+
+    assert config.validation_fraction == pytest.approx(0.0)
+
+
+def test_self_play_modal_config_rejects_a_validation_fraction_of_one() -> None:
+    with pytest.raises(ValueError, match=r"validation_fraction must be in \[0, 1\)"):
+        SelfPlayTrainingConfig(run_id=RUN_ID, validation_fraction=1.0)
+
+
+def test_scratch_config_records_its_objective_and_default_size() -> None:
+    config = SelfPlayTrainingConfig(run_id=RUN_ID, from_scratch=True)
+
+    assert (config.model_channels, config.model_blocks) == (128, 6)
+    assert (
+        _training_objective(config) == "soft-mcts-policy-cross-entropy-plus-value-mse-from-scratch"
+    )
+
+
+def test_scratch_config_rejects_a_parent_policy_anchor() -> None:
+    with pytest.raises(ValueError, match="no parent to anchor to"):
+        SelfPlayTrainingConfig(run_id=RUN_ID, from_scratch=True, policy_anchor_weight=0.3)
+
+
+def test_scratch_config_rejects_an_explicit_parent_checkpoint() -> None:
+    with pytest.raises(ValueError, match="exclusive"):
+        SelfPlayTrainingConfig(
+            run_id=RUN_ID,
+            from_scratch=True,
+            parent_checkpoint_volume_path="runs/parent/checkpoint.pt",
+        )
