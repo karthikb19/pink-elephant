@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 
 import chess
 import pytest
@@ -12,10 +13,15 @@ from pink_elephant.mcts import (
     _backup_value,
     _cached_terminal_value,
     apply_root_policy_temperature,
+    forced_playout_count,
+    prune_root_visit_counts,
+    pruned_root_summary_visit_distribution,
+    pruned_root_visit_distribution,
     puct_score,
     root_visit_distribution,
     run_mcts,
     select_child_with_puct,
+    summarize_root,
 )
 
 
@@ -564,3 +570,101 @@ def test_terminal_root_has_no_visit_distribution() -> None:
     root_node = run_mcts(terminal_board, _uniform_prediction, MCTSConfig(num_simulations=2))
 
     assert root_visit_distribution(root_node) == {}
+
+
+def test_forced_playout_count_follows_the_katago_square_root_rule() -> None:
+    # sqrt(k * P * sum N) with k=2, P=0.5, sum=100 -> sqrt(100) = 10
+    assert forced_playout_count(0.5, 100, 2.0) == 10
+    assert forced_playout_count(0.5, 100, 0.0) == 0
+    assert forced_playout_count(0.0, 100, 2.0) == 0
+    assert forced_playout_count(0.5, 0, 2.0) == 0
+
+
+def test_forced_playouts_grow_with_search_but_decay_as_a_share() -> None:
+    small = forced_playout_count(0.1, 100, 2.0)
+    large = forced_playout_count(0.1, 10_000, 2.0)
+
+    assert large > small
+    assert large / 10_000 < small / 100
+
+
+def _root_with_children(
+    visits_priors_values: Sequence[tuple[int, float, float]],
+) -> MCTSNode:
+    root = MCTSNode(board=chess.Board())
+    root.visit_count = sum(visits for visits, _, _ in visits_priors_values) + 1
+    root.expanded = True
+    for index, (visits, prior, value) in enumerate(visits_priors_values):
+        child = MCTSNode(board=chess.Board(), policy_action_index=index)
+        child.visit_count = visits
+        child.prior_probability = prior
+        child.total_value = value * visits if visits else 0.0
+        root.children_by_action_index[index] = child
+    return root
+
+
+def test_pruning_leaves_the_most_visited_child_untouched() -> None:
+    root = _root_with_children([(60, 0.6, -0.2), (25, 0.3, 0.05), (15, 0.1, 0.15)])
+
+    counts = prune_root_visit_counts(root, exploration_constant=1.1, forced_playout_k=2.0)
+
+    assert counts[0] == 60
+
+
+def test_pruning_reduces_forced_visits_on_non_best_children() -> None:
+    root = _root_with_children([(60, 0.6, -0.2), (25, 0.3, 0.05), (15, 0.1, 0.15)])
+
+    pruned = prune_root_visit_counts(root, exploration_constant=1.1, forced_playout_k=2.0)
+    raw = {index: child.visit_count for index, child in root.children_by_action_index.items()}
+
+    assert sum(pruned.values()) < sum(raw.values())
+    assert all(pruned[index] <= raw[index] for index in raw)
+
+
+def test_pruning_is_a_no_op_when_forced_playouts_are_disabled() -> None:
+    root = _root_with_children([(60, 0.6, -0.2), (25, 0.3, 0.05), (15, 0.1, 0.15)])
+
+    counts = prune_root_visit_counts(root, exploration_constant=1.1, forced_playout_k=0.0)
+
+    assert counts == {
+        index: child.visit_count for index, child in root.children_by_action_index.items()
+    }
+
+
+def test_pruning_never_empties_the_policy_target() -> None:
+    root = _root_with_children([(2, 0.5, 0.0), (1, 0.5, 0.0)])
+
+    distribution = pruned_root_visit_distribution(
+        root, exploration_constant=1.1, forced_playout_k=2.0
+    )
+
+    assert distribution
+    assert math.isclose(sum(distribution.values()), 1.0, abs_tol=1e-9)
+
+
+def test_pruned_distribution_normalizes_to_one() -> None:
+    root = _root_with_children([(60, 0.6, -0.2), (25, 0.3, 0.05), (15, 0.1, 0.15)])
+
+    distribution = pruned_root_visit_distribution(
+        root, exploration_constant=1.1, forced_playout_k=2.0
+    )
+
+    assert math.isclose(sum(distribution.values()), 1.0, abs_tol=1e-9)
+
+
+def test_summary_pruning_matches_tree_pruning() -> None:
+    root = _root_with_children([(60, 0.6, -0.2), (25, 0.3, 0.05), (15, 0.1, 0.15)])
+
+    from_tree = pruned_root_visit_distribution(root, exploration_constant=1.1, forced_playout_k=2.0)
+    from_summary = pruned_root_summary_visit_distribution(
+        summarize_root(root), exploration_constant=1.1, forced_playout_k=2.0
+    )
+
+    assert from_summary.keys() == from_tree.keys()
+    for action_index, probability in from_tree.items():
+        assert from_summary[action_index] == pytest.approx(probability, abs=1e-9)
+
+
+def test_mcts_config_rejects_a_negative_forced_playout_k() -> None:
+    with pytest.raises(ValueError, match="forced_playout_k"):
+        MCTSConfig(forced_playout_k=-1.0)

@@ -73,6 +73,14 @@ not directly equivalent to final committed throughput.
 - Comparisons with different simulation counts are not quality-matched. Position-simulations/second
   is a useful rough normalization, not proof of equivalent search behavior.
 
+## Candidate evaluations
+
+Records of trained checkpoints played against their parent, rather than of generation throughput.
+
+- [Every self-play child wins at one simulation and loses with search](2026-08-21-search-crossover.md)
+  — the 200-simulation ledger across four runs, the simulation crossover, the head-swap
+  attribution, and the `value_weight` 1.0 rejection.
+
 ## Integrity notes
 
 No exact duplicate `(generation_id, round_id)` launch or shared artifact-write conflict was found

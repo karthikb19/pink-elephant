@@ -437,6 +437,63 @@ path subsamples before building rows, skipping the FEN re-derivation for
 discarded plies, and a random offset avoids the side-to-move bias a fixed offset
 would introduce.
 
+## Forced playouts and policy target pruning
+
+Root Dirichlet noise makes a self-play game explore, but the policy target is the
+root visit distribution, so every visit spent on a noise move teaches the policy
+to predict that move. `--forced-playout-k` implements KataGo's fix in two halves.
+
+During search, each root child that has any playouts is guaranteed a minimum:
+
+```text
+n_forced(c) = sqrt(k * P(c) * sum_c' N(c'))
+```
+
+The one-half exponent lets the floor grow with search while decaying to a
+vanishing share of it, so a good noise move is explored enough to be discovered
+and a bad one never dominates. `k = 2` is the paper's value and the default.
+
+When the move is recorded, each non-best child gives those playouts back, subject
+to keeping its PUCT below the most-visited child's, and a child left with a single
+playout is dropped entirely. Move selection still uses the raw visits; only the
+stored target is pruned. On the standard position at 200 simulations this drops 6
+of 20 moves from the target and lifts the best move's share from 0.231 to 0.284.
+
+Set `--forced-playout-k 0` to disable both halves.
+
+## Move selection: the visit floor
+
+Self-play samples the played move from the root visit distribution, so a move
+holding a single visit out of 200 is played 0.5% of the time. A position offers
+dozens of them, so the tail is played often even though search rejected every
+one individually, and those are the moves that hang material.
+
+`--min-visit-fraction` drops moves below that share of the most visited move's
+visits before the temperature draw, defaulting to `0.10`. The threshold is
+relative rather than absolute so it adapts to the position: where search is
+confident the floor is high and almost everything is excluded, and where search
+genuinely cannot separate the moves the floor is low and real alternatives
+survive. **The policy target keeps the full distribution; only the played move
+is constrained.**
+
+Measured over three games at 200 simulations, the lowest visit share ever
+played:
+
+| `min_visit_fraction` | lowest share played | moves played under 5% |
+| --- | --- | --- |
+| 0.0 | 0.5% | 13 |
+| 0.10 | 3.0% | 3 |
+| 0.25 | 6.5% | 0 |
+
+KataGo solves the same problem with `chosenMovePrune` and `chosenMoveSubtract`,
+which are absolute visit thresholds rather than relative ones, paired with a
+much sharper `chosenMoveTemperature` of 0.10.
+
+Variety is better bought from the start position than from playing a move the
+search dislikes: a different opening costs nothing, while a 0.5% move costs a
+blunder. The default start mix therefore weights the human opening book most
+heavily, at 50%, against 20% for the standard position.
+
 ## Value targets
 
 Self-play value targets blend the terminal outcome with the search-averaged root
@@ -483,6 +540,59 @@ run, including batch-norm statistics, so the candidate's value predictions are
 bit-identical to the parent's. That isolates the policy targets: an arena loss
 can no longer be blamed on a drifting value head. The run manifest records
 `policy_head_only`, `value_weight`, and a matching `training_objective`.
+
+## What the self-play loop is measured against
+
+Three measurements decide whether a generation and fine-tune were worth running,
+and each answers a question the others cannot.
+
+`scripts/value_anchor.py` scores a checkpoint against 20,000 frozen held-out
+engine evaluations. Watch `scale`, the predicted spread over the target spread:
+hard `{-1, 0, 1}` targets push it above one long before mean squared error looks
+alarming. The supervised parent sits at correlation 0.878 and scale 0.903.
+
+`scripts/inspect_self_play_games.py` reports a corpus's blunder rate by material
+swing, and the result distribution. White scoring near 0.500 from the balanced
+book positions is the sign the corpus is not biased.
+
+`checkpoint_match_modal.py` plays the candidate against its parent. Sixty games
+resolve about +/-0.10, which cannot separate a 40 Elo edge from noise; 512 games
+resolve about +/-0.035. A 60-game match in this repository once read 0.558 and
+the 512-game rerun of the same pairing read 0.484.
+
+The decision record for 2026-08-20 has the numbers and what they implied.
+
+## Batched checkpoint matches
+
+The local match plays one game at a time through the Python search, evaluating a
+single leaf per forward pass, so 60 games at 200 simulations costs over an hour.
+`checkpoint_match_modal.py` drives the native engine the way generation does:
+every game runs at once and contributes one leaf per batch.
+
+```sh
+uv run modal run src/pink_elephant/checkpoint_match_modal.py \
+  --checkpoint-a runs/<run>/checkpoints/<candidate>.pt \
+  --checkpoint-b runs/<run>/checkpoints/<parent>.pt \
+  --name-a candidate --name-b parent \
+  --positions 256 --simulations 200
+```
+
+One move's whole search belongs to the model to move at its root, so every row of
+a filled batch has one owner and the host runs a forward pass per model over its
+own rows. `--positions 256` plays 512 games, since `paired_starts` puts ordinals
+2k and 2k+1 on one opening with the colours swapped; that pairing is what keeps
+White's advantage out of the result. Noise is off and play is greedy from move
+one, because a match measures strength rather than producing training data.
+
+`--simulations-b` gives model B a different per-move budget, so the same net can
+play itself at two depths. That measures what search alone is worth on a given
+checkpoint, which bounds how much a self-play target can ever improve on the
+policy it was distilled from. Zero means both sides share `--simulations`.
+
+Checkpoint paths are relative to the training Volume, so nothing is uploaded. The
+summary reports the score, its 95% interval, and whether that interval clears
+parity: 60 games resolve about +/-0.10, which is too coarse to separate a 40 Elo
+edge from noise, while 512 games resolve about +/-0.035.
 
 ## Checkpoint arena
 

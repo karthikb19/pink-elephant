@@ -20,6 +20,9 @@ use crate::tree::Tree;
 #[derive(Debug, Clone)]
 pub struct SearchConfig {
     pub simulations: u32,
+    /// Model B's per-move budget. Zero means it matches `simulations`, which is
+    /// every case except a match that varies search depth between the two nets.
+    pub simulations_b: u32,
     pub exploration_constant: f64,
     pub dirichlet_alpha: f64,
     pub dirichlet_fraction: f64,
@@ -27,12 +30,19 @@ pub struct SearchConfig {
     pub opening_temperature: f64,
     pub temperature_cutoff_ply: u32,
     pub max_plies: u32,
+    /// KataGo's forced-playout constant. Zero disables forced playouts and the
+    /// matching policy target pruning.
+    pub forced_playout_k: f64,
+    /// Never play a move holding less than this share of the most visited move's
+    /// visits. Zero keeps every move eligible.
+    pub min_visit_fraction: f64,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simulations: 32,
+            simulations_b: 0,
             exploration_constant: 1.1,
             dirichlet_alpha: 0.3,
             dirichlet_fraction: 0.25,
@@ -40,6 +50,8 @@ impl Default for SearchConfig {
             opening_temperature: 1.0,
             temperature_cutoff_ply: 30,
             max_plies: 512,
+            forced_playout_k: 0.0,
+            min_visit_fraction: 0.0,
         }
     }
 }
@@ -57,6 +69,14 @@ impl SearchConfig {
         }
         if !self.dirichlet_fraction.is_finite() || !(0.0..=1.0).contains(&self.dirichlet_fraction) {
             return Err("dirichlet_fraction must be finite and in [0, 1]".into());
+        }
+        if !self.forced_playout_k.is_finite() || self.forced_playout_k < 0.0 {
+            return Err("forced_playout_k must be finite and non-negative".into());
+        }
+        if !self.min_visit_fraction.is_finite()
+            || !(0.0..=1.0).contains(&self.min_visit_fraction)
+        {
+            return Err("min_visit_fraction must be finite and in [0, 1]".into());
         }
         if !self.root_policy_temperature.is_finite() || self.root_policy_temperature <= 0.0 {
             return Err("root_policy_temperature must be finite and positive".into());
@@ -93,6 +113,8 @@ pub struct CompletedGame {
     pub moves_uci: Vec<String>,
     pub result: String,
     pub termination: String,
+    /// In a paired match, whether model A held white in this game.
+    pub a_is_white: bool,
     pub positions: Vec<RecordedPosition>,
     /// Game result from each recorded position's own side-to-move perspective.
     pub outcomes: Vec<i8>,
@@ -119,6 +141,7 @@ pub struct SelfPlayGame {
     pub game_id: String,
     pub seed: u64,
     initial_fen: String,
+    a_is_white: bool,
     position: GamePosition,
     tree: Tree,
     config: SearchConfig,
@@ -135,12 +158,14 @@ impl SelfPlayGame {
         seed: u64,
         start: GamePosition,
         config: SearchConfig,
+        a_is_white: bool,
     ) -> Self {
         let initial_fen = start.fen();
         Self {
             game_id,
             seed,
             initial_fen,
+            a_is_white,
             position: start,
             tree: Tree::new(),
             config,
@@ -150,6 +175,36 @@ impl SelfPlayGame {
             recorded: Vec::new(),
             rng: ChaCha8Rng::seed_from_u64(seed),
         }
+    }
+
+    /// The per-move simulation budget for whichever model owns this search.
+    ///
+    /// A match can give the two nets different depths, which is how the Elo that
+    /// search alone buys gets measured.
+    fn simulation_budget(&self) -> u32 {
+        if self.model_index() == 1 && self.config.simulations_b > 0 {
+            self.config.simulations_b
+        } else {
+            self.config.simulations
+        }
+    }
+
+    /// Side to move at the root of the search currently in progress.
+    ///
+    /// One move's whole search belongs to one model, so this decides which net
+    /// evaluates every leaf this game contributes until the move is played.
+    pub fn turn(&self) -> Color {
+        self.position.turn()
+    }
+
+    /// Whether model A holds white in this game.
+    pub fn a_is_white(&self) -> bool {
+        self.a_is_white
+    }
+
+    /// Which model owns the search in progress: 0 for A, 1 for B.
+    pub fn model_index(&self) -> u8 {
+        u8::from((self.position.turn() == Color::White) != self.a_is_white)
     }
 
     pub fn awaiting_prediction(&self) -> bool {
@@ -177,14 +232,18 @@ impl SelfPlayGame {
             if self.ply() >= self.config.max_plies {
                 return Ok(Advance::Truncated);
             }
-            if self.simulations_done >= self.config.simulations {
+            if self.simulations_done >= self.simulation_budget() {
                 self.finish_move()?;
                 continue;
             }
 
             let leaf = self
                 .tree
-                .select_leaf(&self.position, self.config.exploration_constant);
+                .select_leaf(
+                    &self.position,
+                    self.config.exploration_constant,
+                    self.config.forced_playout_k,
+                );
             if let Some(value) = leaf.terminal_value {
                 self.tree.backup(&leaf.path, value);
                 self.simulations_done += 1;
@@ -259,7 +318,10 @@ impl SelfPlayGame {
 
     /// Record the completed search as a training row and play the chosen move.
     fn finish_move(&mut self) -> Result<(), String> {
-        let policy = self.tree.root_visit_distribution();
+        let policy = self.tree.pruned_root_visit_distribution(
+            self.config.exploration_constant,
+            self.config.forced_playout_k,
+        );
         if policy.is_empty() {
             return Err("cannot finish a move from an unexpanded root".into());
         }
@@ -299,9 +361,29 @@ impl SelfPlayGame {
 
     /// Select a root action from visit counts, retaining raw visits as the target.
     fn select_action(&mut self, temperature: f64, greedy: bool) -> Result<u32, String> {
-        let statistics = self.tree.root_statistics();
+        let mut statistics = self.tree.root_statistics();
         if statistics.is_empty() {
             return Err("cannot select an action from an unexpanded root".into());
+        }
+        // Sampling proportional to visits gives every one-visit move a ticket, and
+        // a position has dozens of them, so the tail is played often even though
+        // search rejected each one. The policy target keeps the full distribution.
+        if !greedy && self.config.min_visit_fraction > 0.0 {
+            let most_visits = statistics
+                .iter()
+                .map(|&(_, visits, _)| visits)
+                .max()
+                .unwrap_or(0);
+            let floor = self.config.min_visit_fraction * most_visits as f64;
+            let eligible: Vec<(u32, u32, f64)> = statistics
+                .iter()
+                .copied()
+                .filter(|&(_, visits, _)| visits as f64 >= floor)
+                .collect();
+            // An unexpanded root leaves every count at zero; keep every action then.
+            if !eligible.is_empty() {
+                statistics = eligible;
+            }
         }
         if greedy {
             // Highest visits, then highest prior, then lowest action index.
@@ -364,6 +446,7 @@ impl SelfPlayGame {
             game_id: std::mem::take(&mut self.game_id),
             seed: self.seed,
             initial_fen: std::mem::take(&mut self.initial_fen),
+            a_is_white: self.a_is_white,
             moves_uci: std::mem::take(&mut self.moves_uci),
             result: outcome.result().to_string(),
             termination: outcome.termination.as_str().to_string(),

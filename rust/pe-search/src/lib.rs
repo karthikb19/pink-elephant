@@ -60,6 +60,9 @@ pub struct PyCompletedGame {
     /// side-to-move perspective, matching `outcomes`.
     #[pyo3(get)]
     root_values: Vec<f32>,
+    /// Whether model A held white, for scoring a paired match.
+    #[pyo3(get)]
+    a_is_white: bool,
     /// Sparse visit-count policy in CSR form: `policy_indices[offsets[i]..offsets[i+1]]`
     /// are position `i`'s action indices.
     #[pyo3(get)]
@@ -135,6 +138,7 @@ impl PyCompletedGame {
             ply_indices,
             selected_action_indices,
             outcomes: game.outcomes,
+            a_is_white: game.a_is_white,
             root_values,
             policy_indices,
             policy_probabilities,
@@ -160,6 +164,7 @@ impl PySelfPlayEngine {
         seed,
         game_id_prefix,
         simulations = 32,
+        simulations_b = 0,
         pending_batches = 2,
         exploration_constant = 1.1,
         dirichlet_alpha = 0.3,
@@ -169,6 +174,9 @@ impl PySelfPlayEngine {
         temperature_cutoff_ply = 30,
         max_plies = 512,
         start_fens = Vec::new(),
+        forced_playout_k = 0.0,
+        min_visit_fraction = 0.0,
+        paired_starts = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -176,6 +184,7 @@ impl PySelfPlayEngine {
         seed: u64,
         game_id_prefix: String,
         simulations: u32,
+        simulations_b: u32,
         pending_batches: usize,
         exploration_constant: f64,
         dirichlet_alpha: f64,
@@ -185,6 +194,9 @@ impl PySelfPlayEngine {
         temperature_cutoff_ply: u32,
         max_plies: u32,
         start_fens: Vec<String>,
+        forced_playout_k: f64,
+        min_visit_fraction: f64,
+        paired_starts: bool,
     ) -> PyResult<Self> {
         let config = EngineConfig {
             games,
@@ -192,8 +204,10 @@ impl PySelfPlayEngine {
             seed,
             game_id_prefix,
             start_fens,
+            paired_starts,
             search: SearchConfig {
                 simulations,
+                simulations_b,
                 exploration_constant,
                 dirichlet_alpha,
                 dirichlet_fraction,
@@ -201,6 +215,8 @@ impl PySelfPlayEngine {
                 opening_temperature,
                 temperature_cutoff_ply,
                 max_plies,
+                forced_playout_k,
+                min_visit_fraction,
             },
         };
         SelfPlayEngine::new(config)
@@ -217,6 +233,14 @@ impl PySelfPlayEngine {
     /// is the ticket `submit` must quote.
     ///
     /// The GIL is released for the whole traversal.
+    /// Which model owns each row of a filled batch: 0 for A, 1 for B.
+    fn batch_model_indices(&self, batch_id: u64) -> PyResult<Vec<u8>> {
+        self.inner
+            .batch_model_indices(batch_id)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| value_error(format!("unknown batch id {batch_id}")))
+    }
+
     fn fill_batch(
         &mut self,
         py: Python<'_>,
@@ -321,14 +345,20 @@ pub struct PyRootSearch {
     simulations: u32,
     completed: u32,
     exploration_constant: f64,
+    forced_playout_k: f64,
     pending: Option<(Vec<u32>, Vec<(u32, Move)>)>,
 }
 
 #[pymethods]
 impl PyRootSearch {
     #[new]
-    #[pyo3(signature = (fen, *, simulations = 32, exploration_constant = 1.1))]
-    fn new(fen: &str, simulations: u32, exploration_constant: f64) -> PyResult<Self> {
+    #[pyo3(signature = (fen, *, simulations = 32, exploration_constant = 1.1, forced_playout_k = 0.0))]
+    fn new(
+        fen: &str,
+        simulations: u32,
+        exploration_constant: f64,
+        forced_playout_k: f64,
+    ) -> PyResult<Self> {
         if simulations < 1 {
             return Err(value_error("simulations must be positive".into()));
         }
@@ -338,6 +368,7 @@ impl PyRootSearch {
             simulations,
             completed: 0,
             exploration_constant,
+            forced_playout_k,
             pending: None,
         })
     }
@@ -357,6 +388,7 @@ impl PyRootSearch {
             return Err(value_error("buffer_ptr must not be null".into()));
         }
         let exploration_constant = self.exploration_constant;
+        let forced_playout_k = self.forced_playout_k;
         let position = &self.position;
         let tree = &mut self.tree;
         let simulations = self.simulations;
@@ -365,7 +397,7 @@ impl PyRootSearch {
 
         py.detach(move || -> Result<bool, String> {
             while *completed < simulations {
-                let leaf = tree.select_leaf(position, exploration_constant);
+                let leaf = tree.select_leaf(position, exploration_constant, forced_playout_k);
                 if let Some(value) = leaf.terminal_value {
                     tree.backup(&leaf.path, value);
                     *completed += 1;
@@ -430,6 +462,12 @@ impl PyRootSearch {
     }
 
     /// Normalized root visit counts: the training policy target.
+    /// The policy target after forced-playout pruning, as generation records it.
+    fn pruned_root_visit_distribution(&self) -> Vec<(u32, f64)> {
+        self.tree
+            .pruned_root_visit_distribution(self.exploration_constant, self.forced_playout_k)
+    }
+
     fn root_visit_distribution(&self) -> Vec<(u32, f64)> {
         self.tree.root_visit_distribution()
     }

@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import subprocess
 import time
 from collections.abc import Iterable, Iterator
@@ -27,6 +28,7 @@ from typing import Final
 import modal
 import torch
 
+from pink_elephant.arena import load_checkpoint_model
 from pink_elephant.artifacts import RunIdentity, RunParameter, RunStore
 from pink_elephant.contracts import TrainingBatch
 from pink_elephant.modal_image import build_image
@@ -47,7 +49,11 @@ from pink_elephant.training import (
 
 APP_NAME: Final[str] = "pink-elephant-self-play-training"
 # v2 replay shards carry root_value; the v1 volume is kept intact and unread.
-DATASET_VOLUME_NAME: Final[str] = "pink-elephant-self-play-datasets-v2"
+# PE_DATASET_VOLUME selects a different dataset, and the consolidation script
+# reads the same variable so the pair cannot drift.
+DATASET_VOLUME_ENV: Final[str] = "PE_DATASET_VOLUME"
+DEFAULT_DATASET_VOLUME: Final[str] = "pink-elephant-self-play-datasets-v2"
+DATASET_VOLUME_NAME: Final[str] = os.environ.get(DATASET_VOLUME_ENV, DEFAULT_DATASET_VOLUME)
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
 DATASET_MOUNT: Final[Path] = Path("/replay")
 TRAINING_MOUNT: Final[Path] = Path("/training")
@@ -64,6 +70,8 @@ DEFAULT_GRAD_CLIP_NORM: Final[float] = 1.0
 # past the engine-eval anchor's spread; 0.25 with the blended target replaces it.
 DEFAULT_VALUE_WEIGHT: Final[float] = 0.25
 DEFAULT_POLICY_HEAD_ONLY: Final[bool] = False
+DEFAULT_POLICY_ANCHOR_WEIGHT: Final[float] = 0.0
+DEFAULT_VALUE_HEAD_ONLY: Final[bool] = False
 DEFAULT_CHECKPOINT_INTERVAL: Final[int] = 1
 DEFAULT_PREFETCH_BATCHES: Final[int] = 4
 DEFAULT_PROGRESS_INTERVAL_BATCHES: Final[int] = 25
@@ -95,6 +103,8 @@ class SelfPlayTrainingConfig:
     value_weight: float = DEFAULT_VALUE_WEIGHT
     value_target_q_ratio: float = DEFAULT_VALUE_TARGET_Q_RATIO
     policy_head_only: bool = DEFAULT_POLICY_HEAD_ONLY
+    value_head_only: bool = DEFAULT_VALUE_HEAD_ONLY
+    policy_anchor_weight: float = DEFAULT_POLICY_ANCHOR_WEIGHT
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES
     progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES
@@ -250,6 +260,8 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             seed=config.seed,
             grad_clip_norm=config.grad_clip_norm,
             policy_head_only=config.policy_head_only,
+            value_head_only=config.value_head_only,
+            policy_anchor_weight=config.policy_anchor_weight,
         ),
         schema=replay.schema,
         model_spec=model_spec,
@@ -270,6 +282,17 @@ def train_self_play(config: SelfPlayTrainingConfig) -> SelfPlayTrainingResult:
             RunIdentity.parse(config.run_id),
             model_spec,
             parameters=_run_parameters(config, replay, parent_path, parent_sha256),
+        )
+
+    if config.policy_anchor_weight > 0:
+        # Anchor to the parent the replay was generated with, not to a resumed epoch.
+        anchor_path, anchor_sha256 = _resolve_parent_checkpoint(replay, config)
+        _validate_parent_checkpoint(anchor_path, expected_sha256=anchor_sha256)
+        trainer.set_policy_anchor(load_checkpoint_model(anchor_path, device="cuda").model)
+        _log_event(
+            "policy_anchor_loaded",
+            anchor=str(anchor_path.relative_to(TRAINING_MOUNT)),
+            policy_anchor_weight=config.policy_anchor_weight,
         )
 
     if trainer.epoch >= config.epochs:
@@ -435,6 +458,8 @@ def main(
     value_weight: float = DEFAULT_VALUE_WEIGHT,
     value_target_q_ratio: float = DEFAULT_VALUE_TARGET_Q_RATIO,
     policy_head_only: bool = DEFAULT_POLICY_HEAD_ONLY,
+    value_head_only: bool = DEFAULT_VALUE_HEAD_ONLY,
+    policy_anchor_weight: float = DEFAULT_POLICY_ANCHOR_WEIGHT,
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
     prefetch_batches: int = DEFAULT_PREFETCH_BATCHES,
     progress_interval_batches: int = DEFAULT_PROGRESS_INTERVAL_BATCHES,
@@ -456,6 +481,8 @@ def main(
         value_weight=value_weight,
         value_target_q_ratio=value_target_q_ratio,
         policy_head_only=policy_head_only,
+        value_head_only=value_head_only,
+        policy_anchor_weight=policy_anchor_weight,
         checkpoint_interval=checkpoint_interval,
         prefetch_batches=prefetch_batches,
         progress_interval_batches=progress_interval_batches,
@@ -530,6 +557,8 @@ def _run_parameters(
                 "replay_capacity": config.replay_capacity,
                 "seed": config.seed,
                 "policy_head_only": config.policy_head_only,
+                "value_head_only": config.value_head_only,
+                "policy_anchor_weight": config.policy_anchor_weight,
                 "training_objective": _training_objective(config),
                 "validation_fraction": config.validation_fraction,
                 "value_weight": config.value_weight,
@@ -542,8 +571,14 @@ def _run_parameters(
 
 def _training_objective(config: SelfPlayTrainingConfig) -> str:
     if config.policy_head_only:
-        return "soft-mcts-policy-cross-entropy-policy-head-only"
-    return "soft-mcts-policy-cross-entropy-plus-value-mse"
+        objective = "soft-mcts-policy-cross-entropy-policy-head-only"
+    elif config.value_head_only:
+        objective = "value-mse-value-head-only"
+    else:
+        objective = "soft-mcts-policy-cross-entropy-plus-value-mse"
+    if config.policy_anchor_weight > 0:
+        return f"{objective}-with-parent-policy-anchor"
+    return objective
 
 
 def _sha256_file(path: Path) -> str:

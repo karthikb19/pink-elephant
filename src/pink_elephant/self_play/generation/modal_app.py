@@ -17,7 +17,9 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     GENERATION_1_DIRICHLET_ALPHA,
     GENERATION_1_DIRICHLET_FRACTION,
+    GENERATION_1_FORCED_PLAYOUT_K,
     GENERATION_1_ID,
+    GENERATION_1_MIN_VISIT_FRACTION,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
     GENERATION_1_REPLAY_STRIDE,
@@ -55,16 +57,23 @@ from pink_elephant.self_play.generation.worker import (
 
 logger = logging.getLogger(__name__)
 
+# One source of truth for the mix; the entrypoint's flag defaults derive from it.
+DEFAULT_START_MIX: Final[StartPositionMix] = StartPositionMix()
+
 MODAL_VOLUME_NAME: Final[str] = "pink-elephant-training"
 MODAL_VOLUME_MOUNT: Final[Path] = Path("/data")
 SELF_PLAY_VOLUME_ROOT: Final[str] = "self-play"
-# The native engine spends about 5% of one core's wall time on search, so the
-# eight cores the Python path needed are almost entirely idle. This stays at 8 as
-# the container's declared default because the retained Python backend still needs
-# one core per MCTS process; override it per run with `--worker-cpu`.
-SELF_PLAY_CPU: Final[float] = 8.0
+# Generation runs on the native engine, which spends about 5% of one core's wall
+# time on search and waits on the GPU for the rest, so the declared reservation is
+# small. It used to be 8 because the Python backend derives one MCTS process per
+# core from PYTHON_BACKEND_CPU, and the two were the same constant; that made a
+# four-worker round declare 32 cores while reserving 2 each through --worker-cpu.
+# They are separate now so the declared number matches what the default backend
+# actually uses.
+SELF_PLAY_CPU: Final[float] = 2.0
 SELF_PLAY_NATIVE_CPU: Final[float] = 1.0
-SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(SELF_PLAY_CPU)
+PYTHON_BACKEND_CPU: Final[float] = 8.0
+SELF_PLAY_MCTS_PROCESS_COUNT: Final[int] = int(PYTHON_BACKEND_CPU)
 SELF_PLAY_MCTS_TREES_PER_PROCESS: Final[int] = 2
 SELF_PLAY_L4_GPU: Final[str] = "L4"
 SELF_PLAY_MEMORY_MB: Final[int] = 16 * 1024
@@ -208,7 +217,7 @@ def load_committed_worker_results(workers: tuple[WorkerSpec, ...]) -> tuple[Work
     output_root = MODAL_VOLUME_MOUNT / SELF_PLAY_VOLUME_ROOT
     results: list[WorkerResult] = []
     for worker in workers:
-        result_path = (
+        invocations = (
             output_root
             / worker.generation.generation_id
             / "rounds"
@@ -216,11 +225,18 @@ def load_committed_worker_results(workers: tuple[WorkerSpec, ...]) -> tuple[Work
             / "workers"
             / worker.worker_id
             / "invocations"
-            / worker.invocation_id
-            / "worker-result.json"
         )
-        if result_path.is_file():
-            results.append(load_worker_result(result_path))
+        if not invocations.is_dir():
+            continue
+        # Every attempt gets its own invocation directory, so recovery searches all
+        # of them rather than the one this launch happens to be using. A worker that
+        # finished wrote worker-result.json; an interrupted one left only shards, and
+        # is skipped so a fresh invocation can retry it.
+        for invocation in sorted(invocations.iterdir(), reverse=True):
+            result_path = invocation / "worker-result.json"
+            if result_path.is_file():
+                results.append(load_worker_result(result_path))
+                break
     return tuple(results)
 
 
@@ -387,7 +403,7 @@ def coordinate_generation_round(
     if worker_cpu is None:
         # The Python backend derives its MCTS process count from the declared CPU
         # count, so only the native backend gets the reduced default.
-        worker_cpu = SELF_PLAY_NATIVE_CPU if search_backend == "native" else SELF_PLAY_CPU
+        worker_cpu = SELF_PLAY_NATIVE_CPU if search_backend == "native" else PYTHON_BACKEND_CPU
     if worker_cpu != SELF_PLAY_CPU:
         # Invocation-time override; runs in its own container pool.
         worker_function = worker_function.with_options(cpu=worker_cpu)
@@ -489,12 +505,14 @@ def main(
     temperature_cutoff_ply: int = GENERATION_1_TEMPERATURE_CUTOFF_PLY,
     base_seed: int = 0,
     replay_stride: int = GENERATION_1_REPLAY_STRIDE,
+    forced_playout_k: float = GENERATION_1_FORCED_PLAYOUT_K,
+    min_visit_fraction: float = GENERATION_1_MIN_VISIT_FRACTION,
     start_pool_size: int = DEFAULT_START_POOL_SIZE,
-    startpos_weight: float = 0.4,
-    opening_book_weight: float = 0.3,
-    archive_balanced_weight: float = 0.18,
-    archive_moderate_weight: float = 0.075,
-    archive_decisive_weight: float = 0.045,
+    startpos_weight: float = DEFAULT_START_MIX.startpos,
+    opening_book_weight: float = DEFAULT_START_MIX.opening_book,
+    archive_balanced_weight: float = DEFAULT_START_MIX.archive_balanced,
+    archive_moderate_weight: float = DEFAULT_START_MIX.archive_moderate,
+    archive_decisive_weight: float = DEFAULT_START_MIX.archive_decisive,
     opening_book_path: str = "",
     start_archive_path: str = "",
     worker_gpu: str = SELF_PLAY_L4_GPU,
@@ -524,6 +542,8 @@ def main(
         generation_id=generation_id,
         start_pool=start_pool,
         replay_stride=replay_stride,
+        forced_playout_k=forced_playout_k,
+        min_visit_fraction=min_visit_fraction,
         simulations_per_move=simulations,
         exploration_constant=exploration_constant,
         dirichlet_alpha=dirichlet_alpha,
@@ -540,9 +560,14 @@ def main(
         active_games_per_worker=active_games_per_worker,
         shard_position_limit=shard_position_limit,
     )
+    # A distinct invocation per launch: an interrupted attempt leaves a partial
+    # directory behind, and reusing its identity would trip the non-empty guard
+    # that keeps two runs' artifacts from landing in one place.
+    invocation_id = f"invocation-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     completion = coordinate_generation_round.spawn(
         generation,
         round_spec,
+        invocation_id,
         worker_gpu=worker_gpu,
         worker_cpu=worker_cpu,
         autocast=autocast,

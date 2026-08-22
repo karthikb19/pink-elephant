@@ -24,6 +24,10 @@ pub struct EngineConfig {
     pub game_id_prefix: String,
     /// Start positions games are drawn from. Empty means the standard start.
     pub start_fens: Vec<String>,
+    /// Draw start positions by game ordinal rather than by seed, pairing ordinals
+    /// 2k and 2k+1 on one position with the colours swapped. A match needs every
+    /// opening played from both sides, which random selection cannot guarantee.
+    pub paired_starts: bool,
     pub search: SearchConfig,
 }
 
@@ -64,6 +68,8 @@ struct Ticket {
     group: usize,
     /// Slot index for each written row, in row order.
     rows: Vec<usize>,
+    /// Which model owns each row: 0 for A, 1 for B.
+    model_indices: Vec<u8>,
 }
 
 pub struct SelfPlayEngine {
@@ -118,6 +124,16 @@ impl SelfPlayEngine {
         &self.stats
     }
 
+    /// Which model owns each row of a filled batch: 0 for A, 1 for B.
+    ///
+    /// A match runs one forward pass per model over its own rows, so the host
+    /// needs the split before it can evaluate anything.
+    pub fn batch_model_indices(&self, batch_id: u64) -> Option<&[u8]> {
+        self.tickets
+            .get(&batch_id)
+            .map(|ticket| ticket.model_indices.as_slice())
+    }
+
     /// Stop replacing finished games so the run drains to zero active games.
     pub fn stop_starting_new_games(&mut self) {
         self.accepting_new_games = false;
@@ -139,16 +155,24 @@ impl SelfPlayEngine {
         let start = match self.config.start_fens.len() {
             0 => GamePosition::starting(),
             count => {
-                let index = (splitmix64(seed) % count as u64) as usize;
+                let index = if self.config.paired_starts {
+                    (ordinal % count as u64) as usize
+                } else {
+                    (splitmix64(seed) % count as u64) as usize
+                };
                 GamePosition::from_fen(&self.config.start_fens[index])
                     .expect("start fens are validated when the engine is configured")
             }
         };
+        // Even ordinals give model A white, odd give it black, so a start pool that
+        // lists each opening twice plays it once from each side.
+        let a_is_white = !self.config.paired_starts || ordinal % 2 == 0;
         self.slots[slot] = Some(SelfPlayGame::new(
             game_id,
             seed,
             start,
             self.config.search.clone(),
+            a_is_white,
         ));
     }
 
@@ -172,6 +196,7 @@ impl SelfPlayEngine {
         }
 
         let mut rows: Vec<usize> = Vec::with_capacity(self.groups[group].len());
+        let mut model_indices: Vec<u8> = Vec::with_capacity(self.groups[group].len());
         let slots = self.groups[group].clone();
         for slot in slots {
             loop {
@@ -191,6 +216,12 @@ impl SelfPlayEngine {
                             .expect("slot checked above")
                             .tree_nodes() as u64;
                         self.stats.max_tree_nodes = self.stats.max_tree_nodes.max(nodes);
+                        model_indices.push(
+                            self.slots[slot]
+                                .as_ref()
+                                .expect("slot checked above")
+                                .model_index(),
+                        );
                         rows.push(slot);
                         break;
                     }
@@ -213,7 +244,14 @@ impl SelfPlayEngine {
         let count = rows.len();
         if count > 0 {
             self.busy_groups[group] = true;
-            self.tickets.insert(batch_id, Ticket { group, rows });
+            self.tickets.insert(
+                batch_id,
+                Ticket {
+                    group,
+                    model_indices,
+                    rows,
+                },
+            );
         }
         self.stats.batches_filled += 1;
         self.stats.leaves_encoded += count as u64;

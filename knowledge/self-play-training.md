@@ -25,6 +25,39 @@ defaults are deliberately conservative:
 - legal-masked soft MCTS-policy cross-entropy plus terminal-value MSE at weight `1.0`;
 - one immutable checkpoint and one metrics record per epoch.
 
+## Anchor the policy to the parent
+
+`--policy-anchor-weight` blends a second policy cross-entropy, against the frozen
+parent's own distribution, into the policy objective:
+
+```text
+policy = (1 - lambda) * CE(visit targets) + lambda * CE(parent policy)
+```
+
+Up to the parent's own entropy, which no candidate parameter can move, the second
+term is KL(parent || candidate), so minimizing it holds the fine-tune near the
+prior it started from. It exists because every candidate so far has flattened its
+policy relative to the parent and lost Elo under search even while winning at one
+simulation; see [the crossover record](self-play-runs/2026-08-21-search-crossover.md).
+
+The anchor is always the parent checkpoint the replay was generated with, resolved
+from the dataset manifest, so a resumed run anchors to the parent rather than to
+its own latest epoch. Its parameters are frozen, held out of the optimizer, and
+never written into a checkpoint. The cost is one extra no-grad forward per batch.
+
+Reported `policy_loss` stays the unblended visit-target cross-entropy so it
+remains comparable with runs that use no anchor; the anchor term is reported
+separately as `anchor_loss`.
+
+```bash
+uv run modal run src/pink_elephant/self_play/learning/modal_app.py \
+  --run-name policy-anchor-030 \
+  --replay-capacity 2000000 \
+  --epochs 1 \
+  --learning-rate 0.00005 \
+  --policy-anchor-weight 0.3
+```
+
 ## Live progress
 
 Modal logs an `epoch_started` event with the exact train and validation batch counts. During each
@@ -67,3 +100,9 @@ Do not automatically use the newest checkpoint for the next self-play generation
 The first run is a calibration experiment. Keep the dataset, parent checkpoint, and arena settings
 fixed while comparing epochs. If later epochs stop improving in the arena, shorten subsequent runs
 rather than compensating with a larger learning rate.
+
+A single-budget match is not enough. Every candidate measured so far beats its parent at one
+simulation and loses at 200, so a match at one budget can be read either way depending on which one
+is chosen. Play at least one low and one high budget, and play the heads apart when they disagree.
+See [the crossover record](self-play-runs/2026-08-21-search-crossover.md) for the full ledger and
+the head-swap attribution.

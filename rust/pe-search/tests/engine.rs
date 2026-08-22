@@ -33,6 +33,7 @@ fn config(games: usize, pending: usize, simulations: u32) -> EngineConfig {
         seed: 20260819,
         game_id_prefix: "test".into(),
         start_fens: Vec::new(),
+        paired_starts: false,
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,
@@ -177,4 +178,145 @@ fn stopping_new_games_drains_the_active_set() {
 fn games_must_divide_evenly_into_batch_slots() {
     assert!(SelfPlayEngine::new(config(5, 2, 4)).is_err());
     assert!(SelfPlayEngine::new(config(0, 1, 4)).is_err());
+}
+
+#[test]
+fn a_visit_floor_never_plays_a_move_below_its_share() {
+    // Sampling proportional to visits otherwise plays the one-visit tail, which
+    // is where self-play blunders come from. The recorded policy keeps every
+    // move; only the played move is constrained.
+    let mut settings = config(8, 2, 64);
+    settings.search.min_visit_fraction = 0.25;
+    settings.search.temperature_cutoff_ply = 512;
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    let games = run(&mut engine, 4, 200_000);
+    assert!(!games.is_empty(), "the engine produced no completed games");
+
+    for game in &games {
+        for recorded in &game.positions {
+            let most = recorded
+                .policy
+                .iter()
+                .map(|&(_, share)| share)
+                .fold(0.0_f64, f64::max);
+            let played = recorded
+                .policy
+                .iter()
+                .find(|&&(action, _)| action == recorded.selected_action_index)
+                .map(|&(_, share)| share)
+                .expect("the played action must appear in the policy");
+            assert!(
+                played >= 0.25 * most - 1e-9,
+                "played {played} is below the floor of 0.25 * {most}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_zero_visit_floor_leaves_selection_unchanged() {
+    let mut settings = config(8, 2, 32);
+    settings.search.min_visit_fraction = 0.0;
+    let mut baseline = SelfPlayEngine::new(settings.clone()).expect("engine");
+    let expected = run(&mut baseline, 4, 200_000);
+
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    let actual = run(&mut engine, 4, 200_000);
+
+    let expected_moves: Vec<&Vec<String>> = expected.iter().map(|game| &game.moves_uci).collect();
+    let actual_moves: Vec<&Vec<String>> = actual.iter().map(|game| &game.moves_uci).collect();
+    assert_eq!(expected_moves, actual_moves);
+}
+
+#[test]
+fn paired_starts_play_each_opening_from_both_sides() {
+    // A match must play every opening twice with the colours swapped, or the first
+    // move advantage shows up as a difference between the models. The invariant is
+    // per game ordinal, so it holds however many games finish before truncation.
+    let openings = [
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+        "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+    ];
+    let mut settings = config(4, 2, 8);
+    settings.paired_starts = true;
+    settings.start_fens = openings
+        .iter()
+        .flat_map(|fen| [fen.to_string(), fen.to_string()])
+        .collect();
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    engine.stop_starting_new_games();
+    let games = run(&mut engine, 4, 200_000);
+    assert!(!games.is_empty(), "no game completed");
+
+    for game in &games {
+        let ordinal: usize = game
+            .game_id
+            .rsplit('-')
+            .next()
+            .expect("game id carries its ordinal")
+            .parse()
+            .expect("ordinal is numeric");
+        assert_eq!(
+            game.a_is_white,
+            ordinal % 2 == 0,
+            "ordinal {ordinal} took the wrong colour"
+        );
+        assert_eq!(
+            game.initial_fen,
+            openings[(ordinal / 2) % openings.len()],
+            "ordinal {ordinal} started from the wrong opening"
+        );
+    }
+}
+
+#[test]
+fn unpaired_starts_keep_model_a_on_white() {
+    let mut settings = config(4, 2, 8);
+    settings.start_fens = vec![
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+    ];
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    let games = run(&mut engine, 2, 200_000);
+
+    assert!(!games.is_empty());
+    assert!(games.iter().all(|game| game.a_is_white));
+}
+
+#[test]
+fn model_b_can_search_to_a_different_depth() {
+    // Measuring what search alone is worth means giving one side more
+    // simulations per move while both play the same net.
+    let mut settings = config(4, 2, 8);
+    settings.paired_starts = true;
+    settings.search.simulations_b = 32;
+    settings.start_fens = vec![
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+    ];
+    let mut engine = SelfPlayEngine::new(settings).expect("engine");
+    engine.stop_starting_new_games();
+    let games = run(&mut engine, 2, 200_000);
+    assert!(!games.is_empty(), "no game completed");
+}
+
+#[test]
+fn a_zero_second_budget_keeps_both_models_on_one_depth() {
+    let mut paired = config(4, 2, 8);
+    paired.paired_starts = true;
+    paired.search.simulations_b = 0;
+    paired.start_fens = vec![
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+        "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2".to_string(),
+    ];
+    let mut matching = paired.clone();
+    matching.search.simulations_b = matching.search.simulations;
+
+    let mut left = SelfPlayEngine::new(paired).expect("engine");
+    left.stop_starting_new_games();
+    let mut right = SelfPlayEngine::new(matching).expect("engine");
+    right.stop_starting_new_games();
+
+    let a: Vec<Vec<String>> = run(&mut left, 4, 200_000).into_iter().map(|g| g.moves_uci).collect();
+    let b: Vec<Vec<String>> = run(&mut right, 4, 200_000).into_iter().map(|g| g.moves_uci).collect();
+    assert_eq!(a, b, "zero must behave exactly like an equal budget");
 }

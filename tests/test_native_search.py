@@ -21,6 +21,7 @@ from pink_elephant.encoding import encode_board
 from pink_elephant.mcts import (
     MCTSConfig,
     PolicyValuePrediction,
+    pruned_root_visit_distribution,
     root_visit_distribution,
     run_mcts,
 )
@@ -61,11 +62,19 @@ def python_evaluator(board: chess.Board) -> PolicyValuePrediction:
     )
 
 
-def run_native_root_search(fen: str, simulations: int, exploration_constant: float):
+def run_native_root_search(
+    fen: str,
+    simulations: int,
+    exploration_constant: float,
+    forced_playout_k: float = 0.0,
+):
     """Drive `RootSearch` the way the host loop drives the engine."""
 
     search = pe_search.RootSearch(
-        fen, simulations=simulations, exploration_constant=exploration_constant
+        fen,
+        simulations=simulations,
+        exploration_constant=exploration_constant,
+        forced_playout_k=forced_playout_k,
     )
     buffer = np.zeros(ENCODED_LEN, dtype=np.uint8)
     while search.next_leaf(buffer.ctypes.data):
@@ -207,3 +216,91 @@ def test_native_action_mapping_matches_python(fen: str) -> None:
         for move, index in zip(board.legal_moves, legal_policy_indices(board), strict=True)
     }
     assert dict(pe_search.legal_actions(fen)) == expected
+
+
+@pytest.mark.parametrize("fen", DIFFERENTIAL_POSITIONS)
+@pytest.mark.parametrize("simulations", [8, 32, 64])
+def test_forced_playouts_match_the_reference_visit_counts(fen: str, simulations: int) -> None:
+    native = run_native_root_search(fen, simulations, 1.1, forced_playout_k=2.0)
+    reference = run_mcts(
+        chess.Board(fen),
+        python_evaluator,
+        MCTSConfig(num_simulations=simulations, exploration_constant=1.1, forced_playout_k=2.0),
+    )
+
+    expected = {
+        action_index: child.visit_count
+        for action_index, child in reference.children_by_action_index.items()
+    }
+    actual = {action: visits for action, visits, _ in native.root_statistics()}
+    assert actual == expected
+
+
+@pytest.mark.parametrize("fen", DIFFERENTIAL_POSITIONS)
+def test_pruned_policy_target_matches_the_reference(fen: str) -> None:
+    native = run_native_root_search(fen, 64, 1.1, forced_playout_k=2.0)
+    reference = run_mcts(
+        chess.Board(fen),
+        python_evaluator,
+        MCTSConfig(num_simulations=64, exploration_constant=1.1, forced_playout_k=2.0),
+    )
+
+    expected = pruned_root_visit_distribution(
+        reference, exploration_constant=1.1, forced_playout_k=2.0
+    )
+    actual = dict(native.pruned_root_visit_distribution())
+    assert actual.keys() == expected.keys()
+    for action_index, probability in actual.items():
+        assert probability == pytest.approx(expected[action_index], abs=1e-12)
+
+
+# Positions with enough legal moves that some child falls short of its forced
+# minimum; in sparse positions every child already clears it and forcing is a
+# legitimate no-op.
+BRANCHING_POSITIONS = [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+]
+
+
+@pytest.mark.parametrize("fen", BRANCHING_POSITIONS)
+def test_forced_playouts_change_the_search(fen: str) -> None:
+    plain = run_native_root_search(fen, 64, 1.1)
+    forced = run_native_root_search(fen, 64, 1.1, forced_playout_k=2.0)
+
+    plain_visits = {action: visits for action, visits, _ in plain.root_statistics()}
+    forced_visits = {action: visits for action, visits, _ in forced.root_statistics()}
+    assert plain_visits != forced_visits
+    assert sum(plain_visits.values()) == sum(forced_visits.values())
+
+
+@pytest.mark.parametrize("fen", BRANCHING_POSITIONS)
+def test_pruning_removes_visits_from_the_recorded_target(fen: str) -> None:
+    forced = run_native_root_search(fen, 64, 1.1, forced_playout_k=2.0)
+
+    raw = dict(forced.root_visit_distribution())
+    pruned = dict(forced.pruned_root_visit_distribution())
+
+    assert pruned != raw
+    assert sum(pruned.values()) == pytest.approx(1.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("fen", DIFFERENTIAL_POSITIONS)
+def test_pruning_never_invents_probability_mass(fen: str) -> None:
+    forced = run_native_root_search(fen, 64, 1.1, forced_playout_k=2.0)
+
+    counts = {action: visits for action, visits, _ in forced.root_statistics()}
+    pruned = dict(forced.pruned_root_visit_distribution())
+    total = sum(counts.values())
+
+    assert pruned.keys() == counts.keys()
+    if not counts:
+        # A root that is already terminal has no children and no policy target.
+        return
+    assert sum(pruned.values()) == pytest.approx(1.0, abs=1e-9)
+    # Pruning only subtracts, and never from the most-visited child, so its share
+    # can only grow. Other children's shares may rise after renormalization when a
+    # sibling gives back more, so only the best child's direction is invariant.
+    if total:
+        best = max(counts, key=lambda action: (counts[action], -action))
+        assert pruned[best] >= counts[best] / total - 1e-9

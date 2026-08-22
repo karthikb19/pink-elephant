@@ -53,6 +53,7 @@ from pink_elephant.self_play.generation.manifests import (
     seal_round,
 )
 from pink_elephant.self_play.generation.modal_app import (
+    PYTHON_BACKEND_CPU,
     SELF_PLAY_CPU,
     SELF_PLAY_L4_GPU,
     SELF_PLAY_MCTS_PROCESS_COUNT,
@@ -61,6 +62,7 @@ from pink_elephant.self_play.generation.modal_app import (
 from pink_elephant.self_play.generation.process_search import MultiprocessMCTSSearch
 from pink_elephant.self_play.generation.scheduler import GenerationCoordinator
 from pink_elephant.self_play.generation.shards import (
+    audit_replay_shard,
     iter_replay_rows,
     sha256_file,
     validate_games_table,
@@ -842,7 +844,10 @@ def test_modal_generation_defaults_to_one_l4_worker_with_eight_cpus_and_sixteen_
     assert args.generation_id == "generation-000001"
     assert args.worker_count == GENERATION_1_WORKER_COUNT == 1
     assert args.active_games_per_worker == GENERATION_1_ACTIVE_GAMES_PER_WORKER == 16
-    assert SELF_PLAY_CPU == 8.0
+    # The declared reservation follows the native backend, which generation uses;
+    # the Python backend's process count is derived separately.
+    assert SELF_PLAY_CPU == 2.0
+    assert PYTHON_BACKEND_CPU == 8.0
     assert SELF_PLAY_MCTS_PROCESS_COUNT == 8
 
 
@@ -1024,3 +1029,119 @@ def test_generation_identity_covers_the_start_pool_and_stride() -> None:
     assert base.search_config_sha256 != pooled.search_config_sha256
     assert base.start_pool_sha256 == "startpos"
     assert base.start_fens() == ()
+
+
+def test_audit_replay_shard_returns_the_game_ids_it_already_computed(tmp_path: Path) -> None:
+    rows = tuple(replace(_valid_replay_row(), game_id=f"game-{index // 2}") for index in range(4))
+    path = tmp_path / "shard-00000.parquet"
+    write_replay_shard(path, rows)
+
+    reference, game_ids = audit_replay_shard(path)
+
+    assert game_ids == frozenset({"game-0", "game-1"})
+    assert reference.game_count == 2
+    assert reference.position_count == 4
+    assert reference == validate_replay_shard(path)
+
+
+def test_sealing_reads_each_shard_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Row reconstruction dominates sealing, so a second read doubles its cost."""
+
+    from pink_elephant.self_play.generation import shards as shards_module
+
+    path = tmp_path / "shard-00000.parquet"
+    write_replay_shard(path, (_valid_replay_row(),))
+    reads = 0
+    original = shards_module.iter_replay_rows
+
+    def counting(target: Path):
+        nonlocal reads
+        reads += 1
+        return original(target)
+
+    monkeypatch.setattr(shards_module, "iter_replay_rows", counting)
+
+    shards_module.audit_replay_shard(path)
+
+    assert reads == 1
+
+
+def _worker_for_recovery(tmp_path: Path, invocation_id: str) -> object:
+    from pink_elephant.self_play.generation.config import GenerationRoundSpec, WorkerSpec
+
+    generation = generation_1_spec()
+    round_spec = GenerationRoundSpec(
+        generation_id=generation.generation_id,
+        round_id="round-000001",
+        requested_cumulative_positions=10,
+    )
+    return WorkerSpec(
+        generation=generation,
+        round=round_spec,
+        worker_id="worker-0000",
+        invocation_id=invocation_id,
+        seed_start=0,
+        seed_end=100,
+        position_lower_bound=10,
+    )
+
+
+def _write_committed_result(root: Path, worker, invocation_id: str) -> None:
+    directory = (
+        root
+        / worker.generation.generation_id
+        / "rounds"
+        / worker.round.round_id
+        / "workers"
+        / worker.worker_id
+        / "invocations"
+        / invocation_id
+    )
+    directory.mkdir(parents=True)
+    (directory / "worker-result.json").write_text("{}", encoding="utf-8")
+
+
+def test_recovery_finds_a_result_written_under_a_different_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry gets a new invocation id, so recovery cannot assume its own."""
+
+    from pink_elephant.self_play.generation import modal_app
+
+    root = tmp_path / "self-play"
+    worker = _worker_for_recovery(tmp_path, "invocation-20260820T120000Z")
+    _write_committed_result(root, worker, "invocation-0001")
+    monkeypatch.setattr(modal_app, "MODAL_VOLUME_MOUNT", tmp_path)
+    monkeypatch.setattr(modal_app, "SELF_PLAY_VOLUME_ROOT", "self-play")
+    monkeypatch.setattr(modal_app, "load_worker_result", lambda path: f"loaded:{path.parent.name}")
+
+    recovered = modal_app.load_committed_worker_results.local((worker,))
+
+    assert recovered == ("loaded:invocation-0001",)
+
+
+def test_recovery_ignores_an_invocation_with_no_committed_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted attempt leaves shards but no result; it must be retried."""
+
+    from pink_elephant.self_play.generation import modal_app
+
+    root = tmp_path / "self-play"
+    worker = _worker_for_recovery(tmp_path, "invocation-20260820T120000Z")
+    partial = (
+        root
+        / worker.generation.generation_id
+        / "rounds"
+        / worker.round.round_id
+        / "workers"
+        / worker.worker_id
+        / "invocations"
+        / "invocation-0001"
+    )
+    partial.mkdir(parents=True)
+    (partial / "shard-00000.parquet").write_bytes(b"partial")
+    monkeypatch.setattr(modal_app, "MODAL_VOLUME_MOUNT", tmp_path)
+    monkeypatch.setattr(modal_app, "SELF_PLAY_VOLUME_ROOT", "self-play")
+
+    assert modal_app.load_committed_worker_results.local((worker,)) == ()

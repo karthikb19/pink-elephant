@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +14,6 @@ from pink_elephant.self_play.contracts import (
     WORKER_RESULT_SCHEMA_VERSION,
     ArtifactRef,
     GameTableRef,
-    ReplayRow,
     ReplayShardRef,
     RoundCompletion,
     RoundManifest,
@@ -26,7 +25,7 @@ from pink_elephant.self_play.contracts import (
 )
 from pink_elephant.self_play.generation.config import GenerationRoundSpec, GenerationSpec
 from pink_elephant.self_play.generation.shards import (
-    iter_replay_rows,
+    audit_replay_shard,
     load_games_table,
     sha256_file,
     validate_games_table,
@@ -266,16 +265,14 @@ def _validate_worker_result(
     shard_game_ids: set[str] = set()
     for shard in result.shards:
         path = _resolve_artifact(output_root, shard.path)
-        actual = validate_replay_shard(path)
+        # One audit yields both the reference and the game IDs; reading the shard
+        # again for the IDs alone doubles the dominant cost of sealing a round.
+        actual, game_ids_in_shard = audit_replay_shard(path)
         if not _same_artifact(actual, shard):
             raise ValueError(f"worker replay shard reference is stale: {path}")
-        shard_game_ids.update(row.game_id for row in _rows_from_shard(path))
+        shard_game_ids.update(game_ids_in_shard)
     if shard_game_ids != game_ids:
         raise ValueError("worker replay shards and games.parquet contain different games")
-
-
-def _rows_from_shard(path: Path) -> Iterator[ReplayRow]:
-    return iter_replay_rows(path)
 
 
 def _same_artifact(actual: ArtifactRef, expected: ArtifactRef) -> bool:

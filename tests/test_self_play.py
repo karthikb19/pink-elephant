@@ -10,7 +10,9 @@ from pink_elephant.action_mapping import legal_policy_indices, move_to_policy_in
 from pink_elephant.encoding import encode_board
 from pink_elephant.mcts import (
     MCTSConfig,
+    MCTSRootSummary,
     PolicyValuePrediction,
+    RootActionStatistics,
     root_visit_distribution,
     run_mcts,
     run_mcts_batch,
@@ -37,6 +39,7 @@ from pink_elephant.self_play.generation.game import (
     complete_game,
     make_root_dirichlet_modifier,
     select_action_from_root,
+    select_action_from_summary,
 )
 from pink_elephant.self_play.generation.manifests import (
     load_snapshot_manifest,
@@ -367,3 +370,73 @@ def test_seal_round_writes_immutable_snapshot_and_loads_worker_result(tmp_path: 
     assert sealed.completion.snapshot_path.endswith("snapshot-000001/snapshot-manifest.json")
     assert load_snapshot_manifest(sealed.snapshot_path) == sealed.snapshot
     assert sealed.completion_path.is_file()
+
+
+@pytest.mark.parametrize("min_visit_fraction", [0.0, 0.1, 0.25, 0.5])
+def test_min_visit_fraction_never_plays_below_its_floor(min_visit_fraction: float) -> None:
+    actions = tuple(
+        RootActionStatistics(action_index=index, visit_count=visits, prior_probability=0.1)
+        for index, visits in enumerate((64, 20, 6, 1, 1))
+    )
+    summary = MCTSRootSummary(actions=actions)
+    floor = min_visit_fraction * 64
+
+    chosen = {
+        select_action_from_summary(
+            summary,
+            temperature=1.0,
+            rng=Random(seed),
+            min_visit_fraction=min_visit_fraction,
+        )
+        for seed in range(200)
+    }
+
+    assert chosen
+    for action_index in chosen:
+        assert actions[action_index].visit_count >= floor
+
+
+def test_min_visit_fraction_still_allows_variety_above_the_floor() -> None:
+    actions = tuple(
+        RootActionStatistics(action_index=index, visit_count=visits, prior_probability=0.1)
+        for index, visits in enumerate((40, 30, 20, 1))
+    )
+    summary = MCTSRootSummary(actions=actions)
+
+    chosen = {
+        select_action_from_summary(
+            summary, temperature=1.0, rng=Random(seed), min_visit_fraction=0.25
+        )
+        for seed in range(200)
+    }
+
+    assert chosen == {0, 1, 2}
+
+
+def test_min_visit_fraction_is_ignored_when_playing_greedily() -> None:
+    actions = tuple(
+        RootActionStatistics(action_index=index, visit_count=visits, prior_probability=0.1)
+        for index, visits in enumerate((64, 20, 1))
+    )
+
+    selected = select_action_from_summary(
+        MCTSRootSummary(actions=actions),
+        temperature=1.0,
+        rng=Random(0),
+        greedy=True,
+        min_visit_fraction=0.9,
+    )
+
+    assert selected == 0
+
+
+def test_min_visit_fraction_rejects_a_value_outside_the_unit_interval() -> None:
+    actions = (RootActionStatistics(action_index=0, visit_count=1, prior_probability=1.0),)
+
+    with pytest.raises(ValueError, match="min_visit_fraction"):
+        select_action_from_summary(
+            MCTSRootSummary(actions=actions),
+            temperature=1.0,
+            rng=Random(0),
+            min_visit_fraction=1.5,
+        )

@@ -12,6 +12,7 @@ from random import Random
 from typing import Final, Literal
 
 import chess
+import pe_search
 
 STARTPOS_FEN: Final[str] = chess.STARTING_FEN
 DEFAULT_START_POOL_SIZE: Final[int] = 4_096
@@ -57,6 +58,15 @@ class ArchivePosition:
             raise ValueError(f"archive position fen is not parseable: {self.fen}") from error
         if not board.is_valid():
             raise ValueError(f"archive position fen is not a legal position: {self.fen}")
+        # python-chess accepts composed positions the native engine rejects, such
+        # as eight queens a side. The engine parses every start FEN when it is
+        # configured, so an unchecked one fails on a GPU worker instead of here.
+        try:
+            pe_search.encode_position(self.fen)
+        except Exception as error:
+            raise ValueError(
+                f"archive position fen is rejected by the native engine: {self.fen}"
+            ) from error
 
     @property
     def band(self) -> ArchiveBand:
@@ -73,10 +83,14 @@ class StartPositionMix:
     Archive weights are split across evaluation bands rather than filtered to
     balanced play: balanced positions carry the most outcome entropy per game,
     but decisive positions keep the value head calibrated where it already is.
+
+    The book carries the largest share. Variety bought by starting somewhere new
+    is free, while variety bought by sampling a move the search dislikes costs a
+    blunder, and the book positions are human lines an engine judged balanced.
     """
 
-    startpos: float = 0.4
-    opening_book: float = 0.3
+    startpos: float = 0.20
+    opening_book: float = 0.50
     archive_balanced: float = 0.18
     archive_moderate: float = 0.075
     archive_decisive: float = 0.045

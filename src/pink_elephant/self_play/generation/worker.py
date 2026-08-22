@@ -28,7 +28,7 @@ from pink_elephant.mcts import (
     EncodedBatchEvaluationRequest,
     MCTSConfig,
     PolicyValuePrediction,
-    root_summary_visit_distribution,
+    pruned_root_summary_visit_distribution,
     run_mcts_batch,
     summarize_root,
 )
@@ -428,7 +428,11 @@ def run_worker(
             policy = tuple(
                 _policy_entry(action_index, probability)
                 for action_index, probability in sorted(
-                    root_summary_visit_distribution(summary).items()
+                    pruned_root_summary_visit_distribution(
+                        summary,
+                        exploration_constant=worker.generation.exploration_constant,
+                        forced_playout_k=worker.generation.forced_playout_k,
+                    ).items()
                 )
             )
             temperature = (
@@ -441,6 +445,7 @@ def run_worker(
                 temperature=temperature,
                 rng=game.temperature_rng,
                 greedy=game.board.ply() >= worker.generation.temperature_cutoff_ply,
+                min_visit_fraction=worker.generation.min_visit_fraction,
             )
             selected_move = _move_for_action(game.board, selected_action_index)
             game.pending_positions.append(
@@ -811,6 +816,8 @@ def run_native_worker(
         temperature_cutoff_ply=worker.generation.temperature_cutoff_ply,
         max_plies=worker.max_plies_per_game,
         start_fens=list(worker.generation.start_fens()),
+        forced_playout_k=worker.generation.forced_playout_k,
+        min_visit_fraction=worker.generation.min_visit_fraction,
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(
