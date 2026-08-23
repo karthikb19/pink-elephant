@@ -29,9 +29,10 @@ def _request(**overrides: object) -> GauntletRequest:
         "simulations": 200,
         "games": 400,
         "concurrent_games": 64,
-        "depth": 10,
-        "movetime_ms": None,
         "max_plies": 512,
+        "initial_clock_seconds": 60.0,
+        "increment_seconds": 0.6,
+        "output_prefix": "20260823T120000Z",
     }
     fields.update(overrides)
     return GauntletRequest(**fields)  # type: ignore[arg-type]
@@ -76,6 +77,8 @@ def test_a_malformed_entry_is_rejected() -> None:
         ("simulations", 0, "simulations must be positive"),
         ("concurrent_games", 0, "concurrent_games must be positive"),
         ("max_plies", 0, "max_plies must be positive"),
+        ("initial_clock_seconds", 0.0, "initial_clock_seconds must be positive"),
+        ("increment_seconds", -0.1, "increment_seconds must be non-negative"),
     ],
 )
 def test_an_unusable_request_is_rejected(field: str, value: int, message: str) -> None:
@@ -96,6 +99,27 @@ def test_colour_alternates_by_global_game_index() -> None:
     assert games - whites == 200
 
 
+def test_a_flagged_game_is_a_win_and_is_counted_once() -> None:
+    """Stockfish losing on time is a real result, not a discarded game."""
+
+    result = GauntletResult(
+        label="candidate",
+        wins=10,
+        draws=4,
+        losses=6,
+        unfinished=0,
+        flagged=3,
+        plies=1000,
+        games_path="gauntlet/x/candidate",
+        elapsed_seconds=1.0,
+        search_waves=10,
+        mean_batch_size=8.0,
+    )
+    # The three flag-falls are inside the ten wins, not additional to them.
+    assert result.played == 20
+    assert result.flagged <= result.wins
+
+
 def test_played_counts_only_decided_games() -> None:
     """A game that hit the ply limit has no result and must not enter the score."""
 
@@ -105,7 +129,9 @@ def test_played_counts_only_decided_games() -> None:
         draws=4,
         losses=6,
         unfinished=3,
+        flagged=0,
         plies=1000,
+        games_path="gauntlet/x/candidate",
         elapsed_seconds=1.0,
         search_waves=10,
         mean_batch_size=8.0,
