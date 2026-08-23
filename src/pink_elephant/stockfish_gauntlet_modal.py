@@ -5,13 +5,12 @@ and the opponent changes every generation, so those numbers do not compose.
 Stockfish at a fixed UCI Elo is an opponent that stays put, which turns a pile of
 pairwise results into a ladder readable across generations.
 
-The batching is the point. Playing games one at a time runs the search at batch
-size one, which leaves an L4 almost entirely idle: a single move costs 200
-forward passes over a single position. Here every game a container owns runs
-concurrently and `run_mcts_batch` takes one leaf from each tree per wave, so a
-wave is one forward pass over as many positions as there are games waiting on the
-model. That is the same shape as the self-play host, and it is the difference
-between a few games an hour and a few hundred.
+The search is the native engine and the batching is the point. Every game a
+container owns runs concurrently, and a wave takes one leaf from each live
+search into one pinned staging buffer, so a wave is a single forward pass over
+as many positions as there are games waiting on the model. Playing games one at
+a time instead would run the search at batch size one and leave the GPU idle
+through 200 forward passes per move.
 
     uv run modal run --detach src/pink_elephant/stockfish_gauntlet_modal.py \\
       --elo 2500 --simulations 200 --games-per-checkpoint 400
@@ -49,13 +48,14 @@ GAUNTLET_TIMEOUT_SECONDS: Final[int] = 12 * 60 * 60
 # subprocess whose replies would otherwise serialise behind a single engine.
 GAUNTLET_CPU: Final[float] = 4.0
 GAUNTLET_MEMORY_MB: Final[int] = 16 * 1024
-# Games in flight per container, which is also the search batch width: at 64 a
-# wave is one forward pass over up to 64 positions instead of 64 over one.
+# Games in flight per container, which is also the search batch width.
 DEFAULT_CONCURRENT_GAMES: Final[int] = 64
 STOCKFISH_ENGINES: Final[int] = 3
-# Completed games between progress lines. A gauntlet runs for tens of minutes,
-# so silence until the final tally is indistinguishable from a hung container.
-PROGRESS_INTERVAL_GAMES: Final[int] = 20
+# Search waves between progress lines. Progress is reported per wave rather than
+# per completed game: at around a hundred plies a game the first completion is
+# many minutes out, which leaves a working container indistinguishable from a
+# hung one for exactly as long as it takes to lose confidence in it.
+PROGRESS_INTERVAL_WAVES: Final[int] = 500
 
 # label=checkpoint path on the training Volume, separated by semicolons.
 DEFAULT_LADDER: Final[str] = ";".join(
@@ -170,16 +170,19 @@ def elo_difference(score: float) -> float:
     retries=1,
 )
 def play_gauntlet(request: GauntletRequest) -> GauntletResult:
-    """Play one checkpoint's whole gauntlet with the model's searches batched."""
+    """Play one checkpoint's whole gauntlet on the native search."""
 
     import time
 
     import chess
+    import numpy as np
+    import pe_search
     import torch
 
+    from pink_elephant.action_mapping import legal_policy_indices
     from pink_elephant.arena import load_checkpoint_model
-    from pink_elephant.mcts import MCTSConfig, run_mcts_batch
-    from pink_elephant.self_play.generation.worker import ModelBatchEvaluator
+    from pink_elephant.encoding import BOARD_SIZE, HALFMOVE_PLANE, HALFMOVE_SCALE, PLANE_COUNT
+    from pink_elephant.model import ModelOutput
     from pink_elephant.stockfish import (
         StockfishConfig,
         ensure_stockfish_binary,
@@ -196,6 +199,7 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
             "concurrent_games": request.concurrent_games,
             "games": request.games,
             "label": request.label,
+            "search_backend": "native",
             "simulations": request.simulations,
             "stockfish_elo": request.elo,
         },
@@ -205,12 +209,10 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
         raise FileNotFoundError(f"checkpoint does not exist: {request.checkpoint_path}")
 
     device = torch.device("cuda")
-    loaded = load_checkpoint_model(checkpoint, device=str(device))
-    evaluator = ModelBatchEvaluator(loaded.model, device=device, autocast=True)
-    search_config = MCTSConfig(num_simulations=request.simulations)
+    model = load_checkpoint_model(checkpoint, device=str(device)).model.eval()
 
     cache_dir = STOCKFISH_MOUNT / "cache"
-    cached = cache_dir.is_dir() and any(cache_dir.rglob("*"))
+    was_cached = cache_dir.is_dir() and any(cache_dir.rglob("*"))
     fetch_started = time.perf_counter()
     binary = ensure_stockfish_binary(None, cache_dir)
     stockfish_volume.commit()
@@ -223,7 +225,7 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
             "engines": STOCKFISH_ENGINES,
             "fetch_seconds": time.perf_counter() - fetch_started,
             "label": request.label,
-            "was_cached": cached,
+            "was_cached": was_cached,
         },
     )
     stockfish_config = StockfishConfig(
@@ -236,38 +238,68 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
     limit = stockfish_config.search_limit()
     engines = [start_stockfish(binary, stockfish_config) for _ in range(STOCKFISH_ENGINES)]
 
+    # One pinned staging row per game, so a wave writes every leaf into one
+    # contiguous buffer and the host-to-device copy is a single transfer.
+    slots = request.concurrent_games
+    staging = torch.empty(
+        (slots, PLANE_COUNT, BOARD_SIZE, BOARD_SIZE), dtype=torch.uint8, pin_memory=True
+    )
+    rows_view = staging.numpy()
+
+    boards: list[chess.Board] = []
+    colors: list[bool] = []
+    searches: list[object | None] = []
+    issued = 0
     wins = draws = losses = unfinished = plies = 0
     terminations: dict[str, int] = {}
     waves = 0
     batched_positions = 0
-    boards: list[chess.Board] = []
-    colors: list[chess.Color] = []
-    played: list[int] = []
-    issued = 0
-    next_progress = PROGRESS_INTERVAL_GAMES
-    search_seconds = 0.0
+    select_seconds = 0.0
+    forward_seconds = 0.0
     stockfish_seconds = 0.0
 
-    def seed(count: int) -> None:
-        """Start up to `count` more games, while any of the quota is unissued."""
+    def open_search(board: chess.Board) -> object:
+        """Open a native search over a board, carrying its move history.
 
+        The history is what lets the search see repetitions. A search built from
+        the FEN alone cannot tell that a line repeats, so it would neither claim
+        nor avoid a threefold draw.
+        """
+
+        return pe_search.RootSearch(
+            chess.Board().fen(),
+            moves_uci=[move.uci() for move in board.move_stack],
+            simulations=request.simulations,
+        )
+
+    def best_move(board: chess.Board, search: object) -> chess.Move:
+        """Return the most visited root move, breaking ties as the engine does."""
+
+        statistics = search.root_statistics()  # type: ignore[attr-defined]
+        if not statistics:
+            raise RuntimeError("native search returned no root actions")
+        action = max(statistics, key=lambda item: (item[1], item[2], -item[0]))[0]
+        for move, index in zip(board.legal_moves, legal_policy_indices(board), strict=True):
+            if index == action:
+                return move
+        raise RuntimeError(f"root action {action} is not legal in {board.fen()}")
+
+    def seed() -> None:
         nonlocal issued
-        for _ in range(count):
-            if issued >= request.games:
-                return
-            boards.append(chess.Board())
-            # Colour alternates by global index, so the split stays even
-            # whatever order games happen to finish in.
-            colors.append(chess.WHITE if issued % 2 == 0 else chess.BLACK)
-            played.append(0)
+        while len(boards) < slots and issued < request.games:
+            board = chess.Board()
+            # Colour is fixed when a game is issued, so games finishing out of
+            # order cannot skew the split.
+            model_is_white = issued % 2 == 0
+            boards.append(board)
+            colors.append(model_is_white)
+            searches.append(open_search(board) if model_is_white else None)
             issued += 1
 
     def retire(index: int) -> None:
-        """Score one finished game and drop it out of the in-flight set."""
-
         nonlocal wins, draws, losses, unfinished, plies
-        board, model_color, count = boards[index], colors[index], played[index]
-        plies += count
+        board, model_is_white = boards[index], colors[index]
+        plies += board.ply()
         outcome = board.outcome(claim_draw=True)
         if outcome is None:
             unfinished += 1
@@ -277,92 +309,111 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
             terminations[name] = terminations.get(name, 0) + 1
             if outcome.result() == "1/2-1/2":
                 draws += 1
-            elif (outcome.result() == "1-0") == (model_color == chess.WHITE):
+            elif (outcome.result() == "1-0") == model_is_white:
                 wins += 1
             else:
                 losses += 1
-        for container in (boards, colors, played):
+        for container in (boards, colors, searches):
             container.pop(index)
 
+    def model_to_move(index: int) -> bool:
+        board = boards[index]
+        return (board.turn == chess.WHITE) == colors[index]
+
     try:
-        seed(request.concurrent_games)
+        seed()
         while boards:
             finished = [
                 index
                 for index in range(len(boards))
-                if boards[index].is_game_over(claim_draw=True) or played[index] >= request.max_plies
+                if boards[index].is_game_over(claim_draw=True)
+                or boards[index].ply() >= request.max_plies
             ]
             for index in reversed(finished):
                 retire(index)
             if finished:
-                complete = wins + draws + losses + unfinished
-                if complete >= next_progress:
-                    next_progress = complete + PROGRESS_INTERVAL_GAMES
-                    elapsed = time.perf_counter() - started
-                    decided = wins + draws + losses
-                    log_event(
-                        logger,
-                        "gauntlet_progress",
-                        {
-                            "draws": draws,
-                            "elapsed_seconds": elapsed,
-                            "games_completed": complete,
-                            "games_per_hour": complete / elapsed * 3600 if elapsed else 0.0,
-                            "games_total": request.games,
-                            "in_flight": len(boards),
-                            "label": request.label,
-                            "losses": losses,
-                            "mean_batch_size": batched_positions / waves if waves else 0.0,
-                            "score": (wins + 0.5 * draws) / decided if decided else 0.0,
-                            "search_seconds": search_seconds,
-                            "search_waves": waves,
-                            "stockfish_seconds": stockfish_seconds,
-                            "wins": wins,
-                        },
-                    )
-                seed(len(finished))
+                seed()
                 continue
 
-            # Stockfish blocks, so its replies are played first and spread over a
-            # few engines; the GPU is idle here either way, and one engine would
-            # serialise every game waiting on it.
-            waiting = [index for index in range(len(boards)) if boards[index].turn != colors[index]]
+            # Stockfish blocks, so its replies are played before the wave and
+            # spread over a few engines; the GPU is idle here either way, and one
+            # engine would serialise every game waiting on a reply.
             stockfish_started = time.perf_counter()
-            for position, index in enumerate(waiting):
+            for position, index in enumerate(
+                [index for index in range(len(boards)) if not model_to_move(index)]
+            ):
                 reply = engines[position % len(engines)].play(boards[index], limit)
                 if reply.move is None:
                     raise RuntimeError("Stockfish returned no move")
                 boards[index].push(reply.move)
-                played[index] += 1
+                if not boards[index].is_game_over(claim_draw=True):
+                    searches[index] = open_search(boards[index])
             stockfish_seconds += time.perf_counter() - stockfish_started
 
-            searching = [
-                index
-                for index in range(len(boards))
-                if boards[index].turn == colors[index]
-                and not boards[index].is_game_over(claim_draw=True)
-            ]
-            if not searching:
-                continue
+            # One leaf from every live search into its own staging row, then a
+            # single forward pass over all of them.
+            select_started = time.perf_counter()
+            rows: list[int] = []
+            spent: list[int] = []
+            for index, search in enumerate(searches):
+                if search is None:
+                    continue
+                if search.next_leaf(rows_view[len(rows)].ctypes.data):  # type: ignore[attr-defined]
+                    rows.append(index)
+                else:
+                    spent.append(index)
+            select_seconds += time.perf_counter() - select_started
 
-            # One search across every waiting game: each wave takes one leaf per
-            # tree, so the forward pass is as wide as the set rather than one.
-            search_started = time.perf_counter()
-            roots = run_mcts_batch([boards[index] for index in searching], evaluator, search_config)
-            search_seconds += time.perf_counter() - search_started
-            waves += 1
-            batched_positions += len(searching)
-            for index, root in zip(searching, roots, strict=True):
-                if not root.children_by_action_index:
-                    raise RuntimeError("model search returned no legal moves")
-                best = max(
-                    root.children_by_action_index.items(),
-                    key=lambda item: (item[1].visit_count, item[1].prior_probability, -item[0]),
-                )[1]
-                if best.move_from_parent is None:
-                    raise RuntimeError("model search selected a child without a move")
-                boards[index].push(best.move_from_parent)
-                played[index] += 1
+            if rows:
+                forward_started = time.perf_counter()
+                inputs = staging[: len(rows)].to(device, non_blocking=True).float()
+                inputs[:, HALFMOVE_PLANE] /= HALFMOVE_SCALE
+                with torch.inference_mode():
+                    output = model(inputs)
+                if not isinstance(output, ModelOutput):
+                    raise TypeError("gauntlet model must return ModelOutput")
+                logits = output.policy_logits.detach().to("cpu", torch.float32).numpy()
+                values = output.value.detach().to("cpu", torch.float32).reshape(-1).numpy()
+                forward_seconds += time.perf_counter() - forward_started
+                waves += 1
+                batched_positions += len(rows)
+                for row, index in enumerate(rows):
+                    searches[index].submit(  # type: ignore[attr-defined]
+                        np.ascontiguousarray(logits[row], dtype=np.float32),
+                        float(values[row]),
+                    )
+
+            # A search whose budget is spent plays its move and hands the game
+            # back to Stockfish.
+            for index in spent:
+                board = boards[index]
+                board.push(best_move(board, searches[index]))
+                searches[index] = None
+
+            if waves and waves % PROGRESS_INTERVAL_WAVES == 0:
+                elapsed = time.perf_counter() - started
+                decided = wins + draws + losses
+                log_event(
+                    logger,
+                    "gauntlet_progress",
+                    {
+                        "draws": draws,
+                        "elapsed_seconds": elapsed,
+                        "forward_seconds": forward_seconds,
+                        "games_completed": decided + unfinished,
+                        "games_issued": issued,
+                        "games_total": request.games,
+                        "in_flight": len(boards),
+                        "label": request.label,
+                        "losses": losses,
+                        "mean_batch_size": batched_positions / waves,
+                        "score": (wins + 0.5 * draws) / decided if decided else 0.0,
+                        "select_seconds": select_seconds,
+                        "stockfish_seconds": stockfish_seconds,
+                        "waves": waves,
+                        "wins": wins,
+                    },
+                )
     finally:
         for engine in engines:
             engine.quit()
@@ -375,18 +426,15 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
         {
             "draws": draws,
             "elapsed_seconds": elapsed,
+            "forward_seconds": forward_seconds,
             "label": request.label,
             "losses": losses,
             "mean_batch_size": batched_positions / waves if waves else 0.0,
             "score": (wins + 0.5 * draws) / decided if decided else 0.0,
-            "search_seconds": search_seconds,
-            "search_waves": waves,
+            "select_seconds": select_seconds,
             "stockfish_seconds": stockfish_seconds,
-            # Whatever is neither search nor Stockfish is board bookkeeping and
-            # game adjudication; a large share here means the loop, not the GPU,
-            # is the limit.
-            "unattributed_seconds": elapsed - search_seconds - stockfish_seconds,
             "unfinished": unfinished,
+            "waves": waves,
             "wins": wins,
         },
     )

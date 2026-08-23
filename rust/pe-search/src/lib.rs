@@ -17,6 +17,7 @@ use numpy::{PyArray1, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArra
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use shakmaty::uci::UciMove;
 use shakmaty::Move;
 
 use crate::action::{policy_index, POLICY_SIZE};
@@ -391,9 +392,17 @@ pub struct PyRootSearch {
 #[pymethods]
 impl PyRootSearch {
     #[new]
-    #[pyo3(signature = (fen, *, simulations = 32, exploration_constant = 1.1, forced_playout_k = 0.0))]
+    #[pyo3(signature = (
+        fen,
+        *,
+        moves_uci = Vec::new(),
+        simulations = 32,
+        exploration_constant = 1.1,
+        forced_playout_k = 0.0,
+    ))]
     fn new(
         fen: &str,
+        moves_uci: Vec<String>,
         simulations: u32,
         exploration_constant: f64,
         forced_playout_k: f64,
@@ -401,8 +410,22 @@ impl PyRootSearch {
         if simulations < 1 {
             return Err(value_error("simulations must be positive".into()));
         }
+        // Replaying the moves rather than starting from the current FEN is what
+        // gives the search its repetition history. A FEN cannot carry it, so a
+        // search built from one cannot see that a line repeats, and will happily
+        // walk into or miss a threefold draw.
+        let mut position = GamePosition::from_fen(fen).map_err(value_error)?;
+        for raw in &moves_uci {
+            let uci: UciMove = raw
+                .parse()
+                .map_err(|_| value_error(format!("not a UCI move: {raw}")))?;
+            let chess_move = uci
+                .to_move(position.position())
+                .map_err(|_| value_error(format!("move is not legal in this line: {raw}")))?;
+            position.play(&chess_move);
+        }
         Ok(Self {
-            position: GamePosition::from_fen(fen).map_err(value_error)?,
+            position,
             tree: Tree::new(),
             simulations,
             completed: 0,
