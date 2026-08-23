@@ -23,15 +23,16 @@ def _request(**overrides: object) -> CombinedBuildRequest:
         "seed": 23,
         "expert_dataset_path": "datasets/v2-lichess-eval-next-25m-side-to-move",
         "dry_run": True,
+        "expert_positions": 0,
     }
     fields.update(overrides)
     return CombinedBuildRequest(**fields)  # type: ignore[arg-type]
 
 
-def test_default_sources_name_one_generation_per_search_depth() -> None:
+def test_default_sources_name_the_generation_2_corpus() -> None:
     parsed = parse_sources(DEFAULT_SOURCES)
-    assert [source.label for source in parsed] == ["sp400", "sp200", "sp800"]
-    assert len({source.generation_id for source in parsed}) == 3
+    assert [source.label for source in parsed] == ["gen2sp400"]
+    assert parsed[0].generation_id == ("generation-child-epoch-2-second-rev-official-08222026-0002")
 
 
 def test_sources_parse_in_the_order_given() -> None:
@@ -87,6 +88,35 @@ def test_a_zero_expert_fraction_is_allowed() -> None:
 def test_the_request_rejects_sources_it_cannot_parse() -> None:
     with pytest.raises(ValueError, match="label=generation_id"):
         _request(sources="nonsense")
+
+
+def test_an_explicit_expert_count_overrides_the_fraction() -> None:
+    """Sizing the fill directly is the natural ask once self-play is fixed."""
+
+    request = _request(expert_positions=2_000_000, expert_fraction=0.25)
+    assert request.expert_positions == 2_000_000
+    # Mirrors the builder's precedence: the count wins when it is set.
+    self_play = 3_505_524
+    expert = request.expert_positions or round(
+        self_play * request.expert_fraction / (1.0 - request.expert_fraction)
+    )
+    assert expert == 2_000_000
+    # 2M expert against 3.5M self-play is a 36.3% share of the final corpus.
+    assert abs(expert / (self_play + expert) - 0.363) < 0.001
+
+
+def test_a_zero_expert_count_falls_back_to_the_fraction() -> None:
+    request = _request(expert_positions=0, expert_fraction=0.25)
+    self_play = 1_000
+    expert = request.expert_positions or round(
+        self_play * request.expert_fraction / (1.0 - request.expert_fraction)
+    )
+    assert expert == 333
+
+
+def test_a_negative_expert_count_is_rejected() -> None:
+    with pytest.raises(ValueError, match="expert_positions"):
+        _request(expert_positions=-1)
 
 
 @pytest.mark.parametrize(

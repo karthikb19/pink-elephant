@@ -35,7 +35,7 @@ from pink_elephant.modal_image import build_image
 
 APP_NAME: Final[str] = "pink-elephant-combined-replay-build"
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
-DEFAULT_COMBINED_VOLUME: Final[str] = "pink-elephant-self-play-datasets-combined-3m"
+DEFAULT_COMBINED_VOLUME: Final[str] = "pink-elephant-self-play-datasets-gen2-5m"
 EXPERT_DATASET_PATH: Final[str] = "datasets/v2-lichess-eval-next-25m-side-to-move"
 TRAINING_MOUNT: Final[Path] = Path("/training")
 COMBINED_MOUNT: Final[Path] = Path("/combined")
@@ -53,15 +53,9 @@ SUPPORTED_REPLAY_SCHEMA_VERSIONS: Final[tuple[str, ...]] = (
 )
 BUILD_TIMEOUT_SECONDS: Final[int] = 6 * 60 * 60
 
-# The three generations this dataset was designed around: one per search depth,
-# all produced by the same parent checkpoint. Override with --sources.
-DEFAULT_SOURCES: Final[str] = ",".join(
-    (
-        "sp400=generation-virtual-loss-cache-reuse-official-0822-0002",
-        "sp200=generation-blended-20260819-official-run-1",
-        "sp800=generation-visitfloor-800sims-20260820",
-    )
-)
+# Generation 2's first corpus: 3,505,524 positions over 34,489 games at 400
+# simulations, from the +48 Elo parent. Override with --sources.
+DEFAULT_SOURCES: Final[str] = "gen2sp400=generation-child-epoch-2-second-rev-official-08222026-0002"
 
 image = build_image()
 app = modal.App(APP_NAME, image=image)
@@ -115,12 +109,18 @@ class CombinedBuildRequest:
     seed: int
     expert_dataset_path: str
     dry_run: bool
+    # An absolute expert row count, which wins over `expert_fraction` when set.
+    # Sizing the fill directly is the natural way to ask for it when the
+    # self-play side is already fixed; the fraction is then a consequence.
+    expert_positions: int = 0
 
     def __post_init__(self) -> None:
         parse_sources(self.sources)
         # At 1.0 the fill is infinite; the useful range is a minority share.
         if not 0.0 <= self.expert_fraction < 1.0:
             raise ValueError("expert_fraction must be in [0, 1)")
+        if self.expert_positions < 0:
+            raise ValueError("expert_positions must be non-negative")
         if self.seed < 0:
             raise ValueError("seed must be non-negative")
 
@@ -301,9 +301,10 @@ def build(request: CombinedBuildRequest) -> CombinedBuildResult:
 
     self_play_positions = sum(int(entry["position_count"]) for entry in shard_entries)
     self_play_games = sum(int(entry["game_count"]) for entry in shard_entries)
-    # Expert rows are a share of the FINAL total, not of the self-play rows, so
-    # the fraction printed in the run note is the fraction the trainer sees.
-    expert_needed = round(
+    # An explicit count wins. Otherwise expert rows are a share of the FINAL
+    # total, not of the self-play rows, so the fraction printed in the run note
+    # is the fraction the trainer sees.
+    expert_needed = request.expert_positions or round(
         self_play_positions * request.expert_fraction / (1.0 - request.expert_fraction)
     )
 
@@ -426,16 +427,23 @@ def build(request: CombinedBuildRequest) -> CombinedBuildResult:
 def main(
     sources: str = DEFAULT_SOURCES,
     expert_fraction: float = 0.25,
+    expert_positions: int = 0,
     seed: int = 23,
     expert_dataset_path: str = EXPERT_DATASET_PATH,
     dry_run: bool = False,
 ) -> None:
-    """Assemble the dataset and print the exact counts the run note needs."""
+    """Assemble the dataset and print the exact counts the run note needs.
+
+    `--expert-positions` sizes the fill directly and overrides
+    `--expert-fraction`, which is the natural way to ask for it once the
+    self-play side is fixed.
+    """
 
     result = build.remote(
         CombinedBuildRequest(
             sources=sources,
             expert_fraction=expert_fraction,
+            expert_positions=expert_positions,
             seed=seed,
             expert_dataset_path=expert_dataset_path,
             dry_run=dry_run,
