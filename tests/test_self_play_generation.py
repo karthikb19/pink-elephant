@@ -36,6 +36,7 @@ from pink_elephant.self_play.generation.config import (
     GenerationRoundSpec,
     WorkerSpec,
     generation_1_spec,
+    generation_2_spec,
     plan_worker_specs,
 )
 from pink_elephant.self_play.generation.game import (
@@ -1092,6 +1093,42 @@ def test_tree_reuse_changes_the_search_identity_but_the_cache_does_not() -> None
     assert (
         replace(base, eval_cache_entries=1 << 16).search_config_sha256 == base.search_config_sha256
     )
+
+
+def test_generation_2_generates_with_the_promoted_checkpoint() -> None:
+    """Generation 2's parent is the +48 Elo checkpoint, not Generation 1's."""
+
+    from pink_elephant.self_play.generation.config import generation_2_spec
+
+    generation = generation_2_spec()
+    one = generation_1_spec()
+
+    assert generation.generation_id == "generation-000002"
+    assert generation.checkpoint_volume_path.endswith("epoch-000002-step-000006628.pt")
+    assert generation.checkpoint_sha256 == (
+        "fdc2d038c3f2cb7fa03dcd00f47f9d8edadccd2a568464a3436592d1090e81fe"
+    )
+    assert generation.checkpoint_sha256 != one.checkpoint_sha256
+    # A different parent and a different search are a different corpus, and the
+    # identity has to say so or Generation 2 rows could extend a Generation 1 round.
+    assert generation.search_config_sha256 != one.search_config_sha256
+
+
+def test_generation_2_defaults_the_measured_throughput_settings_on() -> None:
+    generation = generation_2_spec()
+
+    assert generation.simulations_per_move == 400
+    assert generation.tree_reuse is True
+    assert generation.max_pending_leaves == 4
+    assert generation.eval_cache_entries == 1 << 20
+    # Search quality settings are inherited unchanged, so the only deliberate
+    # differences from Generation 1 are the parent and the throughput knobs.
+    one = generation_1_spec()
+    assert generation.exploration_constant == one.exploration_constant
+    assert generation.forced_playout_k == one.forced_playout_k
+    assert generation.min_visit_fraction == one.min_visit_fraction
+    assert generation.dirichlet_fraction == one.dirichlet_fraction
+    assert generation.model_spec == one.model_spec
 
 
 def test_generation_spec_rejects_a_negative_eval_cache() -> None:
