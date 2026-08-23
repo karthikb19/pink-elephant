@@ -71,7 +71,7 @@ GENERATION_1_EVAL_CACHE_ENTRIES: Final[int] = 0
 # `20260822T203909Z-combined-3m-400-200-800-anchor-030`, which scored 0.5684
 # against Generation 1's parent over 1024 games at 200 simulations, CI
 # [0.545, 0.592]. See knowledge/self-play-runs/2026-08-22-anchor-030-combined-3m-results.md.
-GENERATION_2_ID: Final[str] = "generation-000002"
+GENERATION_2_ID: Final[str] = "generation-child-epoch-2-first-rev-official-08222026-0001"
 GENERATION_2_CHECKPOINT_VOLUME_PATH: Final[str] = (
     "runs/20260822T203909Z-combined-3m-400-200-800-anchor-030/checkpoints/"
     "20260822T203909Z-combined-3m-400-200-800-anchor-030-epoch-000002-step-000006628.pt"

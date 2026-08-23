@@ -1103,7 +1103,7 @@ def test_generation_2_generates_with_the_promoted_checkpoint() -> None:
     generation = generation_2_spec()
     one = generation_1_spec()
 
-    assert generation.generation_id == "generation-000002"
+    assert generation.generation_id == ("generation-child-epoch-2-first-rev-official-08222026-0001")
     assert generation.checkpoint_volume_path.endswith("epoch-000002-step-000006628.pt")
     assert generation.checkpoint_sha256 == (
         "fdc2d038c3f2cb7fa03dcd00f47f9d8edadccd2a568464a3436592d1090e81fe"
