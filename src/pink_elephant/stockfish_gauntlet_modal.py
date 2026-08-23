@@ -25,6 +25,7 @@ small Volume so later runs skip the download.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -33,6 +34,9 @@ from typing import Final
 import modal
 
 from pink_elephant.modal_image import build_image
+from pink_elephant.self_play.generation.observability import configure_logging, log_event
+
+logger = logging.getLogger(__name__)
 
 APP_NAME: Final[str] = "pink-elephant-stockfish-gauntlet"
 TRAINING_VOLUME_NAME: Final[str] = "pink-elephant-training"
@@ -49,6 +53,9 @@ GAUNTLET_MEMORY_MB: Final[int] = 16 * 1024
 # wave is one forward pass over up to 64 positions instead of 64 over one.
 DEFAULT_CONCURRENT_GAMES: Final[int] = 64
 STOCKFISH_ENGINES: Final[int] = 3
+# Completed games between progress lines. A gauntlet runs for tens of minutes,
+# so silence until the final tally is indistinguishable from a hung container.
+PROGRESS_INTERVAL_GAMES: Final[int] = 20
 
 # label=checkpoint path on the training Volume, separated by semicolons.
 DEFAULT_LADDER: Final[str] = ";".join(
@@ -179,7 +186,20 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
         start_stockfish,
     )
 
+    configure_logging()
     started = time.perf_counter()
+    log_event(
+        logger,
+        "gauntlet_started",
+        {
+            "checkpoint": request.checkpoint_path,
+            "concurrent_games": request.concurrent_games,
+            "games": request.games,
+            "label": request.label,
+            "simulations": request.simulations,
+            "stockfish_elo": request.elo,
+        },
+    )
     checkpoint = TRAINING_MOUNT / request.checkpoint_path
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {request.checkpoint_path}")
@@ -189,8 +209,23 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
     evaluator = ModelBatchEvaluator(loaded.model, device=device, autocast=True)
     search_config = MCTSConfig(num_simulations=request.simulations)
 
-    binary = ensure_stockfish_binary(None, STOCKFISH_MOUNT / "cache")
+    cache_dir = STOCKFISH_MOUNT / "cache"
+    cached = cache_dir.is_dir() and any(cache_dir.rglob("*"))
+    fetch_started = time.perf_counter()
+    binary = ensure_stockfish_binary(None, cache_dir)
     stockfish_volume.commit()
+    log_event(
+        logger,
+        "stockfish_ready",
+        {
+            "binary": str(binary),
+            "elo": request.elo,
+            "engines": STOCKFISH_ENGINES,
+            "fetch_seconds": time.perf_counter() - fetch_started,
+            "label": request.label,
+            "was_cached": cached,
+        },
+    )
     stockfish_config = StockfishConfig(
         elo=request.elo,
         depth=request.depth,
@@ -209,6 +244,9 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
     colors: list[chess.Color] = []
     played: list[int] = []
     issued = 0
+    next_progress = PROGRESS_INTERVAL_GAMES
+    search_seconds = 0.0
+    stockfish_seconds = 0.0
 
     def seed(count: int) -> None:
         """Start up to `count` more games, while any of the quota is unissued."""
@@ -257,6 +295,31 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
             for index in reversed(finished):
                 retire(index)
             if finished:
+                complete = wins + draws + losses + unfinished
+                if complete >= next_progress:
+                    next_progress = complete + PROGRESS_INTERVAL_GAMES
+                    elapsed = time.perf_counter() - started
+                    decided = wins + draws + losses
+                    log_event(
+                        logger,
+                        "gauntlet_progress",
+                        {
+                            "draws": draws,
+                            "elapsed_seconds": elapsed,
+                            "games_completed": complete,
+                            "games_per_hour": complete / elapsed * 3600 if elapsed else 0.0,
+                            "games_total": request.games,
+                            "in_flight": len(boards),
+                            "label": request.label,
+                            "losses": losses,
+                            "mean_batch_size": batched_positions / waves if waves else 0.0,
+                            "score": (wins + 0.5 * draws) / decided if decided else 0.0,
+                            "search_seconds": search_seconds,
+                            "search_waves": waves,
+                            "stockfish_seconds": stockfish_seconds,
+                            "wins": wins,
+                        },
+                    )
                 seed(len(finished))
                 continue
 
@@ -264,12 +327,14 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
             # few engines; the GPU is idle here either way, and one engine would
             # serialise every game waiting on it.
             waiting = [index for index in range(len(boards)) if boards[index].turn != colors[index]]
+            stockfish_started = time.perf_counter()
             for position, index in enumerate(waiting):
                 reply = engines[position % len(engines)].play(boards[index], limit)
                 if reply.move is None:
                     raise RuntimeError("Stockfish returned no move")
                 boards[index].push(reply.move)
                 played[index] += 1
+            stockfish_seconds += time.perf_counter() - stockfish_started
 
             searching = [
                 index
@@ -282,7 +347,9 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
 
             # One search across every waiting game: each wave takes one leaf per
             # tree, so the forward pass is as wide as the set rather than one.
+            search_started = time.perf_counter()
             roots = run_mcts_batch([boards[index] for index in searching], evaluator, search_config)
+            search_seconds += time.perf_counter() - search_started
             waves += 1
             batched_positions += len(searching)
             for index, root in zip(searching, roots, strict=True):
@@ -300,6 +367,29 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
         for engine in engines:
             engine.quit()
 
+    elapsed = time.perf_counter() - started
+    decided = wins + draws + losses
+    log_event(
+        logger,
+        "gauntlet_completed",
+        {
+            "draws": draws,
+            "elapsed_seconds": elapsed,
+            "label": request.label,
+            "losses": losses,
+            "mean_batch_size": batched_positions / waves if waves else 0.0,
+            "score": (wins + 0.5 * draws) / decided if decided else 0.0,
+            "search_seconds": search_seconds,
+            "search_waves": waves,
+            "stockfish_seconds": stockfish_seconds,
+            # Whatever is neither search nor Stockfish is board bookkeeping and
+            # game adjudication; a large share here means the loop, not the GPU,
+            # is the limit.
+            "unattributed_seconds": elapsed - search_seconds - stockfish_seconds,
+            "unfinished": unfinished,
+            "wins": wins,
+        },
+    )
     return GauntletResult(
         label=request.label,
         wins=wins,
@@ -307,7 +397,7 @@ def play_gauntlet(request: GauntletRequest) -> GauntletResult:
         losses=losses,
         unfinished=unfinished,
         plies=plies,
-        elapsed_seconds=time.perf_counter() - started,
+        elapsed_seconds=elapsed,
         search_waves=waves,
         mean_batch_size=batched_positions / waves if waves else 0.0,
         terminations=terminations,
