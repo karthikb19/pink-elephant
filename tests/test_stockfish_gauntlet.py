@@ -1,36 +1,40 @@
-"""Ladder parsing and slice allocation for the Modal Stockfish gauntlet.
+"""Ladder parsing and scoring for the Modal Stockfish gauntlet.
 
 The games themselves need a GPU and a Stockfish binary, so what is covered here
-is the part that decides what gets played: which checkpoints, and how the games
-are split across containers without losing or double-counting any.
+is the part that decides what gets played and how a result is read: which
+checkpoints, and the score, interval, and Elo derived from a tally.
 """
 
 from __future__ import annotations
+
+import math
 
 import pytest
 
 from pink_elephant.stockfish_gauntlet_modal import (
     DEFAULT_LADDER,
-    SliceRequest,
+    GauntletRequest,
+    GauntletResult,
     confidence_interval,
+    elo_difference,
     parse_ladder,
 )
 
 
-def _request(**overrides: object) -> SliceRequest:
+def _request(**overrides: object) -> GauntletRequest:
     fields: dict[str, object] = {
         "label": "candidate",
         "checkpoint_path": "runs/example/checkpoints/example.pt",
         "elo": 2500,
         "simulations": 200,
-        "games": 10,
-        "first_game_index": 0,
+        "games": 400,
+        "concurrent_games": 64,
         "depth": 10,
         "movetime_ms": None,
         "max_plies": 512,
     }
     fields.update(overrides)
-    return SliceRequest(**fields)  # type: ignore[arg-type]
+    return GauntletRequest(**fields)  # type: ignore[arg-type]
 
 
 def test_the_default_ladder_is_one_entry_per_generation() -> None:
@@ -44,8 +48,7 @@ def test_the_default_ladder_is_one_entry_per_generation() -> None:
 
 
 def test_ladder_entries_keep_the_order_given() -> None:
-    parsed = parse_ladder(" a=one.pt ; b=two.pt ")
-    assert parsed == (("a", "one.pt"), ("b", "two.pt"))
+    assert parse_ladder(" a=one.pt ; b=two.pt ") == (("a", "one.pt"), ("b", "two.pt"))
 
 
 def test_a_duplicate_label_is_rejected() -> None:
@@ -66,60 +69,83 @@ def test_a_malformed_entry_is_rejected() -> None:
         parse_ladder("checkpoint-with-no-label.pt")
 
 
-def test_a_slice_must_have_games_to_play() -> None:
-    with pytest.raises(ValueError, match="games must be positive"):
-        _request(games=0)
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("games", 0, "games must be positive"),
+        ("simulations", 0, "simulations must be positive"),
+        ("concurrent_games", 0, "concurrent_games must be positive"),
+        ("max_plies", 0, "max_plies must be positive"),
+    ],
+)
+def test_an_unusable_request_is_rejected(field: str, value: int, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        _request(**{field: value})
 
 
-def test_a_slice_index_cannot_be_negative() -> None:
-    with pytest.raises(ValueError, match="first_game_index"):
-        _request(first_game_index=-1)
+def test_colour_alternates_by_global_game_index() -> None:
+    """Mirrors the container's seeding: an even split whatever the finish order.
 
-
-@pytest.mark.parametrize(("games", "slices"), [(400, 10), (401, 10), (7, 3), (5, 5)])
-def test_slice_allocation_covers_every_game_exactly_once(games: int, slices: int) -> None:
-    """Mirrors the entrypoint's split: no game dropped, none played twice."""
-
-    base, remainder = divmod(games, slices)
-    allocated = [base + (1 if index < remainder else 0) for index in range(slices)]
-    assert sum(allocated) == games
-    assert all(count >= 1 for count in allocated)
-    # Contiguous, non-overlapping global indices.
-    first = 0
-    starts = []
-    for count in allocated:
-        starts.append(first)
-        first += count
-    assert starts == sorted(starts)
-    assert first == games
-
-
-def test_colour_assignment_stays_balanced_across_slices() -> None:
-    """Colour follows the global index, so an uneven split cannot skew it.
-
-    Assigning colour per slice would give a slice with an odd game count one
-    extra white, and enough such slices would bias the whole measurement.
+    Colour is assigned when a game is issued, not when a slot frees up, so games
+    completing out of order cannot skew the split toward one colour.
     """
 
-    games, slices = 401, 10
-    base, remainder = divmod(games, slices)
-    whites = 0
-    first = 0
-    for index in range(slices):
-        count = base + (1 if index < remainder else 0)
-        whites += sum(1 for offset in range(count) if (first + offset) % 2 == 0)
-        first += count
-    # 401 games can only split 201/200; anything further off is a real skew.
+    games = 401
+    whites = sum(1 for index in range(games) if index % 2 == 0)
     assert whites == 201
+    assert games - whites == 200
+
+
+def test_played_counts_only_decided_games() -> None:
+    """A game that hit the ply limit has no result and must not enter the score."""
+
+    result = GauntletResult(
+        label="candidate",
+        wins=10,
+        draws=4,
+        losses=6,
+        unfinished=3,
+        plies=1000,
+        elapsed_seconds=1.0,
+        search_waves=10,
+        mean_batch_size=8.0,
+    )
+    assert result.played == 20
 
 
 def test_confidence_interval_narrows_with_more_games() -> None:
     narrow = confidence_interval(300, 400, 300)
     wide = confidence_interval(30, 40, 30)
     assert narrow[1] - narrow[0] < wide[1] - wide[0]
-    # A balanced result centres on 0.5 either way.
     assert abs((narrow[0] + narrow[1]) / 2 - 0.5) < 1e-9
 
 
 def test_confidence_interval_of_no_games_is_uninformative() -> None:
     assert confidence_interval(0, 0, 0) == (0.0, 1.0)
+
+
+def test_more_games_is_the_whole_reason_this_runs_on_modal() -> None:
+    """20 games locally cannot resolve what 400 can.
+
+    At 400 games a balanced result spans about +/-0.038, or roughly 26 Elo; at
+    20 it spans about +/-0.17, which is wider than every difference measured
+    between these generations.
+    """
+
+    local_low, local_high = confidence_interval(6, 8, 6)
+    modal_low, modal_high = confidence_interval(120, 160, 120)
+    assert modal_high - modal_low == pytest.approx(0.076, abs=0.002)
+    assert local_high - local_low > 4 * (modal_high - modal_low)
+
+
+@pytest.mark.parametrize(
+    ("score", "expected"),
+    [(0.5, 0.0), (0.75, 190.8), (0.25, -190.8), (0.9, 381.7)],
+)
+def test_elo_difference_matches_the_logistic_scale(score: float, expected: float) -> None:
+    assert elo_difference(score) == pytest.approx(expected, abs=0.1)
+
+
+def test_a_clean_sweep_has_no_finite_elo() -> None:
+    assert elo_difference(1.0) == math.inf
+    assert elo_difference(0.0) == -math.inf
