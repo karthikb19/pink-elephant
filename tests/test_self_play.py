@@ -278,7 +278,7 @@ def test_replay_shards_and_games_round_trip_without_splitting_a_game(tmp_path: P
         pending_positions=pending,
     )
     builder = ReplayShardBuilder(tmp_path, max_positions=2)
-    builder.add_game(completed.rows)
+    builder.add_game(completed.rows, completed.record)
     references = builder.finish()
     games_reference = write_games_table(tmp_path / "games.parquet", (completed.record,))
 

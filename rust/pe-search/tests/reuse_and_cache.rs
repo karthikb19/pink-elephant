@@ -217,6 +217,7 @@ fn config(simulations: u32, tree_reuse: bool, eval_cache_entries: usize) -> Engi
         start_fens: Vec::new(),
         paired_starts: false,
         eval_cache_entries,
+        first_game_ordinal: 0,
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,

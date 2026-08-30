@@ -34,6 +34,10 @@ pub struct EngineConfig {
     /// 2k and 2k+1 on one position with the colours swapped. A match needs every
     /// opening played from both sides, which random selection cannot guarantee.
     pub paired_starts: bool,
+    /// Game ordinal the first game is seeded from. A worker resuming after a
+    /// preemption starts past the games it already sealed, so its seeds and game
+    /// ids continue the sequence instead of reissuing ones already on disk.
+    pub first_game_ordinal: u64,
     /// Network evaluations to cache across every game, rounded up to a power of
     /// two. Zero disables the cache. The table is shared engine-wide because the
     /// overlap worth exploiting is mostly between games, not within one.
@@ -116,7 +120,7 @@ impl SelfPlayEngine {
             next_batch_id: 0,
             finished: Vec::new(),
             accepting_new_games: true,
-            next_game_ordinal: 0,
+            next_game_ordinal: config.first_game_ordinal,
             cache: EvalCache::new(config.eval_cache_entries),
             stats: EngineStats::default(),
             config,

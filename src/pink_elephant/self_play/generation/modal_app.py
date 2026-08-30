@@ -17,25 +17,25 @@ from pink_elephant.self_play.generation.config import (
     GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     GENERATION_1_DIRICHLET_ALPHA,
     GENERATION_1_DIRICHLET_FRACTION,
-    GENERATION_1_EVAL_CACHE_ENTRIES,
     GENERATION_1_FORCED_PLAYOUT_K,
-    GENERATION_1_ID,
-    GENERATION_1_MAX_PENDING_LEAVES,
     GENERATION_1_MIN_VISIT_FRACTION,
     GENERATION_1_OPENING_TEMPERATURE,
     GENERATION_1_PUCT,
     GENERATION_1_REPLAY_STRIDE,
     GENERATION_1_ROOT_POLICY_TEMPERATURE,
     GENERATION_1_SHARD_POSITION_LIMIT,
-    GENERATION_1_SIMULATIONS,
     GENERATION_1_TEMPERATURE_CUTOFF_PLY,
-    GENERATION_1_TREE_REUSE,
-    GENERATION_1_VIRTUAL_LOSS,
     GENERATION_1_WORKER_COUNT,
+    GENERATION_2_EVAL_CACHE_ENTRIES,
+    GENERATION_2_ID,
+    GENERATION_2_MAX_PENDING_LEAVES,
+    GENERATION_2_SIMULATIONS,
+    GENERATION_2_TREE_REUSE,
+    GENERATION_2_VIRTUAL_LOSS,
     GenerationRoundSpec,
     GenerationSpec,
     WorkerSpec,
-    generation_1_spec,
+    generation_2_spec,
     plan_worker_specs,
     resolve_start_pool,
 )
@@ -238,10 +238,12 @@ def load_committed_worker_results(workers: tuple[WorkerSpec, ...]) -> tuple[Work
         )
         if not invocations.is_dir():
             continue
-        # Every attempt gets its own invocation directory, so recovery searches all
+        # Every launch gets its own invocation directory, so recovery searches all
         # of them rather than the one this launch happens to be using. A worker that
         # finished wrote worker-result.json; an interrupted one left only shards, and
-        # is skipped so a fresh invocation can retry it.
+        # is skipped so a fresh invocation can retry it. Retries within one launch
+        # reuse their directory: they return an existing result or discard a dead
+        # attempt's partial shards, so no directory here holds two attempts' output.
         for invocation in sorted(invocations.iterdir(), reverse=True):
             result_path = invocation / "worker-result.json"
             if result_path.is_file():
@@ -502,11 +504,11 @@ def launch_modal_generation_round(
 def main(
     round_id: str,
     requested_positions: int,
-    generation_id: str = GENERATION_1_ID,
+    generation_id: str = GENERATION_2_ID,
     worker_count: int = GENERATION_1_WORKER_COUNT,
     active_games_per_worker: int = GENERATION_1_ACTIVE_GAMES_PER_WORKER,
     shard_position_limit: int = GENERATION_1_SHARD_POSITION_LIMIT,
-    simulations: int = GENERATION_1_SIMULATIONS,
+    simulations: int = GENERATION_2_SIMULATIONS,
     exploration_constant: float = GENERATION_1_PUCT,
     dirichlet_alpha: float = GENERATION_1_DIRICHLET_ALPHA,
     dirichlet_fraction: float = GENERATION_1_DIRICHLET_FRACTION,
@@ -517,10 +519,10 @@ def main(
     replay_stride: int = GENERATION_1_REPLAY_STRIDE,
     forced_playout_k: float = GENERATION_1_FORCED_PLAYOUT_K,
     min_visit_fraction: float = GENERATION_1_MIN_VISIT_FRACTION,
-    max_pending_leaves: int = GENERATION_1_MAX_PENDING_LEAVES,
-    virtual_loss: float = GENERATION_1_VIRTUAL_LOSS,
-    tree_reuse: bool = GENERATION_1_TREE_REUSE,
-    eval_cache_entries: int = GENERATION_1_EVAL_CACHE_ENTRIES,
+    max_pending_leaves: int = GENERATION_2_MAX_PENDING_LEAVES,
+    virtual_loss: float = GENERATION_2_VIRTUAL_LOSS,
+    tree_reuse: bool = GENERATION_2_TREE_REUSE,
+    eval_cache_entries: int = GENERATION_2_EVAL_CACHE_ENTRIES,
     start_pool_size: int = DEFAULT_START_POOL_SIZE,
     startpos_weight: float = DEFAULT_START_MIX.startpos,
     opening_book_weight: float = DEFAULT_START_MIX.opening_book,
@@ -552,7 +554,7 @@ def main(
         seed=base_seed,
     )
     generation = replace(
-        generation_1_spec(base_seed=base_seed),
+        generation_2_spec(base_seed=base_seed),
         generation_id=generation_id,
         start_pool=start_pool,
         replay_stride=replay_stride,

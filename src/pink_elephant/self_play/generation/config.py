@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
 
@@ -66,6 +66,29 @@ GENERATION_1_TREE_REUSE: Final[bool] = False
 # Network evaluations cached across every game in a worker, rounded up to a power
 # of two. Zero disables the cache. Roughly 180 bytes an entry.
 GENERATION_1_EVAL_CACHE_ENTRIES: Final[int] = 0
+
+# Generation 2 generates with the epoch-2 checkpoint of
+# `20260822T203909Z-combined-3m-400-200-800-anchor-030`, which scored 0.5684
+# against Generation 1's parent over 1024 games at 200 simulations, CI
+# [0.545, 0.592]. See knowledge/self-play-runs/2026-08-22-anchor-030-combined-3m-results.md.
+GENERATION_2_ID: Final[str] = "generation-child-epoch-2-first-rev-official-08222026-0001"
+GENERATION_2_CHECKPOINT_VOLUME_PATH: Final[str] = (
+    "runs/20260822T203909Z-combined-3m-400-200-800-anchor-030/checkpoints/"
+    "20260822T203909Z-combined-3m-400-200-800-anchor-030-epoch-000002-step-000006628.pt"
+)
+GENERATION_2_CHECKPOINT_SHA256: Final[str] = (
+    "fdc2d038c3f2cb7fa03dcd00f47f9d8edadccd2a568464a3436592d1090e81fe"
+)
+# The depth the 1.38M-position run used, and the depth this parent's data was
+# largely generated at.
+GENERATION_2_SIMULATIONS: Final[int] = 400
+# Virtual loss, tree reuse, and the evaluation cache measured 4.8x per worker
+# against one leaf per game with neither, so Generation 2 defaults them on.
+GENERATION_2_MAX_PENDING_LEAVES: Final[int] = 4
+GENERATION_2_VIRTUAL_LOSS: Final[float] = 0.0
+GENERATION_2_TREE_REUSE: Final[bool] = True
+# Roughly 180 bytes an entry, so about 190MB of worker memory.
+GENERATION_2_EVAL_CACHE_ENTRIES: Final[int] = 1 << 20
 _SHA256_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -343,6 +366,27 @@ def generation_1_spec(*, base_seed: int = 0) -> GenerationSpec:
         tree_reuse=GENERATION_1_TREE_REUSE,
         eval_cache_entries=GENERATION_1_EVAL_CACHE_ENTRIES,
         base_seed=base_seed,
+    )
+
+
+def generation_2_spec(*, base_seed: int = 0) -> GenerationSpec:
+    """Return the authoritative Generation 2 semantic configuration.
+
+    Same architecture and same search shape as Generation 1, with a stronger
+    parent and the three throughput settings that are now measured rather than
+    speculative.
+    """
+
+    return replace(
+        generation_1_spec(base_seed=base_seed),
+        generation_id=GENERATION_2_ID,
+        checkpoint_volume_path=GENERATION_2_CHECKPOINT_VOLUME_PATH,
+        checkpoint_sha256=GENERATION_2_CHECKPOINT_SHA256,
+        simulations_per_move=GENERATION_2_SIMULATIONS,
+        max_pending_leaves=GENERATION_2_MAX_PENDING_LEAVES,
+        virtual_loss=GENERATION_2_VIRTUAL_LOSS,
+        tree_reuse=GENERATION_2_TREE_REUSE,
+        eval_cache_entries=GENERATION_2_EVAL_CACHE_ENTRIES,
     )
 
 

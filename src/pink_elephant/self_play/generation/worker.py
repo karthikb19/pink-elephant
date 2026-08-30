@@ -53,6 +53,7 @@ from pink_elephant.self_play.generation.game import (
     select_action_from_summary,
     subsample_replay_rows,
 )
+from pink_elephant.self_play.generation.manifests import load_worker_result
 from pink_elephant.self_play.generation.native_host import (
     PENDING_BATCHES,
     HostStats,
@@ -64,8 +65,10 @@ from pink_elephant.self_play.generation.process_search import (
     RootPriorNoise,
     SearchRequest,
 )
-from pink_elephant.self_play.generation.shards import (
+from pink_elephant.self_play.generation.shards import (  # noqa: I001
     ReplayShardBuilder,
+    ResumedShards,
+    resume_shard_builder,
     sha256_file,
     write_games_table,
 )
@@ -283,23 +286,21 @@ def run_worker(
             "worker_id": worker.worker_id,
         },
     )
-    invocation_root = _invocation_root(output_root, worker)
-    if invocation_root.exists() and any(invocation_root.iterdir()):
-        raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
-    invocation_root.mkdir(parents=True, exist_ok=True)
-    shard_builder = ReplayShardBuilder(
-        invocation_root,
-        max_positions=worker.round.shard_position_limit,
-    )
-    completed_games = []
-    termination_counts: Counter[str] = Counter()
+    invocation_root, published = _prepare_invocation_root(output_root, worker)
+    if published is not None:
+        return published
+    shard_builder, resumed = _resume_shards(invocation_root, worker)
+    completed_games = list(resumed.games)
+    termination_counts: Counter[str] = Counter(record.termination for record in resumed.games)
     failed_game_count = 0
-    completed_position_count = 0
+    completed_position_count = resumed.position_count
     progress_interval = max(1, min(100, worker.position_lower_bound // 10))
     next_progress_log = progress_interval
     search_batch_count = 0
     last_search_log_at = started
-    attempts = 0
+    # `attempts` is incremented before it names a game, so resuming holds it at
+    # the highest sealed ordinal and the next game takes the one after it.
+    attempts = max(0, _highest_sealed_game_ordinal(resumed))
     active: list[_ActiveGame] = []
     mcts_config = MCTSConfig(
         num_simulations=worker.generation.simulations_per_move,
@@ -494,7 +495,7 @@ def run_worker(
             rows = subsample_replay_rows(
                 completed.rows, stride=worker.generation.replay_stride, seed=game.seed
             )
-            shard_builder.add_game(rows)
+            shard_builder.add_game(rows, completed.record)
             completed_games.append(completed.record)
             completed_position_count += len(rows)
             termination_counts[completed.record.termination] += 1
@@ -664,6 +665,92 @@ def _process_search_log_fields(search: MultiprocessMCTSSearch) -> dict[str, floa
     }
 
 
+def _prepare_invocation_root(
+    output_root: Path, worker: WorkerSpec
+) -> tuple[Path, WorkerResult | None]:
+    """Return this worker's output directory, and its result if it already finished.
+
+    Modal retries a failed worker with the same `WorkerSpec`, so a retry lands on
+    the exact path its dead predecessor was writing into. Refusing a non-empty
+    directory therefore made every retry fail the moment one shard existed, and
+    the `FileExistsError` buried whatever actually killed the first attempt.
+
+    `worker-result.json` is written only after every shard and the games table
+    are on disk, so its presence means the work is done: return it and let the
+    retry be a no-op rather than regenerating games that are already published.
+    Otherwise the directory holds a dead attempt's output, which
+    `resume_shard_builder` sorts into sealed shards worth keeping and partial
+    writes worth deleting. The path is scoped to one generation, round, worker,
+    and launch, so nothing else can be writing here.
+    """
+
+    invocation_root = _invocation_root(output_root, worker)
+    result_path = invocation_root / "worker-result.json"
+    if result_path.is_file():
+        log_event(
+            logger,
+            "worker_invocation_already_published",
+            {
+                "generation_id": worker.generation.generation_id,
+                "invocation_id": worker.invocation_id,
+                "round_id": worker.round.round_id,
+                "worker_id": worker.worker_id,
+            },
+        )
+        return invocation_root, load_worker_result(result_path)
+    invocation_root.mkdir(parents=True, exist_ok=True)
+    return invocation_root, None
+
+
+def _resume_shards(
+    invocation_root: Path, worker: WorkerSpec
+) -> tuple[ReplayShardBuilder, ResumedShards]:
+    """Open this worker's shard builder over whatever a dead attempt left behind.
+
+    Preemption restarts a worker with the same input, and on a long round that
+    can throw away half an hour of finished games. Sealed shards survive because
+    each one carries a sidecar of its game records, so the retry adopts them and
+    generates only the shortfall.
+    """
+
+    builder, resumed = resume_shard_builder(
+        invocation_root, max_positions=worker.round.shard_position_limit
+    )
+    if resumed.references:
+        log_event(
+            logger,
+            "worker_invocation_resumed",
+            {
+                "generation_id": worker.generation.generation_id,
+                "invocation_id": worker.invocation_id,
+                "resumed_game_count": len(resumed.games),
+                "resumed_position_count": resumed.position_count,
+                "resumed_shard_count": len(resumed.references),
+                "round_id": worker.round.round_id,
+                "worker_id": worker.worker_id,
+            },
+        )
+    return builder, resumed
+
+
+def _highest_sealed_game_ordinal(resumed: ResumedShards) -> int:
+    """The largest game counter a previous attempt sealed, or -1 for none.
+
+    Both search paths derive a game's seed and its id from one monotonic
+    counter, so a resumed worker has to continue that counter rather than restart
+    it. Counting the adopted games is not enough: a dead attempt may have
+    truncated or rejected games between the ones it sealed, so the count would
+    reissue an id that is already on disk.
+    """
+
+    highest = -1
+    for record in resumed.games:
+        _, _, suffix = record.game_id.rpartition("-")
+        if suffix.isdigit():
+            highest = max(highest, int(suffix))
+    return highest
+
+
 def _invocation_root(output_root: Path, worker: WorkerSpec) -> Path:
     return (
         output_root
@@ -799,6 +886,13 @@ def run_native_worker(
 
     configure_logging()
     started = time.perf_counter()
+    invocation_root, published = _prepare_invocation_root(output_root, worker)
+    if published is not None:
+        return published
+    shard_builder, resumed = _resume_shards(invocation_root, worker)
+    # Adopted games already count against the quota, so a worker preempted just
+    # before publishing searches nothing and goes straight to sealing.
+    remaining_quota = max(0, worker.position_lower_bound - resumed.position_count)
     engine = pe_search.SelfPlayEngine(
         games=worker.round.active_games_per_worker,
         seed=worker.seed_start,
@@ -822,6 +916,7 @@ def run_native_worker(
         virtual_loss=worker.generation.virtual_loss,
         tree_reuse=worker.generation.tree_reuse,
         eval_cache_entries=worker.generation.eval_cache_entries,
+        first_game_ordinal=_highest_sealed_game_ordinal(resumed) + 1,
     )
     host = NativeSelfPlayHost(model, engine, device=device, autocast=autocast)
     log_event(
@@ -843,16 +938,9 @@ def run_native_worker(
         },
     )
 
-    invocation_root = _invocation_root(output_root, worker)
-    if invocation_root.exists() and any(invocation_root.iterdir()):
-        raise FileExistsError(f"worker invocation path is not empty: {invocation_root}")
-    invocation_root.mkdir(parents=True, exist_ok=True)
-    shard_builder = ReplayShardBuilder(
-        invocation_root,
-        max_positions=worker.round.shard_position_limit,
-    )
     writer = ReplayAdmissionWriter(
         shard_builder,
+        resumed=resumed,
         round_id=worker.round.round_id,
         worker_id=worker.worker_id,
         position_lower_bound=worker.position_lower_bound,
@@ -870,11 +958,18 @@ def run_native_worker(
     # it. The writer is closed, drained, and joined before anything reads its
     # results, so the publish step still sees a complete and ordered set.
     with writer:
-        stats = host.run(
-            position_quota=worker.position_lower_bound,
-            on_game=writer.submit,
-            progress=report,
-            progress_interval=NATIVE_PROGRESS_INTERVAL,
+        # A worker preempted after its last shard sealed has nothing left to
+        # search. Running the host anyway would still drain a full set of active
+        # games, so the quota check happens before any search starts.
+        stats = (
+            host.run(
+                position_quota=remaining_quota,
+                on_game=writer.submit,
+                progress=report,
+                progress_interval=NATIVE_PROGRESS_INTERVAL,
+            )
+            if remaining_quota > 0
+            else HostStats()
         )
     results = writer.results
 

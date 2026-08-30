@@ -35,6 +35,7 @@ fn config(games: usize, pending: usize, simulations: u32) -> EngineConfig {
         start_fens: Vec::new(),
         paired_starts: false,
         eval_cache_entries: 0,
+        first_game_ordinal: 0,
         search: SearchConfig {
             simulations,
             dirichlet_fraction: 0.25,
